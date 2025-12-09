@@ -351,6 +351,7 @@ Note that you have the choice of IMU as the old sequences (before 2024) did not 
 ## TODOs
 
 - [ ] Add script the demonstrate the querying of the distance field service
+- [ ] Clean the printouts
 - [ ] Improve the README/documentation
 - [ ] Implement full offline bundle adjustment after loop closures
 - [ ] Add pose estimation at the frequency of the IMU
