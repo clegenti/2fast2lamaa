@@ -201,9 +201,9 @@ namespace ugpm
                 bool loop = true;
                 while(loop)
                 {
-                    if(samples[i].t > from)
+                    if((samples[i].t > from) || (samples[i].t <= from && i == samples.size() - 1) || (samples[i].t <= from && samples[i+1].t > from) )
                     {
-                        if(samples[i].t < to)
+                        if( (samples[i].t < to) || (samples[i].t >= to && i == 0) || (samples[i].t >= to && samples[i-1].t < to) )
                         {
                             output.push_back(samples[i]);
                         }
