@@ -47,7 +47,7 @@ class LidarOdometryNode : public rclcpp::Node
 
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_dense_pub_;
 
-
+        LidarOdometryMode mode_ = LidarOdometryMode::IMU;
 
         std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
 

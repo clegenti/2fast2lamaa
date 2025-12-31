@@ -5,6 +5,9 @@
 #include <set>
 #include <memory>
 #include <iostream>
+#include <vector>
+#include <map>
+
 
 // Types for the lidar features: 1: planar, 2: edge, 3: rough
 const std::set<int> kTypes = {1, 2, 3};
@@ -335,3 +338,18 @@ inline void testDataAssociationJacobian(int type = 1)
     std::cout << "Jacobian num: " << std::endl << jacobian_num << std::endl;
 }
 
+
+
+
+
+enum class LidarOdometryMode
+{
+    IMU,
+    GYR,
+    NO_IMU
+};
+const std::map<std::string, LidarOdometryMode> kLidarOdometryModeMap = {
+    {"imu", LidarOdometryMode::IMU},
+    {"gyr", LidarOdometryMode::GYR},
+    {"no_imu", LidarOdometryMode::NO_IMU}
+};

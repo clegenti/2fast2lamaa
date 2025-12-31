@@ -53,6 +53,7 @@ struct LidarOdometryParams
 
     bool planar_only = false; // If true, only use planar features (no edge features)
 
+    LidarOdometryMode mode = LidarOdometryMode::IMU;
 };
 
 

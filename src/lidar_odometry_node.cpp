@@ -23,13 +23,36 @@ LidarOdometryNode::LidarOdometryNode()
     params.acc_std = readFieldDouble(this, "acc_std", 0.02);
     params.lidar_std = readFieldDouble(this, "lidar_std", 0.02);
     params.g = readFieldDouble(this, "g", 9.80);
+    std::string mode = readFieldString(this, "mode", "imu");
+    if(kLidarOdometryModeMap.find(mode) != kLidarOdometryModeMap.end())
+    {
+        params.mode = kLidarOdometryModeMap.at(mode);
+        mode_ = params.mode;
+    }
+    else
+    {
+        RCLCPP_ERROR(this->get_logger(), "Invalid mode parameter: %s. Options are 'imu', 'gyr', 'no_imu'. Using 'imu' mode.", mode.c_str());
+        throw std::runtime_error("Invalid mode parameter for LidarOdometryNode");
+    }
 
-    params.calib_px = readRequiredFieldDouble(this, "calib_px");
-    params.calib_py = readRequiredFieldDouble(this, "calib_py");
-    params.calib_pz = readRequiredFieldDouble(this, "calib_pz");
-    params.calib_rx = readRequiredFieldDouble(this, "calib_rx");
-    params.calib_ry = readRequiredFieldDouble(this, "calib_ry");
-    params.calib_rz = readRequiredFieldDouble(this, "calib_rz");
+    //if(params.mode == LidarOdometryMode::NO_IMU)
+    //{
+    //    params.calib_px = 0.0;
+    //    params.calib_py = 0.0;
+    //    params.calib_pz = 0.0;
+    //    params.calib_rx = 0.0;
+    //    params.calib_ry = 0.0;
+    //    params.calib_rz = 0.0;
+    //}
+    //else
+    {
+        params.calib_px = readRequiredFieldDouble(this, "calib_px");
+        params.calib_py = readRequiredFieldDouble(this, "calib_py");
+        params.calib_pz = readRequiredFieldDouble(this, "calib_pz");
+        params.calib_rx = readRequiredFieldDouble(this, "calib_rx");
+        params.calib_ry = readRequiredFieldDouble(this, "calib_ry");
+        params.calib_rz = readRequiredFieldDouble(this, "calib_rz");
+    }
 
     params.max_associations_per_type = readFieldInt(this, "max_associations_per_type", 1000);
 
@@ -246,7 +269,7 @@ void LidarOdometryNode::pcCallback(const sensor_msgs::msg::PointCloud2::ConstSha
     StopWatch sw;
     sw.start();
 
-    if(first_acc_ || first_gyr_)
+    if( ((first_acc_ || first_gyr_) && (mode_ == LidarOdometryMode::IMU)) || (first_gyr_ && (mode_ == LidarOdometryMode::GYR)) )
     {
         RCLCPP_WARN(this->get_logger(), "Received point cloud before IMU messages, ignoring the point cloud");
         return;

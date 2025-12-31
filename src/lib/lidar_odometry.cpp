@@ -41,6 +41,8 @@ LidarOdometry::LidarOdometry(const LidarOdometryParams& params, LidarOdometryNod
     imu_data_.acc_var = params_.acc_std*params_.acc_std;
     imu_data_.gyr_var = params_.gyr_std*params_.gyr_std;
     lidar_weight_ = 1.0/params_.lidar_std;
+
+    testStateMonoJacobians(params_.mode);
 }
 
 
@@ -48,9 +50,23 @@ void LidarOdometry::addPc(const std::shared_ptr<std::vector<Pointd>>& pc, const 
 {
     bool has_imu_data = true;
     imu_mutex_.lock();
-    if((imu_data_.acc.size() == 0) || (imu_data_.gyr.size() == 0) || (imu_data_.acc[0].t > nanosToImuTime(t)) || (imu_data_.gyr[0].t > nanosToImuTime(t)))
+    if(params_.mode == LidarOdometryMode::IMU)
     {
-        has_imu_data = false;
+        if((imu_data_.acc.size() == 0) || (imu_data_.gyr.size() == 0) || (imu_data_.acc[0].t > nanosToImuTime(t)) || (imu_data_.gyr[0].t > nanosToImuTime(t)))
+        {
+            has_imu_data = false;
+        }
+    }
+    else if(params_.mode == LidarOdometryMode::GYR)
+    {
+        if((imu_data_.gyr.size() == 0) || (imu_data_.gyr[0].t > nanosToImuTime(t)))
+        {
+            has_imu_data = false;
+        }
+    }
+    else
+    {
+        first_ = false; // In NO_IMU mode, we don't care about IMU data
     }
     imu_mutex_.unlock();
 
@@ -141,14 +157,30 @@ void LidarOdometry::run()
         int64_t scan_period = (scan_count_ > 0) ? (int64_t)(scan_time_sum_ / scan_count_) : 100000000; 
         mutex_.unlock();
         imu_mutex_.lock();
-        if(imu_data_.acc.size() > 0 && imu_data_.gyr.size() > 0)
+        if( (params_.mode == LidarOdometryMode::IMU) && (imu_data_.acc.size() > 0) && (imu_data_.gyr.size() > 0))
         {
              last_time_t += std::min((int64_t)(imu_data_.acc.back().t * 1e9), (int64_t)(imu_data_.gyr.back().t * 1e9));
+        }
+        else if( (params_.mode == LidarOdometryMode::GYR) && (imu_data_.gyr.size() > 0))
+        {
+             last_time_t += (int64_t)(imu_data_.gyr.back().t * 1e9);
         }
         imu_mutex_.unlock();
         size_t id_to_run = (params_.low_latency) ? 1 : 2;
         pc_mutex_.lock();
-        bool has_data = (imu_data_.acc.size() > 0) && (imu_data_.gyr.size() > 0) && (pc_chunk_features_.size() > id_to_run) && (pc_chunks_t_[id_to_run] + scan_period) <= last_time_t;
+        bool has_data = false;
+        if(params_.mode == LidarOdometryMode::IMU)
+        {
+            has_data = (imu_data_.acc.size() > 0) && (imu_data_.gyr.size() > 0) && (pc_chunk_features_.size() > id_to_run) && (pc_chunks_t_[id_to_run] + scan_period) <= last_time_t;
+        }
+        else if(params_.mode == LidarOdometryMode::GYR)
+        {
+            has_data = (imu_data_.gyr.size() > 0) && (pc_chunk_features_.size() > id_to_run) && (pc_chunks_t_[id_to_run] + scan_period) <= last_time_t;
+        }
+        else // NO_IMU
+        {
+            has_data = (pc_chunk_features_.size() > id_to_run);
+        }
         pc_mutex_.unlock();
         if(has_data)
         {
@@ -411,10 +443,20 @@ std::tuple<std::vector<std::shared_ptr<std::vector<Pointd> > >, std::vector<std:
     mutex_.lock();
     int64_t margin = (int64_t)(scan_time_sum_ / (2*scan_count_));
     mutex_.unlock();
-    imu_mutex_.lock();
-    ugpm::ImuData imu_data = imu_data_.get(nanosToImuTime(t0 - margin), std::min(std::max(imu_data_.acc.back().t, imu_data_.gyr.back().t), nanosToImuTime(t1 + 3*margin)));
-    imu_mutex_.unlock();
-
+    ugpm::ImuData imu_data;
+    if(params_.mode != LidarOdometryMode::NO_IMU)
+    {
+        imu_mutex_.lock();
+        if(params_.mode == LidarOdometryMode::GYR)
+        {
+            imu_data = imu_data_.get(nanosToImuTime(t0 - margin), std::min(imu_data_.gyr.back().t, nanosToImuTime(t1 + 3*margin)));
+        }
+        else // IMU
+        {
+            imu_data = imu_data_.get(nanosToImuTime(t0 - margin), std::min(std::max(imu_data_.acc.back().t, imu_data_.gyr.back().t), nanosToImuTime(t1 + 3*margin)));
+        }
+        imu_mutex_.unlock();
+    }
 
     return {features, sparse_features, imu_data, t0, t1};
 }
@@ -434,7 +476,7 @@ void LidarOdometry::optimise()
     auto [features, sparse_features, imu_data, t0, t1] = getDataForOptimisation();
 
 
-    State state(imu_data, nanosToImuTime(t0), params_.state_frequency);
+    State state(imu_data, nanosToImuTime(t0), params_.state_frequency, params_.mode);
 
     // Initialize the state on the first optimisation
     if(first_optimisation_)
@@ -497,6 +539,11 @@ void LidarOdometry::optimise()
 
 void LidarOdometry::initState(const ugpm::ImuData& imu_data)
 {
+    if(params_.mode != LidarOdometryMode::IMU)
+    {
+        return;
+    }
+
     // Create the state times and the K_inv matrix
     Vec3 acc_temp;
     acc_temp[0] = imu_data.acc[0].data[0];
@@ -908,6 +955,12 @@ void LidarOdometry::addBlocks(ceres::Problem& problem, bool vel_only)
         problem.SetParameterBlockConstant(state_blocks_[1].data());
         problem.SetParameterBlockConstant(state_blocks_[2].data());
     }
+
+    if(params_.mode != LidarOdometryMode::IMU)
+    {
+        problem.SetParameterBlockConstant(state_blocks_[0].data());
+        problem.SetParameterBlockConstant(state_blocks_[2].data());
+    }
 }
 
 
@@ -938,13 +991,32 @@ void LidarOdometry::addLidarResiduals(ceres::Problem& problem
 
 void LidarOdometry::printState()
 {
-    std::cout << "State: " << std::endl;
-    std::cout << "    acc_bias: " << state_blocks_[0].transpose() << std::endl;
-    std::cout << "    gyr_bias: " << state_blocks_[1].transpose() << std::endl;
-    std::cout << "    gravity: " << state_blocks_[2].transpose() << std::endl;
-    std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
-    std::cout << "    time_offset: " << time_offset_ << std::endl;
-    std::cout << "    calib: " << state_calib_.transpose() << std::endl;
+    if(params_.mode == LidarOdometryMode::IMU)
+    {
+        std::cout << "State: " << std::endl;
+        std::cout << "    acc_bias: " << state_blocks_[0].transpose() << std::endl;
+        std::cout << "    gyr_bias: " << state_blocks_[1].transpose() << std::endl;
+        std::cout << "    gravity: " << state_blocks_[2].transpose() << std::endl;
+        std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
+        std::cout << "    time_offset: " << time_offset_ << std::endl;
+        std::cout << "    calib: " << state_calib_.transpose() << std::endl;
+    }
+    else if(params_.mode == LidarOdometryMode::GYR)
+    {
+        std::cout << "State: " << std::endl;
+        std::cout << "    gyr_bias: " << state_blocks_[1].transpose() << std::endl;
+        std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
+        std::cout << "    time_offset: " << time_offset_ << std::endl;
+        std::cout << "    calib: " << state_calib_.transpose() << std::endl;
+    }
+    else // NO_IMU
+    {
+        std::cout << "State: " << std::endl;
+        std::cout << "    ang_vel: " << state_blocks_[1].transpose() << std::endl;
+        std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
+        std::cout << "    time_offset: " << time_offset_ << std::endl;
+        std::cout << "    calib: " << state_calib_.transpose() << std::endl;
+    }
 }
 
 void LidarOdometry::logState()
@@ -992,35 +1064,46 @@ void LidarOdometry::prepareNextState(const State& state)
     pc_mutex_.lock();
     int64_t next_query_time = (params_.low_latency) ? pc_chunks_t_.at(1) : pc_chunks_t_.at(2);
     pc_mutex_.unlock();
-    auto [next_pos, next_rot] = state.query(nanosToImuTime(next_query_time), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
 
+    auto [next_pos, next_rot] = state.query(nanosToImuTime(next_query_time), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
     Mat3 R = ugpm::expMap(next_rot);
 
-    acc_bias_sum_ += state_blocks_[0];
-    gyr_bias_sum_ += state_blocks_[1];
-    bias_count_++;
-
-    if(bias_count_ >= 10)
+    if(params_.mode != LidarOdometryMode::NO_IMU)
     {
-        state_blocks_[0] = acc_bias_sum_ / bias_count_;
-        state_blocks_[1] = gyr_bias_sum_ / bias_count_;
+
+
+        acc_bias_sum_ += state_blocks_[0];
+        gyr_bias_sum_ += state_blocks_[1];
+        bias_count_++;
+
+        if(bias_count_ >= 10)
+        {
+            state_blocks_[0] = acc_bias_sum_ / bias_count_;
+            state_blocks_[1] = gyr_bias_sum_ / bias_count_;
+        }
+        else
+        {
+            state_blocks_[0] = Vec3::Zero();
+            state_blocks_[1] = Vec3::Zero();
+        }
+
+        if(params_.mode == LidarOdometryMode::IMU)
+        {
+            state_blocks_[2] = R.transpose()*state_blocks_[2];
+            state_blocks_[3] = R.transpose()*state_blocks_[3];
+        }
+
+        mutex_.lock();
+        int64_t margin = (int64_t)(scan_time_sum_ / (2*scan_count_));
+        mutex_.unlock();
+        imu_mutex_.lock();
+        imu_data_ = imu_data_.get(nanosToImuTime(pc_chunks_t_.at(0) - margin), std::numeric_limits<double>::max());
+        imu_mutex_.unlock();
     }
     else
     {
-        state_blocks_[0] = Vec3::Zero();
-        state_blocks_[1] = Vec3::Zero();
+        state_blocks_[3] = R.transpose()*state_blocks_[3];
     }
-
-    state_blocks_[2] = R.transpose()*state_blocks_[2];
-    state_blocks_[3] = R.transpose()*state_blocks_[3];
-
-
-    mutex_.lock();
-    int64_t margin = (int64_t)(scan_time_sum_ / (2*scan_count_));
-    mutex_.unlock();
-    imu_mutex_.lock();
-    imu_data_ = imu_data_.get(nanosToImuTime(pc_chunks_t_.at(0) - margin), std::numeric_limits<double>::max());
-    imu_mutex_.unlock();
 
     // Remove the first 2 chunks of point clouds and features
     int n_to_remove = (params_.low_latency) ? 1 : 2;

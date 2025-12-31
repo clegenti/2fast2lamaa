@@ -42,6 +42,7 @@ def generate_launch_description():
                 {"state_freq": 200.0},
                 {"max_associations_per_type": 750},
                 {"planar_only": True},
+                {"mode": "gyr"},
 
                 {"absolute_time": True},
 

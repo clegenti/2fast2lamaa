@@ -15,33 +15,15 @@ class State
         std::vector<ugpm::PreintMeas> preint_meas_;
         double state_period_;
         double start_t_;
+        LidarOdometryMode mode_ = LidarOdometryMode::IMU;
 
     public:
 
-        State(const ugpm::ImuData& imu_data, const double first_t, const double state_freq);
+        State(const ugpm::ImuData& imu_data, const double first_t, const double state_freq, const LidarOdometryMode mode);
         State(){};
 
 
-        std::vector<std::pair<Vec3, Vec3> > query(
-                const std::vector<double>& query_time
-                , const Vec3& acc_bias
-                , const Vec3& gyr_bias
-                , const Vec3& gravity
-                , const Vec3& vel
-                , const double dt
-                ) const;
-
         std::vector<std::pair<Vec3, Vec3> > queryApprox(
-                const std::vector<double>& query_time
-                , const Vec3& acc_bias
-                , const Vec3& gyr_bias
-                , const Vec3& gravity
-                , const Vec3& vel
-                , const double dt
-                ) const;
-
-        std::pair<std::vector<std::pair<Vec3, Vec3> >,
-                std::vector<std::vector<std::pair<MatX, MatX> > > >queryWthJacobian(
                 const std::vector<double>& query_time
                 , const Vec3& acc_bias
                 , const Vec3& gyr_bias
@@ -82,18 +64,6 @@ class State
                 , const Vec3& vel
                 , const double dt
                 ) const;
-        
-        Vec3 queryVelocity(
-                const double query_time
-                , const Vec3& acc_bias
-                , const Vec3& gyr_bias
-                , const Vec3& gravity
-                , const Vec3& vel
-                , const double dt
-                ) const;
 };
 
-void testStateMonoJacobians();
-
-
-void testStateJacobians();
+void testStateMonoJacobians(LidarOdometryMode mode);
