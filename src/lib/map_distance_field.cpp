@@ -7,16 +7,6 @@
 #include <eigen3/Eigen/Dense>
 
 
-struct PhNeighborQuery
-{
-    void operator()(const PointPh& point, CellPtr& cell)
-    {
-        neighbors.push_back({point, cell});
-    }
-    std::vector<std::pair<PointPh, CellPtr> > neighbors;
-};
-
-
 
 
 
@@ -418,13 +408,10 @@ MapDistField::MapDistField(const MapDistFieldOptions& options):
     , opt_(options)
     , cell_hyperparameters(options.gp_lengthscale < 0 ? 2.0*options.cell_size : options.gp_lengthscale, options.gp_sigma_z, options.use_voxel_weights)
 {
-    //Cell dummy_cell(Vec3::Zero(), 0.0, this); // To access the hyperparameters
-    //dummy_cell.testKernelAndRevert();
-    //dummy_cell.testKernelAndRevert();
     hash_map_ = std::make_unique<HashMap<CellPtr> >();
     if(opt_.edge_field)
     {
-        hash_map_edge_ = std::make_unique<ankerl::unordered_dense::map<CellPtr, PointPh>>();
+        hash_map_edge_ = std::make_unique<ankerl::unordered_dense::set<CellPtr>>();
     }
 
     calibrateUncertaintyProxy();
@@ -450,8 +437,8 @@ void MapDistField::clear()
         hash_map_edge_->clear();
     }
     free_space_cells_.clear();
-    phtree_.clear();
-    phtree_edge_.clear();
+    ioctree_.clear();
+    ioctree_edge_.clear();
     num_cells_ = 0;
     path_length_ = 0.0;
     scan_counter_ = -1;
@@ -619,8 +606,12 @@ void MapDistField::cleanCells()
     clean_mutex_.lock();
     for(auto& index : cells_to_clean_)
     {
-        auto cell = hash_map_->at(index);
-        cell->resetAlpha();
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        it->second->resetAlpha();
     }
     cells_to_clean_.clear();
     clean_mutex_.unlock();
@@ -754,12 +745,26 @@ std::pair<ankerl::unordered_dense::set<GridIndex>, std::vector<bool> > MapDistFi
 std::vector<Vec3> MapDistField::getNeighborPoints(const Vec3& pt, const double radius)
 {
     std::vector<Vec3> neighbors;
-    PhNeighborQuery query;
-    phtree_.for_each(query, improbable::phtree::FilterSphere({pt[0], pt[1], pt[2]}, radius, phtree_.converter()));
-    for(auto& neighbor : query.neighbors)
+    std::vector<PointSimple> neighbors_octree_;
+    std::vector<double> neighbor_dists;
+    ioctree_.radiusNeighbors(PointSimple{pt[0], pt[1], pt[2]}, radius, neighbors_octree_, neighbor_dists);
+    for(auto& neighbor : neighbors_octree_)
     {
-        neighbors.push_back(neighbor.second->getPt());
+        GridIndex index = getGridIndex(neighbor);
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        neighbors.push_back(it->second->getPt());
     }
+
+    //PhNeighborQuery query;
+    //phtree_.for_each(query, improbable::phtree::FilterSphere({pt[0], pt[1], pt[2]}, radius, phtree_.converter()));
+    //for(auto& neighbor : query.neighbors)
+    //{
+    //    neighbors.push_back(neighbor.second->getPt());
+    //}
     return neighbors;
 }
 
@@ -816,6 +821,10 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
 
     // Project the points to the map frame
     double min_point_time = std::numeric_limits<double>::max();
+    std::vector<PointSimple> pts_to_add_octree;
+    pts_to_add_octree.reserve(pts_to_add.size()/8);
+    std::vector<PointSimple> pts_to_add_octree_edge;
+    pts_to_add_octree_edge.reserve(pts_to_add.size()/16);
     for (size_t i = 0; i < pts_to_add.size(); i++)
     {
         if(pts_to_add[i].type == kSkyPoint) continue;
@@ -855,25 +864,59 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
             hash_map_->insert({index, cell_ptr});
             num_cells_++;
             temp_pt = getCenterPt(index);
-            phtree_.emplace({temp_pt[0], temp_pt[1], temp_pt[2]}, cell_ptr);
+            //phtree_.emplace({temp_pt[0], temp_pt[1], temp_pt[2]}, cell_ptr);
+            pts_to_add_octree.push_back(PointSimple{temp_pt[0], temp_pt[1], temp_pt[2]});
+
         }
         else
         {
-            cell_ptr = hash_map_->at(index);
-            cell_ptr->addPt(temp_pt, pts_to_add[i].i);
+            auto it = hash_map_->find(index);
+            if(it == hash_map_->end())
+            {
+                continue;
+            }
+            it->second->addPt(temp_pt, pts_to_add[i].i);
         }
 
         if(opt_.edge_field && (pts_to_add[i].type == 2))
         {
             if (hash_map_edge_->count(cell_ptr) == 0)
             {
-                PointPh edge_point = {temp_pt[0], temp_pt[1], temp_pt[2]};
-                hash_map_edge_->insert({cell_ptr, edge_point});
-                phtree_edge_.emplace(edge_point, cell_ptr);
+                //PointPh edge_point = {temp_pt[0], temp_pt[1], temp_pt[2]};
+                //hash_map_edge_->insert({cell_ptr, edge_point});
+                //phtree_edge_.emplace(edge_point, cell_ptr);
+                hash_map_edge_->insert(cell_ptr);
+
+                PointSimple edge_octree_point = {temp_pt[0], temp_pt[1], temp_pt[2]};
+                pts_to_add_octree_edge.push_back(edge_octree_point);
             }
         }
     }
 
+    // Insert the new points in the octree
+    if(pts_to_add_octree.size() > 0)
+    {
+        if(ioctree_.size() == 0)
+        {
+            ioctree_.initialize(pts_to_add_octree);
+        }
+        else
+        {
+            ioctree_.update(pts_to_add_octree);
+        }
+    }
+    // Insert the new edge points in the octree
+    if(opt_.edge_field && pts_to_add_octree_edge.size() > 0)
+    {
+        if(ioctree_edge_.size() == 0)
+        {
+            ioctree_edge_.initialize(pts_to_add_octree_edge);
+        }
+        else
+        {
+            ioctree_edge_.update(pts_to_add_octree_edge);
+        }
+    }
 
 
 
@@ -881,11 +924,11 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     sw.print("Time to transform and add points");
     std::cout << "Number of cells in the map: " << num_cells_ << std::endl;
     std::cout << "Number in hash map: " << hash_map_->size() << std::endl;
-    std::cout << "Number in phtree: " << phtree_.size() << std::endl;
+    std::cout << "Number in ioctree: " << ioctree_.size() << std::endl;
     if(opt_.edge_field)
     {
         std::cout << "Number in edge map: " << hash_map_edge_->size() << std::endl;
-        std::cout << "Number in phtree edge: " << phtree_edge_.size() << std::endl;
+        std::cout << "Number in ioctree edge: " << ioctree_edge_.size() << std::endl;
     }
 }
 
@@ -951,24 +994,34 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
     {
         //free_space_cells_.insert(map_index);
         // For each cell to remove, also remove the cell from the neighbors
-        PhNeighborQuery query_to_remove;
+        //PhNeighborQuery query_to_remove;
         Vec3 map_pt = getCenterPt(map_index);
-        phtree_.for_each(query_to_remove, improbable::phtree::FilterSphere({map_pt[0], map_pt[1], map_pt[2]}, 2*cell_size_, phtree_.converter()));
+        std::vector<PointSimple> neighbors_octree_;
+        std::vector<double> neighbor_dists;
+
+        ioctree_.radiusNeighbors(PointSimple{map_pt[0], map_pt[1], map_pt[2]}, 2*cell_size_, neighbors_octree_, neighbor_dists);
+
         bool one = false;
-        for(auto& neighbor : query_to_remove.neighbors)
+        for(auto& neighbor_octree : neighbors_octree_)
         {
-            if(opt_.edge_field && hash_map_edge_->count(neighbor.second) > 0)
+            GridIndex grid_index = getGridIndex(neighbor_octree);
+            auto it = hash_map_->find(grid_index);
+            if(it == hash_map_->end())
             {
-                phtree_edge_.erase(hash_map_edge_->at(neighbor.second));
-                hash_map_edge_->erase(neighbor.second);
+                continue;
             }
-            phtree_.erase(neighbor.first);
-            GridIndex neighbor_index = neighbor.second->getIndex();
+            CellPtr neighbor_cell = it->second;
+            if(opt_.edge_field && hash_map_edge_->count(neighbor_cell) > 0)
+            {
+                ioctree_edge_.boxWiseDelete(getCellBox(grid_index), true);
+                hash_map_edge_->erase(neighbor_cell);
+            }
+            ioctree_.boxWiseDelete(getCellBox(grid_index), true);
+            GridIndex neighbor_index = getGridIndex(neighbor_octree);
             free_space_cells_.insert(neighbor_index);
             hash_map_->erase(neighbor_index);
             num_cells_--;
-
-            delete neighbor.second;
+            delete neighbor_cell;
 
             one = true;
             if((!opt_.over_reject) && one)
@@ -985,26 +1038,21 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
     
 double MapDistField::getMinTime(const Vec3& pt)
 {
-    auto nn = phtree_.begin_knn_query(1, {pt[0], pt[1], pt[2]}, DistancePh());
-    return nn.second()->getFirstTime();
-}
-
-std::pair<double, double> MapDistField::getMinTimeAndProxyWeight(const Vec3& pt)
-{
-    auto nn = phtree_.begin_knn_query(1, {pt[0], pt[1], pt[2]}, DistancePh());
-    double uncertainty_proxy = nn.second()->getUncertaintyProxy();
-    // If the uncertainty proxy is 0, the weight is 1, if it is superior to calibrated value-1 then the weight is 0.3, linear in between
-    const double lowest = 0.3;
-    if(uncertainty_proxy <= 0.0)
+    PointSimple query_point = {pt[0], pt[1], pt[2]};
+    std::vector<double> neighbor_dists;
+    std::vector<PointSimple> neighbors;
+    ioctree_.knnNeighbors(query_point, 1, neighbors, neighbor_dists);
+    if(neighbors.size() == 0)
     {
-        return {nn.second()->getFirstTime(), 1.0};
+        return std::numeric_limits<double>::max();
     }
-    if(uncertainty_proxy >= cell_hyperparameters.uncertainty_proxy_calib - 1.0)
+    GridIndex index = getGridIndex(neighbors[0]);
+    auto it = hash_map_->find(index);
+    if(it == hash_map_->end())
     {
-        return {nn.second()->getFirstTime(), lowest};
+        return std::numeric_limits<double>::max();
     }
-    double weight = 1.0 - (1.0 - lowest)*(uncertainty_proxy/(cell_hyperparameters.uncertainty_proxy_calib - 1.0));
-    return {nn.second()->getFirstTime(), weight};
+    return it->second->getFirstTime();
 }
 
 
@@ -1060,59 +1108,71 @@ std::pair<std::vector<Pointd>, std::vector<Vec3> > MapDistField::getPtsAndNormal
     return {pts, normals};
 }
 
-std::pair<std::vector<Vec3>, std::vector<Vec3> > MapDistField::getClosestPtAndNormal(const std::vector<Vec3>& pts, const bool clean_behind)
-{
-    std::vector<Vec3> closest_pts(pts.size());
-    std::vector<Vec3> normals(pts.size());
-    #pragma omp parallel for num_threads(10)
-    for(size_t i = 0; i < pts.size(); i++)
-    {
-        auto cell = getClosestCell(pts[i]);
-        closest_pts[i] = cell->getPt();
-        normals[i] = cell->getNormals({pts[i]}, clean_behind)[0];
-        // Check if there is a nan in the normal
-        if(!std::isfinite(normals[i][0]) || !std::isfinite(normals[i][1]) || !std::isfinite(normals[i][2]))
-        {
-            normals[i] = Vec3::Zero();
-        }
-    }
-    return {closest_pts, normals};
-}
 
 
 
 double MapDistField::queryDistField(const Vec3& pt, const bool field, const int type)
 {
     double dist = std::numeric_limits<double>::max();
-    TreePh<CellPtr>& tree = (opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0) ? phtree_edge_ : phtree_;
-    for(auto nn= tree.begin_knn_query(num_neighbors_, {pt[0], pt[1], pt[2]}, DistancePh()); nn != tree.end(); ++nn)
+    thuni::Octree& octree = (opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0) ? ioctree_edge_ : ioctree_;
+    if(octree.size() == 0)
     {
+        return dist;
+    }
+    std::vector<double> neighbor_dists;
+    std::vector<PointSimple> neighbors;
+    octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
+    for(size_t i = 0; i < neighbors.size(); i++)
+    {
+        GridIndex index = getGridIndex(neighbors[i]);
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        CellPtr cell = it->second;
+        
         if(field)
         {
-            double temp_dist = nn.second()->getDist(pt);
+            double temp_dist = cell->getDist(pt);
             dist = std::min(dist, temp_dist);
         }
         else
         {
-            double temp_dist = (pt - nn.second()->getPt()).norm();
+            double temp_dist = (pt - cell->getPt()).norm();
             dist = std::min(dist, temp_dist);
         }
-    }    
+    }
+
+    if(dist == std::numeric_limits<double>::max())
+    {
+        return 0.0; // No cell found, return 0 distance for not affecting optimization
+    }
     return dist;
 }
 
 std::pair<double, double> MapDistField::queryDistFieldAndUncertaintyProxy(const Vec3& pt)
 {
     double dist = std::numeric_limits<double>::max();
-    double uncertainty_proxy = 0.0;
+    double uncertainty_proxy = std::numeric_limits<double>::max();
     CellPtr best_cell = nullptr;
-    for(auto nn= phtree_.begin_knn_query(num_neighbors_, {pt[0], pt[1], pt[2]}, DistancePh()); nn != phtree_.end(); ++nn)
+    std::vector<double> neighbor_dists;
+    std::vector<PointSimple> neighbors;
+    ioctree_.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
+    for(size_t i = 0; i < neighbors.size(); i++)
     {
-        double temp_dist = nn.second()->getDist(pt);
+        GridIndex index = getGridIndex(neighbors[i]);
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        CellPtr cell = it->second;
+        double temp_dist = cell->getDist(pt);
         if(temp_dist < dist)
         {
             dist = temp_dist;
-            best_cell = nn.second();
+            best_cell = cell;
         }
     }
     if(best_cell)
@@ -1141,22 +1201,36 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
     double dist = std::numeric_limits<double>::max();
     Vec3 grad = Vec3::Zero();
     CellPtr best_cell = nullptr;
-    TreePh<CellPtr>& tree = (opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0) ? phtree_edge_ : phtree_;
-    for(auto nn= tree.begin_knn_query(num_neighbors_, {pt[0], pt[1], pt[2]}, DistancePh()); nn != tree.end(); ++nn)
+    std::vector<double> neighbor_dists;
+    std::vector<PointSimple> neighbors;
+    thuni::Octree& octree = (opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0) ? ioctree_edge_ : ioctree_;
+    if(octree.size() == 0)
     {
+        return {dist, grad};
+    }
+    octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
+    for(size_t i = 0; i < neighbors.size(); i++)
+    {
+        GridIndex index = getGridIndex(neighbors[i]);
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        CellPtr cell = it->second;
         double temp_dist;
         if(field)
         {
-            temp_dist = nn.second()->getDist(pt);
+            temp_dist = cell->getDist(pt);
         }
         else
         {
-            temp_dist = (pt - nn.second()->getPt()).norm();
+            temp_dist = (pt - cell->getPt()).norm();
         }
         if(temp_dist < dist)
         {
             dist = temp_dist;
-            best_cell = nn.second();
+            best_cell = cell;
         }
     }
     if(best_cell)
@@ -1170,6 +1244,10 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
             grad = (pt - best_cell->getPt()).normalized();
         }
     }
+    else
+    {
+        dist = 0.0; // No cell found, return 0 distance for not affecting optimization
+    }
     return {dist, grad};
 }
 
@@ -1177,28 +1255,27 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
 
 
 
-double MapDistField::distToClosestCell(const Vec3& pt) const
-{
-    double dist = std::numeric_limits<double>::max();
-    for(auto nn= phtree_.begin_knn_query(1, {pt[0], pt[1], pt[2]}, DistancePh()); nn != phtree_.end(); ++nn)
-    {
-        dist = (pt - nn.second()->getPt()).norm();
-    }
-    return dist;
-}
-
-
-CellPtr MapDistField::getClosestCell(const Vec3& pt) const
+CellPtr MapDistField::getClosestCell(const Vec3& pt)
 {
     CellPtr closest_cell = nullptr;
     double dist = std::numeric_limits<double>::max();
-    for(auto nn= phtree_.begin_knn_query(num_neighbors_, {pt[0], pt[1], pt[2]}, DistancePh()); nn != phtree_.end(); ++nn)
+    std::vector<double> neighbor_dists;
+    std::vector<PointSimple> neighbors;
+    ioctree_.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
+    for(auto& neighbor : neighbors)
     {
-        double temp_dist = (pt - nn.second()->getPt()).norm();
+        GridIndex index = getGridIndex(neighbor);
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        CellPtr cell = it->second;
+        double temp_dist = (pt - cell->getPt()).norm();
         if(temp_dist < dist)
         {
             dist = temp_dist;
-            closest_cell = nn.second();
+            closest_cell = cell;
         }
     }
     return closest_cell;
@@ -1219,9 +1296,26 @@ GridIndex MapDistField::getGridIndex(const Vec2& pos)
     return std::make_tuple(std::floor(pos[0]*inv_cell_size_), std::floor(pos[1]*inv_cell_size_), 0);
 }
 
+GridIndex MapDistField::getGridIndex(const PointSimple& pos)
+{
+    return std::make_tuple(std::floor(pos.x*inv_cell_size_), std::floor(pos.y*inv_cell_size_), std::floor(pos.z*inv_cell_size_));
+}
+
 Vec3 MapDistField::getCenterPt(const GridIndex& index)
 {
     return Vec3(std::get<0>(index)*cell_size_f_ + half_cell_size_f_, std::get<1>(index)*cell_size_f_ + half_cell_size_f_, std::get<2>(index)*cell_size_f_ + half_cell_size_f_);
+}
+
+thuni::BoxDeleteType MapDistField::getCellBox(const GridIndex& index)
+{
+    thuni::BoxDeleteType box;
+    box.min[0] = std::get<0>(index)*cell_size_f_;
+    box.min[1] = std::get<1>(index)*cell_size_f_;
+    box.min[2] = std::get<2>(index)*cell_size_f_;
+    box.max[0] = box.min[0] + cell_size_f_;
+    box.max[1] = box.min[1] + cell_size_f_;
+    box.max[2] = box.min[2] + cell_size_f_;
+    return box;
 }
 
 
@@ -1229,11 +1323,18 @@ std::vector<CellPtr> MapDistField::getNeighborCells(const Vec3& pt)
 {
     std::vector<CellPtr> neighbors;
     double radius = (opt_.neighborhood_size+0.5)*cell_size_;
-    PhNeighborQuery query;
-    phtree_.for_each(query, improbable::phtree::FilterSphere({pt[0], pt[1], pt[2]}, radius, phtree_.converter()));
-    for(auto& neighbor : query.neighbors)
+    std::vector<PointSimple> neighbors_octree_;
+    std::vector<double> neighbor_dists;
+    ioctree_.radiusNeighbors(PointSimple{pt[0], pt[1], pt[2]}, radius, neighbors_octree_, neighbor_dists);
+    for(auto& neighbor : neighbors_octree_)
     {
-        neighbors.push_back(neighbor.second);
+        GridIndex index = getGridIndex(neighbor);
+        auto it = hash_map_->find(index);
+        if(it == hash_map_->end())
+        {
+            continue;
+        }
+        neighbors.push_back(it->second);
     }
     return neighbors;
 }

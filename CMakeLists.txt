@@ -60,18 +60,15 @@ target_link_libraries(lidar_scan_odometry
 )
 target_link_libraries(gp_map
   Eigen3::Eigen
-  phtree
   Ceres::ceres
   "${cpp_typesupport_target}"
 )
 
 target_link_libraries(map_cleaner
-  phtree
   Eigen3::Eigen
   Ceres::ceres
 )
 target_link_libraries(offline_loop_closure
-  phtree
   Eigen3::Eigen
   Ceres::ceres
 )
@@ -116,8 +113,6 @@ ament_target_dependencies(offline_loop_closure
 include_directories(
   include
   external_lib
-  external_lib/phtree-cpp/include
-
 )
 
 # Enable openMP

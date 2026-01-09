@@ -9,18 +9,18 @@
 #include <mutex>
 #include "ankerl/unordered_dense.h"
 
-#include "phtree-cpp/include/phtree/phtree.h"
-#include "phtree-cpp/include/phtree/filter.h"
+#include "ioctree/octree2/Octree.h"
 
 #include <ceres/ceres.h>
 
 
+struct PointSimple
+{
+    double x;
+    double y;
+    double z;
+};
 
-typedef improbable::phtree::PhPointD<3> PointPh;
-template <typename V>
-using TreePh = improbable::phtree::PhTreeD<3, V>;
-
-typedef improbable::phtree::DistanceEuclidean<3> DistancePh;
 
 template <typename V>
 using HashMap = ankerl::unordered_dense::map<GridIndex, V>;
@@ -153,7 +153,7 @@ class MapDistField {
         ankerl::unordered_dense::set<GridIndex> free_space_cells_;
 
         std::unique_ptr<HashMap<CellPtr> > hash_map_;
-        std::unique_ptr<ankerl::unordered_dense::map<CellPtr, PointPh> > hash_map_edge_;
+        std::unique_ptr<ankerl::unordered_dense::set<CellPtr> > hash_map_edge_;
         const double cell_size_;
         const double inv_cell_size_;
         const float cell_size_f_;
@@ -163,9 +163,8 @@ class MapDistField {
         std::mutex clean_mutex_;
         ankerl::unordered_dense::set<GridIndex> cells_to_clean_;
 
-
-        TreePh<CellPtr> phtree_;
-        TreePh<CellPtr> phtree_edge_;
+        thuni::Octree ioctree_;
+        thuni::Octree ioctree_edge_;
 
         std::vector<Pointd> prev_scan_;
         Mat4 prev_pose_;
@@ -216,9 +215,6 @@ class MapDistField {
         double queryDistField(const Vec3& query_pt, const bool field=true, const int type=0);
         std::pair<double, double> queryDistFieldAndUncertaintyProxy(const Vec3& query_pt);
 
-        std::pair<std::vector<Vec3>, std::vector<Vec3> > getClosestPtAndNormal(const std::vector<Vec3>& query_pts, const bool clean_behind=false); 
-
-        double getAvgTime(const Vec3& pt);
         double getMinTime(const Vec3& pt);
         std::pair<double, double> getMinTimeAndProxyWeight(const Vec3& pt);
 
@@ -226,7 +222,9 @@ class MapDistField {
 
         GridIndex getGridIndex(const Vec3& pt);
         GridIndex getGridIndex(const Vec2& pt);
+        GridIndex getGridIndex(const PointSimple& pt);
         Vec3 getCenterPt(const GridIndex& index);
+        thuni::BoxDeleteType getCellBox(const GridIndex& index);
 
 
         void writeMap(const std::string& filename);
@@ -235,9 +233,7 @@ class MapDistField {
 
         bool isInHash(const GridIndex& index) const{ return hash_map_->find(index) != hash_map_->end(); }
 
-        double distToClosestCell(const Vec3& pt) const;
-
-        CellPtr getClosestCell(const Vec3& pt) const;
+        CellPtr getClosestCell(const Vec3& pt);
 
         std::vector<CellPtr> getNeighborCells(const Vec3& pt);
         
