@@ -35,16 +35,6 @@ LidarOdometryNode::LidarOdometryNode()
         throw std::runtime_error("Invalid mode parameter for LidarOdometryNode");
     }
 
-    //if(params.mode == LidarOdometryMode::NO_IMU)
-    //{
-    //    params.calib_px = 0.0;
-    //    params.calib_py = 0.0;
-    //    params.calib_pz = 0.0;
-    //    params.calib_rx = 0.0;
-    //    params.calib_ry = 0.0;
-    //    params.calib_rz = 0.0;
-    //}
-    //else
     {
         params.calib_px = readRequiredFieldDouble(this, "calib_px");
         params.calib_py = readRequiredFieldDouble(this, "calib_py");
@@ -274,7 +264,7 @@ void LidarOdometryNode::pcCallback(const sensor_msgs::msg::PointCloud2::ConstSha
         RCLCPP_WARN(this->get_logger(), "Received point cloud before IMU messages, ignoring the point cloud");
         return;
     }
-    auto [incoming_pts, temp_has_intensity, temp_has_channel] = pointCloud2MsgToPtsVec<double>(pc_msg, time_field_multiplier_, true, broken_channels_, absolute_time_);
+    auto [incoming_pts, temp_has_intensity, temp_has_channel, is_2d] = pointCloud2MsgToPtsVec<double>(pc_msg, time_field_multiplier_, true, broken_channels_, absolute_time_);
     std::shared_ptr<std::vector<Pointd>> incoming_pts_ptr = std::make_shared<std::vector<Pointd>>(std::move(incoming_pts));
     std::cout << "Point cloud with " << incoming_pts_ptr->size() << " points received." << std::endl;
     rclcpp::Time header_time(pc_msg->header.stamp);
@@ -292,6 +282,7 @@ void LidarOdometryNode::pcCallback(const sensor_msgs::msg::PointCloud2::ConstSha
             pt.z *= pc_scale_;
         }
     }
+    lidar_odometry_->setIs2D(is_2d);
     lidar_odometry_->addPc(incoming_pts_ptr, header_time.nanoseconds());
 
     sw.stop();

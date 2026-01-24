@@ -290,12 +290,13 @@ inline sensor_msgs::msg::PointCloud2 ptsVecToPointCloud2MsgInternal(const std::v
 
 
 
-inline std::vector<Pointd> pointCloud2MsgToPtsVecInternal(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
+inline std::pair<std::vector<Pointd>, bool> pointCloud2MsgToPtsVecInternal(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
 {
     std::vector<Pointd> output;
     output.resize(msg->width*msg->height);
     bool has_color = (msg->fields.size() > 8);
     int64_t time_offset = rclcpp::Time(msg->header.stamp).nanoseconds();
+    bool is_2d = true;
     for(size_t i=0; i < output.size(); ++i)
     {
         float temp_x, temp_y, temp_z;
@@ -305,6 +306,10 @@ inline std::vector<Pointd> pointCloud2MsgToPtsVecInternal(const sensor_msgs::msg
         output[i].x = (double)temp_x;
         output[i].y = (double)temp_y;
         output[i].z = (double)temp_z;
+        if(temp_z != 0.0f)
+        {
+            is_2d = false;
+        }
         uint32_t t;
         memcpy(&(output[i].i), &(msg->data[(msg->point_step*i) + 12]), sizeof(float));
         memcpy(&t, &(msg->data[(msg->point_step*i) + 16]), sizeof(uint32_t));
@@ -319,12 +324,12 @@ inline std::vector<Pointd> pointCloud2MsgToPtsVecInternal(const sensor_msgs::msg
             output[i].has_color = true;
         }
     }
-    return output;
+    return {output, is_2d};
 }
 
 // Function to read a PointCloud2 message and convert it to a vector of points
 template <typename T>
-inline std::tuple<std::vector<PointTemplated<T> >, bool, bool> pointCloud2MsgToPtsVec(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const double time_scale = 1e-9, bool need_time = true, const std::set<int>& dead_channels = std::set<int>(), bool absolute_time = false)
+inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2MsgToPtsVec(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const double time_scale = 1e-9, bool need_time = true, const std::set<int>& dead_channels = std::set<int>(), bool absolute_time = false)
 {
     std::vector<PointTemplated<T>> output;
     rclcpp::Time time = rclcpp::Time(msg->header.stamp);
@@ -340,6 +345,7 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool> pointCloud2MsgToP
     bool has_color = (fields[PointFieldTypes::RGB].first != -1);
 
     bool has_dead_channel = false;
+    bool is_2d = true;
     if(has_channel && !dead_channels.empty())
     {
         has_dead_channel = true;
@@ -404,6 +410,10 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool> pointCloud2MsgToP
         pt.x = (T)temp_x;
         pt.y = (T)temp_y;
         pt.z = (T)temp_z;
+        if(temp_z != 0.0f)
+        {
+            is_2d = false;
+        }
         if(has_time)
         {
             if(fields[PointFieldTypes::TIME].second == sensor_msgs::msg::PointField::FLOAT64)
@@ -475,7 +485,7 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool> pointCloud2MsgToP
         }
         output.push_back(pt);
     }
-    return {output, has_intensity, has_channel};
+    return {output, has_intensity, has_channel, is_2d};
 }
 /////// End helper functions to subscribe and publish PointCloud2 messages
 

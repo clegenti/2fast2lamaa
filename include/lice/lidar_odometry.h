@@ -76,6 +76,15 @@ class LidarOdometry
         void run();
         std::shared_ptr<std::thread> runThread();
 
+        void setIs2D(const bool is_2d)
+        {
+            is_2d_ = is_2d;
+            if(is_2d_ && (params_.mode == LidarOdometryMode::IMU))
+            {
+                throw std::runtime_error("LidarOdometry::setIs2D: Cannot set is_2d flag when using IMU mode");
+            }
+        }
+
 
         // Destructor
         ~LidarOdometry()
@@ -110,6 +119,7 @@ class LidarOdometry
         // Storing an time offset to interact with the UGPM data structure
         bool first_ = true;
         int64_t imu_time_offset_ = 0;
+        bool is_2d_ = false;
 
         // Storing the chunks of point clouds
         std::vector<std::shared_ptr<std::vector<Pointd> > > pc_chunks_;

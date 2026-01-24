@@ -52,6 +52,8 @@ add_executable(gp_map src/gp_map_node.cpp src/lib/map_distance_field.cpp)
 add_executable(map_cleaner src/map_cleaning.cpp src/lib/map_distance_field.cpp)
 add_executable(offline_loop_closure src/offline_loop_closure.cpp src/lib/submap_bundle_adjustment.cpp src/lib/map_distance_field.cpp)
 
+add_executable(lidar_2d_conversion src/2d_lidar_conversion_node.cpp)
+
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 target_link_libraries(lidar_scan_odometry
@@ -71,6 +73,9 @@ target_link_libraries(map_cleaner
 target_link_libraries(offline_loop_closure
   Eigen3::Eigen
   Ceres::ceres
+)
+target_link_libraries(lidar_2d_conversion
+  Eigen3::Eigen
 )
 
 
@@ -109,6 +114,11 @@ ament_target_dependencies(offline_loop_closure
   Eigen3
   Ceres)
 
+ament_target_dependencies(lidar_2d_conversion
+  rclcpp
+  sensor_msgs
+  Eigen3
+) 
 
 include_directories(
   include
@@ -124,7 +134,7 @@ install(
     )
 
 install(TARGETS
-  lidar_scan_odometry gp_map map_cleaner offline_loop_closure
+  lidar_scan_odometry gp_map map_cleaner offline_loop_closure lidar_2d_conversion
   DESTINATION lib/${PROJECT_NAME})
 
 

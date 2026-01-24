@@ -491,6 +491,16 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     num_neighbors_ = 1;
 
     ceres::Problem problem;
+    if(is_2d_)
+    {
+        ceres::SubsetManifold* manifold = new ceres::SubsetManifold(6, {2, 3, 4});
+        problem.AddParameterBlock(pose_correction_state.data(), 6, manifold);
+        
+    }
+    else
+    {
+        problem.AddParameterBlock(pose_correction_state.data(), 6);
+    }
 
     StopWatch sw;
     sw.start();

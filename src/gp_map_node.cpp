@@ -343,7 +343,13 @@ class GpMapNode: public rclcpp::Node
             if(add_to_map)
             {
                 // First convert the point cloud message to a vector of points
-                std::vector<Pointd> pts = getPcFromMsg(msg);
+                auto [pts, is_2d] = getPcFromMsg(msg);
+                if(is_2d)
+                {
+                    map_mutex_.lock();
+                    map_->set2D(true);
+                    map_mutex_.unlock();
+                }
 
                 if(localization_ && first_)
                 {
@@ -515,19 +521,20 @@ class GpMapNode: public rclcpp::Node
             return need_update;
         }
 
-        std::vector<Pointd> getPcFromMsg(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
+        std::pair<std::vector<Pointd>, bool> getPcFromMsg(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
         {
             std::vector<Pointd> pts;
+            bool is_2d = false;
             if(pc_type_internal_)
             {
-                pts = pointCloud2MsgToPtsVecInternal(msg);
+                std::tie(pts, is_2d) = pointCloud2MsgToPtsVecInternal(msg);
             }
             else
             {
                 bool rubish0, rubish1;
-                std::tie(pts, rubish0, rubish1) = pointCloud2MsgToPtsVec<double>(msg, 1e-9, false);
+                std::tie(pts, rubish0, rubish1, is_2d) = pointCloud2MsgToPtsVec<double>(msg, 1e-9, false);
             }
-            return pts;
+            return {pts, is_2d};
         }
 
         void pcPriorCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc_msg, const geometry_msgs::msg::TransformStamped::ConstSharedPtr odom_msg)

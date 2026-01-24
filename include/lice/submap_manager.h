@@ -48,6 +48,7 @@ class SubmapManager
             }
 
             current_map_ = std::make_shared<MapDistField>(options_);
+            current_map_->set2D(is_2d_);
 
             if(localization_)
             {
@@ -213,6 +214,7 @@ class SubmapManager
                         std::cout << "Switching from submap " << current_map_id_ << " to submap " << new_map_id << "\n\n\n\n\n" << std::endl;
                         current_map_ = std::make_shared<MapDistField>(options_);
                         current_map_->loadMap(submap_paths_[new_map_id]);
+                        current_map_->set2D(is_2d_);
                         current_map_id_ = new_map_id;
                     }
                 }
@@ -266,6 +268,7 @@ class SubmapManager
                 if((current_map_->getPathLength() > submap_length_ * (1.0 - submap_overlap_)) && (next_map_ == nullptr))
                 {
                     next_map_ = std::make_shared<MapDistField>(options_);
+                    next_map_->set2D(is_2d_);
                 }
                 if(next_map_)
                 {
@@ -319,6 +322,15 @@ class SubmapManager
         }
 
 
+        void set2D(const bool is_2d)
+        {
+            is_2d_ = is_2d;
+            if(current_map_)
+            {
+                current_map_->set2D(is_2d);
+            }
+        }            
+
     private:
         MapDistFieldOptions options_;
         bool localization_ = false;
@@ -326,6 +338,7 @@ class SubmapManager
         double submap_overlap_ = 0.1;
         bool using_submaps_ = false;
         std::string map_path_;
+        bool is_2d_ = false;
 
         std::shared_ptr<MapDistField> current_map_ = nullptr;
         std::vector<std::pair<int64_t, Mat4>> current_map_poses_;

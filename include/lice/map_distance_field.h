@@ -183,6 +183,7 @@ class MapDistField {
         int64_t time_offset_ = -1;
 
         MapDistFieldOptions opt_;
+        bool is_2d_ = false;
 
         void cleanCells();
 
@@ -204,6 +205,8 @@ class MapDistField {
         ~MapDistField();
 
         void clear();
+
+        void set2D(const bool is_2d){ is_2d_ = is_2d;}
 
         Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const double current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12);
 

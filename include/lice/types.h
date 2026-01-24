@@ -247,6 +247,13 @@ struct DataAssociation
             }
             double v3_norm_inv = 1.0/v3_norm;
             Vec3 n = v1.cross(v2);
+            
+            double temp_norm = (n/(v1.norm()*v2.norm())).norm();
+            if( std::isnan(temp_norm) || temp_norm < 1e-4)
+            {
+                output.setZero();
+                return output;
+            }   
 
             Mat3_6 temp_d_vector_prod;
             temp_d_vector_prod(0,0) = 0.0;

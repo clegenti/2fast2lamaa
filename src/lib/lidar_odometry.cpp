@@ -16,8 +16,6 @@ LidarOdometry::LidarOdometry(const LidarOdometryParams& params, LidarOdometryNod
     : params_(params)
     , node_(node)
 {
-    std::cout << "LidarOdometry constructor" << std::endl;
-
     params_.association_filter_lin_quantum = 1.5*params_.feature_voxel_size;
 
     // Initialize the state variables and current position and rotation
@@ -41,8 +39,6 @@ LidarOdometry::LidarOdometry(const LidarOdometryParams& params, LidarOdometryNod
     imu_data_.acc_var = params_.acc_std*params_.acc_std;
     imu_data_.gyr_var = params_.gyr_std*params_.gyr_std;
     lidar_weight_ = 1.0/params_.lidar_std;
-
-    testStateMonoJacobians(params_.mode);
 }
 
 
@@ -220,8 +216,6 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
     }
 
     double threshold = params_.feature_voxel_size;
-    StopWatch sw;
-    sw.start();
 
     pc_mutex_.lock();
     bool is_odd = (pc_chunks_.size() % 2 == 1);
@@ -237,19 +231,22 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
     pc_mutex_.unlock();
 
     // Split the point cloud into channels and remove points too close
-    bool has_channel = pc->at(0).channel != kNoChannel;
     std::vector<std::vector<Pointd> > channels;
-    if(!has_channel)
+    if(is_2d_)
     {
-        throw std::runtime_error("LidarOdometry::extractEdgeFeatures: Point cloud does not have a channel. Current implementation requires point clouds to be split by channel.");
+        channels.push_back(*pc);
     }
     else
     {
-        StopWatch sw2;
-        sw2.start();
-        channels = splitChannels(*pc, params_.min_range, params_.max_feature_range);
-        sw2.stop();
-        sw2.print("Lidar odometry splitChannels time");
+        bool has_channel = pc->at(0).channel != kNoChannel;
+        if(!has_channel)
+        {
+            throw std::runtime_error("LidarOdometry::extractEdgeFeatures: Point cloud does not have a channel. Current implementation requires point clouds to be split by channel.");
+        }
+        else
+        {
+            channels = splitChannels(*pc, params_.min_range, params_.max_feature_range);
+        }
     }
 
 
@@ -325,7 +322,7 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
             }
 
 
-            if(!params_.planar_only)
+            if((!params_.planar_only) && (!is_2d_))
             {
                 int64_t dt_1 = channels[i][j].nanos() - channels[i][j-1].nanos();
                 int64_t dt_2 = channels[i][j+1].nanos() - channels[i][j].nanos();
@@ -371,7 +368,7 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
             {
                 last_point = channels[i][j];
                 downsample->push_back(channels[i][j]);
-                downsample->back().type = 1; // Set the type to 1 (planar)
+                downsample->back().type = is_2d_ ? 2 : 1; // Set the type to 1 (planar) or 2 (edge) depending on is_2d_
             }
         }
     }
@@ -381,10 +378,9 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
     std::shared_ptr<std::vector<Pointd> > sparse_features(new std::vector<Pointd>());
     *sparse_features = downsamplePointCloudSubset(*downsample, 2*params_.feature_voxel_size);
     // Concatenate the edge features to the sparse features
-    if(!params_.planar_only)
+    if((!params_.planar_only) && (!is_2d_))
     {
         std::vector<Pointd> edge_sparse_features = downsamplePointCloudSubset(*output, params_.feature_voxel_size);
-        std::cout << "LidarOdometry::extractFeatures: Edges " << output->size() << ", downsampled " << downsample->size() << ", sparse " << sparse_features->size() << ", edge sparse " << edge_sparse_features.size() << std::endl;
         sparse_features->insert(sparse_features->end(), edge_sparse_features.begin(), edge_sparse_features.end());
     }
 
@@ -392,8 +388,6 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
     output->insert(output->end(), downsample->begin(), downsample->end());
 
 
-    sw.stop();
-    sw.print("Lidar odometry feature extraction time");
     pc_mutex_.lock();
     if( pc_chunks_t_.size() > 0 
         && (t <= pc_chunks_t_.back()))
@@ -405,7 +399,6 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
     pc_chunks_.push_back(pc);
     pc_chunks_t_.push_back(t);
     pc_mutex_.unlock();
-    std::cout << "Finished feature extraction" << std::endl;
     return;
 }
 
@@ -458,6 +451,15 @@ std::tuple<std::vector<std::shared_ptr<std::vector<Pointd> > >, std::vector<std:
         imu_mutex_.unlock();
     }
 
+    if(is_2d_)
+    {
+        for(size_t i = 0; i < imu_data.gyr.size(); ++i)
+        {
+            imu_data.gyr[i].data[0] = 0.0;
+            imu_data.gyr[i].data[1] = 0.0;
+        }
+    }
+
     return {features, sparse_features, imu_data, t0, t1};
 }
 
@@ -467,8 +469,6 @@ std::tuple<std::vector<std::shared_ptr<std::vector<Pointd> > >, std::vector<std:
 
 void LidarOdometry::optimise()
 {   
-    std::cout << "LidarOdometry::optimise" << std::endl;
-
     StopWatch sw;
     sw.start();
 
@@ -567,10 +567,6 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
         , const int nb_iter
         , bool vel_only)
 {
-    StopWatch sw;
-    sw.start();
-
-
     // Perform the optimisation
     ceres::Solver::Options options;
     options.minimizer_progress_to_stdout = false;
@@ -593,16 +589,10 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
         state_blocks_,
         time_offset_,
         state_calib_);
-    sw.stop();
-    sw.print("Projection of the features: ");
 
 
 
-    sw.reset();
-    sw.start();
     std::vector<DataAssociation> data_associations = getDataAssociations(types, projected_features, projected_sparse_features);
-    sw.stop();
-    sw.print("Data association time: ");
 
 
     ceres::Problem::Options pb_options;
@@ -614,17 +604,11 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
 
     ZeroPrior* prior = new ZeroPrior(3, 1.0);
     problem.AddResidualBlock(prior, NULL, state_blocks_[0].data());
-    
-    sw.reset();
-    sw.start();
 
     // Solve the problem
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     std::cout << summary.BriefReport() << std::endl;
-
-    sw.stop();
-    sw.print("Ceres solver time: ");
 
 
     return data_associations;
@@ -906,10 +890,8 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
 
     for(const auto& pair: associations_per_type)
     {
-        int type = pair.first;
         const auto& assocs = pair.second;
 
-        std::cout << "Type " << type << ": " << assocs.size() << " associations before capping." << std::endl;
         if(assocs.size() > params_.max_associations_per_type)
         {
             std::vector<size_t> indices(assocs.size());
@@ -926,8 +908,6 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
         }
     }
 
-    std::cout << "LidarOdometry::getDataAssociations: associations found: " << data_associations.size() << " over " << source_features->size() << " features." << std::endl;
-
     return data_associations;
 }
 
@@ -940,11 +920,25 @@ void LidarOdometry::addBlocks(ceres::Problem& problem, bool vel_only)
 {
     // Add the state variables
     problem.AddParameterBlock(state_blocks_[0].data(), 3);
-    problem.AddParameterBlock(state_blocks_[1].data(), 3);
     ceres::SphereManifold<3>* sphere = new ceres::SphereManifold<3>();
     problem.AddParameterBlock(state_blocks_[2].data(), 3, sphere);
+    if(is_2d_)
+    {
+        // Lock the z component of velocity
+        std::vector<int> constant_dims = {2};
+        ceres::SubsetManifold* vel_manifold = new ceres::SubsetManifold(3, constant_dims);
+        problem.AddParameterBlock(state_blocks_[3].data(), 3, vel_manifold);
+        // Lock the x and y component of gyro bias
+        constant_dims = {0, 1};
+        ceres::SubsetManifold* gyr_manifold = new ceres::SubsetManifold(3, constant_dims);
+        problem.AddParameterBlock(state_blocks_[1].data(), 3, gyr_manifold);
+    }
+    else
+    {
+        problem.AddParameterBlock(state_blocks_[1].data(), 3);
+        problem.AddParameterBlock(state_blocks_[3].data(), 3);
+    }
 
-    problem.AddParameterBlock(state_blocks_[3].data(), 3);
     problem.AddParameterBlock(&time_offset_, 1);
 
     problem.SetParameterBlockConstant(&time_offset_);
@@ -973,9 +967,6 @@ void LidarOdometry::addLidarResiduals(ceres::Problem& problem
         )
 {
     // Add the residuals
-    std::cout << "Adding " << data_associations.size() << " lidar residuals" << std::endl;
-
-
     for(size_t i = 0; i < data_associations.size(); ++i)
     {
         LidarNoCalCostFunction* cost_function = new LidarNoCalCostFunction(state, data_associations[i], pts, sparse_pts, lidar_weight_, imu_time_offset_, state_calib_);
@@ -998,24 +989,18 @@ void LidarOdometry::printState()
         std::cout << "    gyr_bias: " << state_blocks_[1].transpose() << std::endl;
         std::cout << "    gravity: " << state_blocks_[2].transpose() << std::endl;
         std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
-        std::cout << "    time_offset: " << time_offset_ << std::endl;
-        std::cout << "    calib: " << state_calib_.transpose() << std::endl;
     }
     else if(params_.mode == LidarOdometryMode::GYR)
     {
         std::cout << "State: " << std::endl;
         std::cout << "    gyr_bias: " << state_blocks_[1].transpose() << std::endl;
         std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
-        std::cout << "    time_offset: " << time_offset_ << std::endl;
-        std::cout << "    calib: " << state_calib_.transpose() << std::endl;
     }
     else // NO_IMU
     {
         std::cout << "State: " << std::endl;
         std::cout << "    ang_vel: " << state_blocks_[1].transpose() << std::endl;
         std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
-        std::cout << "    time_offset: " << time_offset_ << std::endl;
-        std::cout << "    calib: " << state_calib_.transpose() << std::endl;
     }
 }
 
