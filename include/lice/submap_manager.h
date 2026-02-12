@@ -23,6 +23,7 @@ class SubmapManager
             , submap_overlap_(submap_overlap)
             , using_submaps_(using_submaps)
             , map_path_(map_path)
+            , reverse_path_(reverse_path)
         {
             if(submap_length_ > 0.0 && submap_overlap_ >= 1.0)
             {
@@ -192,17 +193,15 @@ class SubmapManager
                 int best_node_id = current_node_id_;
                 double best_dist = (current_pos - graph_nodes_[current_node_id_].first).norm();
                 // Check the next kNumAdjacentNodesToCheck nodes
-                for(int i = -kNumAdjacentNodesToCheck; i <= kNumAdjacentNodesToCheck; i++)
+                int start = reverse_path_ ? std::max(0, current_node_id_ - kNumAdjacentNodesToCheck) : current_node_id_;
+                int end = reverse_path_ ? current_node_id_ : std::min((int)graph_nodes_.size(), current_node_id_ + kNumAdjacentNodesToCheck);
+                for(int node_id = start; node_id < end; node_id++)
                 {
-                    int node_id = current_node_id_ + i;
-                    if(node_id >= 0 && (size_t)node_id < graph_nodes_.size())
+                    double dist = (current_pos - graph_nodes_[node_id].first).norm();
+                    if(dist < best_dist)
                     {
-                        double dist = (current_pos - graph_nodes_[node_id].first).norm();
-                        if(dist < best_dist)
-                        {
-                            best_dist = dist;
-                            best_node_id = node_id;
-                        }
+                        best_dist = dist;
+                        best_node_id = node_id;
                     }
                 }
 
@@ -338,6 +337,7 @@ class SubmapManager
         double submap_overlap_ = 0.1;
         bool using_submaps_ = false;
         std::string map_path_;
+        bool reverse_path_ = false;
         bool is_2d_ = false;
 
         std::shared_ptr<MapDistField> current_map_ = nullptr;
