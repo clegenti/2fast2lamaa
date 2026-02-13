@@ -230,13 +230,16 @@ SubmapManager::~SubmapManager() {}
 Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations)
 {
     GravityFactorFunctor* gravity_factor = nullptr;
-    if((gravity_.squaredNorm() < 1))
+    if(!localization_)
     {
-        attemptGravityBiasInit();
-    }
-    else
-    {
-        gravity_factor = computeGravityFactor(current_time);
+        if((gravity_.squaredNorm() < 1))
+        {
+            attemptGravityBiasInit();
+        }
+        else
+        {
+            gravity_factor = computeGravityFactor(current_time);
+        }
     }
 
 
