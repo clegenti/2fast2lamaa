@@ -70,6 +70,9 @@ def generate_launch_description():
             remappings=[
                 ('/points_input', '/lidar_scan_undistorted'),
                 ('/pose_input', '/undistortion_pose'),
+                ('/gp_map/acc', '/imu/data'),
+                ('/gp_map/gyr', '/imu/data'),
+                ('/twist', '/start_of_scan_twist')
                 ],
             parameters=[
                 {"point_cloud_internal_type": True},

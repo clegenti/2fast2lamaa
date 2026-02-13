@@ -97,6 +97,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             global_odom_pub_ = this->create_publisher<geometry_msgs::msg::TransformStamped>("/undistortion_pose", 10);
             odom_twist_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/end_of_scan_odom", 10);
             odom_twist_only_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/end_of_scan_odom_twist", 10);
+            odom_twist_start_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/start_of_scan_twist", 10);
             pc_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_scan_undistorted", 10);
             if(params.dense_pc_output)
             {
@@ -237,6 +238,22 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             mutex_br_.unlock();
         }
 
+        void publishTwist(const int64_t t, const Vec3& linear, const Vec3& angular)
+        {
+            rclcpp::Time new_time(t);
+            geometry_msgs::msg::TwistStamped twist_msg;
+            twist_msg.header.stamp = new_time;
+            twist_msg.header.frame_id = "lidar";
+            twist_msg.twist.linear.x = linear[0];
+            twist_msg.twist.linear.y = linear[1];
+            twist_msg.twist.linear.z = linear[2];
+            twist_msg.twist.angular.x = angular[0];
+            twist_msg.twist.angular.y = angular[1];
+            twist_msg.twist.angular.z = angular[2];
+
+            odom_twist_start_pub_->publish(twist_msg);
+        }
+
         void publishPc(const int64_t t, const std::vector<Pointd>& pc)
         {
             rclcpp::Time new_time(t);
@@ -275,6 +292,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
         rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr global_odom_pub_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_twist_pub_;
         rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr odom_twist_only_pub_;
+        rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr odom_twist_start_pub_;
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
 
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_dense_pub_;

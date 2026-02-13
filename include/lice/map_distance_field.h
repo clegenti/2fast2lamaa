@@ -12,6 +12,7 @@
 #include "ioctree/octree2/Octree.h"
 
 #include <ceres/ceres.h>
+#include <ceres/rotation.h>
 
 
 struct PointSimple
@@ -144,7 +145,7 @@ struct MapDistFieldOptions {
 };
 
 
-
+struct GravityFactorFunctor;
 
 class MapDistField {
     private:
@@ -179,7 +180,7 @@ class MapDistField {
 
         bool has_color_ = false;
         
-        double last_time_register_ = -1.0;
+        int64_t last_time_register_ = -1;
         int64_t time_offset_ = -1;
 
         MapDistFieldOptions opt_;
@@ -208,7 +209,7 @@ class MapDistField {
 
         void set2D(const bool is_2d){ is_2d_ = is_2d;}
 
-        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const double current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12);
+        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr);
 
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const std::vector<double>& count=std::vector<double>());
         std::vector<Pointd> getPts();
@@ -270,5 +271,56 @@ class RegistrationCostFunction: public ceres::CostFunction
 
         std::unique_ptr<ceres::LossFunction> loss_function_;
 
+
+};
+
+struct GravityFactorFunctor {
+    GravityFactorFunctor(const Vec3& gravity_current, const Vec3& gravity_target, const double angle_stdev = 1.0)
+    : gravity_current_(gravity_current)
+    , gravity_target_(gravity_target)
+    , angle_stdev_(angle_stdev)
+    {
+        pose_base_(3,3) = -1.0;
+    }
+
+    template<typename T>
+    bool operator()(const T* const pose_correction, T* residuals) const
+    {
+        if(pose_base_(3,3) < 0.0)
+        {
+            throw std::runtime_error("GravityFactorFunctor not properly initialized with pose base");
+        }
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> rot_correction(pose_correction + 3);
+        Eigen::Matrix<T, 3, 3> rot_base = pose_base_.block(0,0,3,3).template cast<T>();
+        Eigen::Matrix<T, 3, 3> rot_correction_mat;
+        ceres::AngleAxisToRotationMatrix(rot_correction.data(), rot_correction_mat.data());
+        Eigen::Matrix<T, 3, 3> rot_corrected = rot_base * rot_correction_mat;
+
+        Eigen::Matrix<T, 3, 1> gravity_corrected = rot_corrected * gravity_current_.template cast<T>();
+
+        // Compute the angle between the corrected gravity and the target gravity
+        T cos_angle = gravity_corrected.dot(gravity_target_.template cast<T>()) / (gravity_corrected.norm() * gravity_target_.norm());
+        if (cos_angle > T(1.0)) cos_angle = T(1.0);
+        if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
+        T angle_diff = ceres::acos(cos_angle);
+
+        // Scale the residual by the angle stdev
+        residuals[0] = angle_diff / T(angle_stdev_);
+        return true;
+    }
+
+    void setPoseBase(const Mat4& pose_base)
+    {
+        pose_base_ = pose_base;
+    }
+    
+
+
+
+    private:
+        Vec3 gravity_current_;
+        Vec3 gravity_target_;
+        Mat4 pose_base_;
+        double angle_stdev_ = 1.0;
 
 };

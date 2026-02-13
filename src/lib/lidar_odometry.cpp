@@ -1140,6 +1140,9 @@ void LidarOdometry::publishResults(const State& state)
         current_pose_mutex_.unlock();
     }
 
+    // Publish the velocity at the current time
+    auto [current_twist_linear, current_twist_angular] = state.queryTwist(nanosToImuTime(t1), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
+    if(node_ != nullptr) node_->publishTwist(t1, current_twist_linear, current_twist_angular);
     
     // Publish the odometry at the end of the scan
     int64_t end_t = anchor_t + (int64_t)(scan_time_sum_ / scan_count_);

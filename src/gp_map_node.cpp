@@ -11,7 +11,9 @@
 
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "geometry_msgs/msg/twist_stamped.hpp"
 #include "tf2_ros/transform_broadcaster.h"
+#include "sensor_msgs/msg/imu.hpp"
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
 
@@ -178,6 +180,10 @@ class GpMapNode: public rclcpp::Node
             query_dist_field_srv_ = this->create_service<ffastllamaa::srv::QueryDistField>("/query_dist_field", std::bind(&GpMapNode::queryDistFieldCallback, this, std::placeholders::_1, std::placeholders::_2));
 
 
+            gyr_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/gyr", 10, std::bind(&GpMapNode::gyrCallback, this, std::placeholders::_1));
+            acc_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/acc", 10, std::bind(&GpMapNode::accCallback, this, std::placeholders::_1));
+            twist_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>("/twist", 10, std::bind(&GpMapNode::twistCallback, this, std::placeholders::_1));
+
 
             // Create the map manager
             double submap_length = readFieldDouble(this, "submap_length", -1.0);
@@ -236,7 +242,12 @@ class GpMapNode: public rclcpp::Node
         rclcpp::Service<ffastllamaa::srv::QueryDistField>::SharedPtr query_dist_field_srv_;
 
 
-
+        // Subscriber for the IMU data
+        rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gyr_sub_;
+        rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr acc_sub_;
+        
+        // Subscriber for the velocities (twist)
+        rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr twist_sub_;
 
 
         Mat4 current_pose_ = Mat4::Identity();
@@ -633,6 +644,32 @@ class GpMapNode: public rclcpp::Node
                 RCLCPP_ERROR(this->get_logger(), "Could not open trajectory file: %s", path.c_str());
                 return;
             }
+        }
+
+        void gyrCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
+        {
+            Vec3 gyr(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+            map_mutex_.lock();
+            map_->addGyrMeasurement(gyr, getTimeNs(rclcpp::Time(msg->header.stamp)));
+            map_mutex_.unlock();
+        }
+        void accCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
+        {
+            Vec3 acc(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
+            map_mutex_.lock();
+            map_->addAccMeasurement(acc, getTimeNs(rclcpp::Time(msg->header.stamp)));
+            map_mutex_.unlock();
+        }
+        void twistCallback(const geometry_msgs::msg::TwistStamped::ConstSharedPtr msg)
+        {
+            if(msg->header.frame_id != "lidar")
+            {
+                return;
+            }
+            Vec3 linear(msg->twist.linear.x, msg->twist.linear.y, msg->twist.linear.z);
+            map_mutex_.lock();
+            map_->addVelocity(linear, getTimeNs(rclcpp::Time(msg->header.stamp)));
+            map_mutex_.unlock();
         }
 
 };

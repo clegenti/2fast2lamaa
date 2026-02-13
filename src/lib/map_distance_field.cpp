@@ -478,13 +478,12 @@ void MapDistField::calibrateUncertaintyProxy()
     opt_.min_range = save_min_range;
 }
 
-Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const double current_time, const bool approximate, const double loss_scale, const int max_iterations)
+Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor)
 {
     if(current_time != last_time_register_)
     {
         cleanCells();
     }
-    std::cout << "Registering points" << std::endl;
     Vec6 pose_correction_state = Vec6::Zero();
     
     int num_neighbors_save = num_neighbors_;
@@ -502,9 +501,13 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
         problem.AddParameterBlock(pose_correction_state.data(), 6);
     }
 
-    StopWatch sw;
-    sw.start();
-    std::cout << "Computing weights" << std::endl;
+    if(gravity_factor)
+    {
+        gravity_factor->setPoseBase(pose);
+        ceres::CostFunction* gravity_factor_cost = new ceres::AutoDiffCostFunction<GravityFactorFunctor, 1, 6>(gravity_factor);
+        problem.AddResidualBlock(gravity_factor_cost, nullptr, pose_correction_state.data());
+    }
+
     std::vector<double> weights(pts.size(), 1.0);
     if(opt_.use_temporal_weights)
     {
@@ -535,8 +538,6 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
             }
         }
     }
-    sw.stop();
-    sw.print("Time to compute weights");
 
     auto temp_pose = pose;
 
@@ -544,7 +545,7 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
     options.max_num_iterations = max_iterations;
     options.function_tolerance = 1e-4;
-    options.minimizer_progress_to_stdout = true;
+    options.minimizer_progress_to_stdout = false;
 
 
     // Optimization with openMP in the cost function
@@ -555,40 +556,11 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-    std::cout << summary.FullReport() << std::endl;
-
+    std::cout << summary.BriefReport() << std::endl;
 
 
     Mat3 R = expMap(pose_correction_state.segment<3>(3));
     Vec3 pos = pose_correction_state.segment<3>(0);
-
-    std::cout << "\n\n\n\n----------------\nPose correction: \n" << pose_correction_state.transpose() << "----------------\n\n\n\n" << std::endl;
-
-    // Log the pose correction
-    std::string log_path = "/home/ced/ros2_ws/install/ffastllamaa/share/ffastllamaa/maps/localization_corrections.csv";
-    if(scan_counter_ <= 0)
-    {
-        std::ofstream log_file;
-        log_file.open(log_path);
-        log_file << "scan_counter,px,py,pz,rx,ry,rz,num_points,approximate\n";
-        log_file.close();
-    }
-    {
-        std::ofstream log_file;
-        log_file.open(log_path, std::ios::app);
-        if(log_file.is_open())
-        {
-            log_file << scan_counter_ << "," 
-                     << pos[0] << "," << pos[1] << "," << pos[2] << ","
-                     << pose_correction_state[3] << "," << pose_correction_state[4] << "," << pose_correction_state[5] << ","
-                     << pts.size() << "," << approximate << "\n";
-            log_file.close();
-        }
-        else
-        {
-            std::cerr << "MapDistField::registerPts: Unable to open log file: " << log_path << std::endl;
-        }
-    }
 
 
     Mat4 pose_correction = Mat4::Identity();
@@ -932,14 +904,6 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
 
     sw.stop();
     sw.print("Time to transform and add points");
-    std::cout << "Number of cells in the map: " << num_cells_ << std::endl;
-    std::cout << "Number in hash map: " << hash_map_->size() << std::endl;
-    std::cout << "Number in ioctree: " << ioctree_.size() << std::endl;
-    if(opt_.edge_field)
-    {
-        std::cout << "Number in edge map: " << hash_map_edge_->size() << std::endl;
-        std::cout << "Number in ioctree edge: " << ioctree_edge_.size() << std::endl;
-    }
 }
 
 
@@ -1512,7 +1476,7 @@ void MapDistField::loadMap(const std::string& filename)
     sw.print("Time to load map");
 
 }
-    
+
 
 
 

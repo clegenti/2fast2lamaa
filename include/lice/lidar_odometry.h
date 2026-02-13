@@ -65,6 +65,7 @@ class LidarOdometryPublisher
         virtual void publishPc(const int64_t t, const std::vector<Pointd>& pc) = 0;
         virtual void publishGlobalOdom(const int64_t t, const Vec3& pos, const Vec3& rot, const Vec3& vel, const Vec3& ang_vel) = 0;
         virtual void publishPcDense(const int64_t t, const std::vector<Pointd>& pc) = 0;
+        virtual void publishTwist(const int64_t t, const Vec3& linear, const Vec3& angular) = 0;
 };
 
 

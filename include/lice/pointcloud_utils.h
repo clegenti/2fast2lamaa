@@ -132,8 +132,6 @@ inline std::vector<PointTemplated<T>> downsamplePointCloudPerType(
     std::vector<PointTemplated<T>> output;
     for(const auto& [type, pts] : type_to_points)
     {
-        std::cout << "Downsampling type " << type << " with " << pts.size() << " points." <<  std::endl;
-        std::cout << "Max points per type: " << max_points * ((double)pts.size())/input.size() << std::endl;
         std::vector<PointTemplated<T>> downsampled_pts = downsamplePointCloud<T>(pts, cell_size, max_points*((double)pts.size())/input.size());
         for(auto& pt : downsampled_pts)
         {

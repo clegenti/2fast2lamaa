@@ -50,6 +50,7 @@ add_library(lice STATIC
   src/lib/state.cpp
   src/lib/map_distance_field.cpp
   src/lib/submap_bundle_adjustment.cpp
+  src/lib/submap_manager.cpp
 )
 
 target_link_libraries(lice
