@@ -437,7 +437,7 @@ void SubmapManager::attemptGravityBiasInit()
     }
 
 
-    if(path_length_ > 5.0 && path_angle_change_ > 120.0*M_PI/180.0)
+    if(path_length_ > 5.0 && path_angle_change_ > 120.0*M_PI/180.0 && (imu_poses_.size() >= 30))
     {
         std::cout << "Initializing gravity" << std::endl;
         int num_poses = preint_meas_vec_.size() + 1;
