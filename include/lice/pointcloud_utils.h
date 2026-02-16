@@ -18,6 +18,55 @@ inline GridIndex getGridIndex(const PointTemplated<T>& pt, T cell_size)
         static_cast<int>(std::floor(pt.z / cell_size)));
 }
 
+template<typename T>
+inline std::vector<PointTemplated<T> > filterPointsDensity(const std::vector<PointTemplated<T> >& input, T cell_size)
+{
+    ankerl::unordered_dense::map<GridIndex, std::vector<PointTemplated<T>>> occupied_cells;
+    occupied_cells.reserve(input.size());
+    for(const auto& pt : input)
+    {
+        GridIndex index = getGridIndex(pt, cell_size);
+        if(occupied_cells.find(index) == occupied_cells.end())
+        {
+            occupied_cells[index] = std::vector<PointTemplated<T>>{pt};
+        }
+        else
+        {
+            occupied_cells[index].push_back(pt);
+        }
+    }
+    std::vector<PointTemplated<T>> output;
+
+    // If the 8 neighboring cells are all occupied, ignore the point in the cell
+    for(const auto& [index, pts] : occupied_cells)
+    {
+        int num_neighbors = 0;
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            for(int dy = -1; dy <= 1; ++dy)
+            {
+                for(int dz = -1; dz <= 1; ++dz)
+                {
+                    if(dx == 0 && dy == 0 && dz == 0)
+                    {
+                        continue;
+                    }
+                    GridIndex neighbor_index(std::get<0>(index) + dx, std::get<1>(index) + dy, std::get<2>(index) + dz);
+                    if(occupied_cells.find(neighbor_index) != occupied_cells.end())
+                    {
+                        num_neighbors++;
+                    }
+                }
+            }
+        }
+        if(num_neighbors <= 12)
+        {
+            output.insert(output.end(), pts.begin(), pts.end());
+        }
+    }
+    return output;
+}
+
 
 template<typename T>
 inline std::vector<PointTemplated<T>> downsamplePointCloud(const std::vector<PointTemplated<T> >& input, T cell_size, int max_points = -1, bool quadrant_balanced = false)

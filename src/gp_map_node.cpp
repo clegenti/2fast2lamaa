@@ -355,6 +355,13 @@ class GpMapNode: public rclcpp::Node
             {
                 // First convert the point cloud message to a vector of points
                 auto [pts, is_2d] = getPcFromMsg(msg);
+                StopWatch sw;
+                sw.start();
+                int original_pts_size = pts.size();
+                pts = filterPointsDensity(pts, voxel_size_);
+                sw.stop();
+                sw.print("Time to filter points by density (pts before: " + std::to_string(original_pts_size) + ", pts after: " + std::to_string(pts.size()) + "): ");
+
                 if(is_2d)
                 {
                     map_mutex_.lock();
