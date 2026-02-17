@@ -41,6 +41,15 @@ struct GPCellHyperparameters {
     GPCellHyperparameters(const double lengthscale, const double sz, const bool use_weights = true);
 };
 
+
+class GpMapPublisher
+{
+    public:
+        virtual void publishSubmapInfo(const std::string& filename, const Vec3& gravity) = 0;
+};
+
+
+
 class MapDistField;
 
 struct AlphaBlock
@@ -154,6 +163,7 @@ class MapDistField {
         ankerl::unordered_dense::set<GridIndex> free_space_cells_;
 
         std::unique_ptr<HashMap<CellPtr> > hash_map_;
+        GpMapPublisher* publisher_;
         std::unique_ptr<ankerl::unordered_dense::set<CellPtr> > hash_map_edge_;
         const double cell_size_;
         const double inv_cell_size_;
@@ -186,6 +196,8 @@ class MapDistField {
         MapDistFieldOptions opt_;
         bool is_2d_ = false;
 
+        Vec3 gravity_ = Vec3::Zero();
+
         void cleanCells();
 
         std::pair<ankerl::unordered_dense::set<GridIndex>, std::vector<bool> > getFreeSpaceCellsToRemove(const std::vector<Pointd>& scan, const std::vector<Vec3>& map_pts, const Mat4& pose_scan, const Mat4& pose_map);
@@ -201,7 +213,7 @@ class MapDistField {
 
     public:
         GPCellHyperparameters cell_hyperparameters;
-        MapDistField(const MapDistFieldOptions& options);
+        MapDistField(const MapDistFieldOptions& options, GpMapPublisher* publisher);
 
         ~MapDistField();
 
@@ -247,6 +259,8 @@ class MapDistField {
         double getPathLength() const { return path_length_; }
 
         std::vector<Pointd> freeSpaceCarving(const std::vector<Pointd>& pts, const Mat4& pose);
+
+        void setGravity(const Vec3& gravity) { gravity_ = gravity; }
 
 };
 

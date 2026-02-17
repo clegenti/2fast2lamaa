@@ -229,7 +229,7 @@ void SubmapBundleAdjustment::refineLoopTransforms()
         map_options.cell_size = readResolutions(res_1);
 
 
-        MapDistField map_field(map_options);
+        MapDistField map_field(map_options, nullptr);
         map_field.loadMap(pcd_1);
 
         

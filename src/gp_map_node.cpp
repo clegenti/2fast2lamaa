@@ -20,6 +20,7 @@
 #include "ankerl/unordered_dense.h"
 
 #include "ffastllamaa/srv/query_dist_field.hpp"
+#include "ffastllamaa/msg/submap_info.hpp"
 
 #include <sys/stat.h>
 
@@ -44,7 +45,7 @@ bool createFolder(const std::string& folderPath) {
     return false; // Failed to create folder
 }
 
-class GpMapNode: public rclcpp::Node
+class GpMapNode: public rclcpp::Node, public GpMapPublisher
 {
     public:
         GpMapNode()
@@ -184,6 +185,8 @@ class GpMapNode: public rclcpp::Node
             acc_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/acc", 10, std::bind(&GpMapNode::accCallback, this, std::placeholders::_1));
             twist_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>("/twist", 10, std::bind(&GpMapNode::twistCallback, this, std::placeholders::_1));
 
+            submap_info_pub_ = this->create_publisher<ffastllamaa::msg::SubmapInfo>("/submap_info", 10);
+
 
             // Create the map manager
             double submap_length = readFieldDouble(this, "submap_length", -1.0);
@@ -192,10 +195,40 @@ class GpMapNode: public rclcpp::Node
             {
                 using_submaps = (submap_length > 0.0);
             }
-            std::cout << "\n\n[GP MAP NODE] Using submaps: " << (using_submaps ? "true" : "false") << std::endl;
-            map_ = std::make_shared<SubmapManager>(options, localization_, using_submaps, submap_length, submap_overlap, map_path, reverse_path);
+            RCLCPP_INFO(this->get_logger(), "Using submaps: %s", using_submaps ? "true" : "false");
+            map_ = std::make_shared<SubmapManager>(this, options, localization_, using_submaps, submap_length, submap_overlap, map_path, reverse_path);
 
         }
+
+
+
+        void publishSubmapInfo(const std::string& filename, const Vec3& gravity)
+        {
+            auto msg = ffastllamaa::msg::SubmapInfo();
+            msg.ply_file = filename;
+            // Get the filename only and the folder path
+            size_t last_slash_idx = filename.find_last_of("\\/");
+            std::string folder_path = filename.substr(0, last_slash_idx);
+            if (std::string::npos != last_slash_idx)
+            {
+                std::string filename_only = filename.substr(last_slash_idx + 1);
+                std::string traj_filename = "trajectory_" + filename_only.replace(filename_only.find(".ply"), 4, ".csv");
+                msg.scan_folder = folder_path + "/scans";
+                msg.traj_file = folder_path + "/" + traj_filename;
+            }
+            else
+            {
+                msg.traj_file = "";
+                msg.scan_folder = "";
+            }
+            msg.raw_output_folder = folder_path;
+            msg.map_res = voxel_size_;
+            msg.gravity = {gravity[0], gravity[1], gravity[2]};
+            submap_info_pub_->publish(msg);
+        }
+
+
+
 
         ~GpMapNode()
         {
@@ -240,6 +273,8 @@ class GpMapNode: public rclcpp::Node
         rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pose_pub_;
         // Service to query the distance field
         rclcpp::Service<ffastllamaa::srv::QueryDistField>::SharedPtr query_dist_field_srv_;
+
+        rclcpp::Publisher<ffastllamaa::msg::SubmapInfo>::SharedPtr submap_info_pub_;
 
 
         // Subscriber for the IMU data

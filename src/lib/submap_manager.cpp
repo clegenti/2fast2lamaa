@@ -66,8 +66,9 @@ struct GravityBiasCostFunctor
 
 
 
-SubmapManager::SubmapManager(const MapDistFieldOptions options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path)
-    : options_(options)
+SubmapManager::SubmapManager(GpMapPublisher* publisher, const MapDistFieldOptions& options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path)
+    : publisher_(publisher)
+    , options_(options)
     , localization_(localization)
     , submap_length_(submap_length)
     , submap_overlap_(submap_overlap)
@@ -98,8 +99,9 @@ SubmapManager::SubmapManager(const MapDistFieldOptions options, const bool local
         options_.max_range = std::numeric_limits<double>::max();
     }
 
-    current_map_ = std::make_shared<MapDistField>(options_);
+    current_map_ = std::make_shared<MapDistField>(options_, publisher_);
     current_map_->set2D(is_2d_);
+    current_map_->setGravity(gravity_);
 
     if(localization_)
     {
@@ -276,7 +278,8 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
             if(new_map_id != current_map_id_)
             {
                 std::cout << "Switching from submap " << current_map_id_ << " to submap " << new_map_id << "\n\n\n\n\n" << std::endl;
-                current_map_ = std::make_shared<MapDistField>(options_);
+                current_map_ = std::make_shared<MapDistField>(options_, publisher_);
+                current_map_->setGravity(gravity_);
                 current_map_->loadMap(submap_paths_[new_map_id]);
                 current_map_->set2D(is_2d_);
                 current_map_id_ = new_map_id;
@@ -358,8 +361,9 @@ void SubmapManager::addPts(const std::vector<Pointd>& pts, const Mat4& pose, con
     {
         if((current_map_->getPathLength() > submap_length_ * (1.0 - submap_overlap_)) && (next_map_ == nullptr))
         {
-            next_map_ = std::make_shared<MapDistField>(options_);
+            next_map_ = std::make_shared<MapDistField>(options_, publisher_);
             next_map_->set2D(is_2d_);
+            next_map_->setGravity(gravity_);
         }
         if(next_map_)
         {
@@ -507,6 +511,15 @@ void SubmapManager::attemptGravityBiasInit()
         imu_times_.clear();
         imu_velocities_.clear();
         preint_meas_vec_.clear();
+
+        if(current_map_)
+        {
+            current_map_->setGravity(gravity_);
+        }
+        if(next_map_)
+        {
+            next_map_->setGravity(gravity_);
+        }
     }
 
 }
@@ -587,12 +600,6 @@ void SubmapManager::writeCurrentSubmap()
     }
     std::cout << "Writing map to: " << ply_path << std::endl;
 
-    auto lambda = [] (std::shared_ptr<MapDistField> map, const std::string& path) {
-        map->writeMap(path);
-    };
-    std::thread write_thread(lambda, current_map_, ply_path);
-    write_thread.detach();
-
     // Write the trajectory
     std::string traj_path;
     if(using_submaps_)
@@ -627,6 +634,12 @@ void SubmapManager::writeCurrentSubmap()
                     << std::endl;
     }
     traj_file.close();
+
+    auto lambda = [] (std::shared_ptr<MapDistField> map, const std::string& path) {
+        map->writeMap(path);
+    };
+    std::thread write_thread(lambda, current_map_, ply_path);
+    write_thread.detach();
 }
 
 

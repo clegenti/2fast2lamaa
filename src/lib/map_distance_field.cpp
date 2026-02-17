@@ -400,12 +400,13 @@ double Cell::getUncertaintyProxy(){
 
 
 
-MapDistField::MapDistField(const MapDistFieldOptions& options):
-    cell_size_(options.cell_size)
+MapDistField::MapDistField(const MapDistFieldOptions& options, GpMapPublisher* publisher)
+    : cell_size_(options.cell_size)
     , inv_cell_size_(1.0/options.cell_size)
     , cell_size_f_((float)options.cell_size)
     , half_cell_size_f_((float)options.cell_size/2.0)
     , opt_(options)
+    , publisher_(publisher)
     , cell_hyperparameters(options.gp_lengthscale < 0 ? 2.0*options.cell_size : options.gp_lengthscale, options.gp_sigma_z, options.use_voxel_weights)
 {
     hash_map_ = std::make_unique<HashMap<CellPtr> >();
@@ -1385,6 +1386,12 @@ void MapDistField::writeMap(const std::string& filename)
     info_file.open(static_filename);
     info_file << "cell_size " << cell_size_ << std::endl;
     info_file.close();
+
+    if(publisher_)
+    {
+        publisher_->publishSubmapInfo(filename, gravity_);
+    }
+
 
 
     sw.stop();

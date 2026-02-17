@@ -103,7 +103,7 @@ def generate_launch_description():
                 {"submap_length": 200.0},
                 {"submap_overlap": 0.2},
 
-                {"write_scans": False}
+                {"write_scans": True}
             ],
             output='screen',
             on_exit=Shutdown()

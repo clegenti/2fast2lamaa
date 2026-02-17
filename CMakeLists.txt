@@ -41,6 +41,7 @@ endif()
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/QueryDistField.srv"
+  "msg/SubmapInfo.msg"
   DEPENDENCIES std_msgs
 )
 
@@ -74,12 +75,19 @@ add_executable(offline_loop_closure src/offline_loop_closure.cpp)
 
 add_executable(lidar_2d_conversion src/2d_lidar_conversion_node.cpp)
 
+add_executable(pose_graph src/pose_graph_node.cpp)
+
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 target_link_libraries(lidar_scan_odometry
   lice
 )
 target_link_libraries(gp_map
+  "${cpp_typesupport_target}"
+  lice
+)
+
+target_link_libraries(pose_graph
   "${cpp_typesupport_target}"
   lice
 )
@@ -123,6 +131,16 @@ ament_target_dependencies(gp_map
   tf2_ros
   )
 
+ament_target_dependencies(pose_graph
+  rclcpp
+  sensor_msgs
+  geometry_msgs
+  message_filters
+  std_msgs
+  tf2
+  tf2_ros
+  )
+
 
 ament_target_dependencies(map_cleaner
   Eigen3
@@ -153,7 +171,7 @@ install(
 
 install(TARGETS
   lice
-  lidar_scan_odometry gp_map map_cleaner offline_loop_closure lidar_2d_conversion
+  lidar_scan_odometry gp_map map_cleaner offline_loop_closure lidar_2d_conversion pose_graph
   DESTINATION lib/${PROJECT_NAME})
 
 

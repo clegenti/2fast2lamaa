@@ -19,7 +19,7 @@ const int kNumAdjacentNodesToCheck = 20;
 class SubmapManager
 {
     public:
-        SubmapManager(const MapDistFieldOptions options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path=false);
+        SubmapManager(GpMapPublisher* publisher, const MapDistFieldOptions& options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path=false);
         ~SubmapManager();
 
 
@@ -51,6 +51,7 @@ class SubmapManager
         void set2D(const bool is_2d);
 
     private:
+        GpMapPublisher* publisher_ = nullptr;
         MapDistFieldOptions options_;
         bool localization_ = false;
         double submap_length_ = -1.0;

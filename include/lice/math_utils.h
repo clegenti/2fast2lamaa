@@ -3,6 +3,7 @@
 
 #include "lice/types.h"
 #include <random>
+#include <ceres/rotation.h>
 
 const double kExpNormTolerance = 1e-14;
 
@@ -212,4 +213,80 @@ inline std::pair<Vec3, Vec3> getPcTransform(const std::vector<Vec3>& target, con
     }
     Vec3 t = target_centroid - R * source_centroid;
     return {t, logMap(R)};
+}
+
+
+template <typename T>
+inline Eigen::Matrix<T, 3, 1> rotMatToAngleAxis(const Eigen::Matrix<T, 3, 3>& R)
+{
+    Eigen::Matrix<T, 3, 1> angle_axis;
+    ceres::RotationMatrixToAngleAxis(R.data(), angle_axis.data());
+    return angle_axis;
+}
+
+
+template <typename T>
+inline Eigen::Matrix<T, 4, 4> posQuatToTransform(const T* const pose)
+{
+    Eigen::Matrix<T, 4, 4> trans = Eigen::Matrix<T, 4, 4>::Identity();
+    trans.template block<3, 1>(0, 3) = Eigen::Matrix<T, 3, 1>(pose[0], pose[1], pose[2]);
+    Eigen::Matrix<T, 3, 3> R;
+    ceres::QuaternionToRotation(pose + 3, R.data());
+    trans.template block<3, 3>(0, 0) = R;
+    return trans;
+}
+
+template <typename T>
+inline Eigen::Matrix<T, 4, 4> posQuatToTransform(const Eigen::Matrix<T, 7, 1>& pose)
+{
+    Eigen::Matrix<T, 4, 4> trans = Eigen::Matrix<T, 4, 4>::Identity();
+    trans.template block<3, 1>(0, 3) = pose.template block<3, 1>(0, 0);
+    Eigen::Matrix<T, 3, 3> R;
+    ceres::QuaternionToRotation(pose.template block<4, 1>(3, 0).data(), R.data());
+    trans.template block<3, 3>(0, 0) = R;
+    return trans;
+}
+
+template <typename T>
+inline Eigen::Matrix<T, 7, 1> transformToPosQuat(const Eigen::Matrix<T, 4, 4>& trans)
+{
+    Eigen::Matrix<T, 7, 1> pose;
+    // Translation part
+    pose.template block<3, 1>(0, 0) = trans.template block<3, 1>(0, 3);
+    // Rotation part (as quaternion)
+    Eigen::Matrix<T, 3, 3> R = trans.template block<3, 3>(0, 0);
+    Eigen::Matrix<T, 4, 1> quat;
+    ceres::RotationMatrixToQuaternion(R.data(), quat.data());
+    pose.template block<4, 1>(3, 0) = quat;
+    return pose;
+}
+
+template <typename T>
+inline Eigen::Matrix<T, 6, 1> posQuatToPosRot(const Eigen::Matrix<T, 7, 1>& pose)
+{
+    Eigen::Matrix<T, 6, 1> pose_vec;
+    // Translation part
+    pose_vec.template block<3, 1>(0, 0) = pose.template block<3, 1>(0, 0);
+    // Rotation part (using logarithm map)
+    Eigen::Matrix<T, 3, 3> R;
+    ceres::QuaternionToRotation(pose.template block<4, 1>(3, 0).data(), R.data());
+    Eigen::Matrix<T, 3, 1> rot_vec;
+    ceres::RotationMatrixToAngleAxis(R.data(), rot_vec.data());
+    pose_vec.template block<3, 1>(3, 0) = rot_vec;
+    return pose_vec;
+}
+
+
+template <typename T>
+inline Eigen::Matrix<T, 6, 1> transformToPoseVector(const Eigen::Matrix<T, 4, 4>& trans)
+{
+    Eigen::Matrix<T, 6, 1> pose_vec;
+    // Translation part
+    pose_vec.template block<3, 1>(0, 0) = trans.template block<3, 1>(0, 3);
+    // Rotation part (using logarithm map)
+    Eigen::Matrix<T, 3, 3> R = trans.template block<3, 3>(0, 0);
+    Eigen::Matrix<T, 3, 1> rot_vec;
+    ceres::RotationMatrixToAngleAxis(R.data(), rot_vec.data());
+    pose_vec.template block<3, 1>(3, 0) = rot_vec;
+    return pose_vec;
 }

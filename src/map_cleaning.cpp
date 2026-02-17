@@ -104,13 +104,13 @@ int main(int argc, char** argv)
         options.max_range = std::numeric_limits<double>::max();
 
         // Copy the original map replacing .ply with _original.ply
-        std::string original_map_path = map_path;;
+        std::string original_map_path = map_path;
         original_map_path.replace(original_map_path.end() - 4, original_map_path.end(), "_original.ply");
         std::filesystem::copy_file(map_path, original_map_path, std::filesystem::copy_options::overwrite_existing);
         std::cout << "Copied original map to: " << original_map_path << std::endl;
 
 
-        MapDistField map(options);
+        MapDistField map(options, nullptr);
         map.loadMap(map_path);
 
 
