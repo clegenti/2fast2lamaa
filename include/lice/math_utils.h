@@ -230,7 +230,7 @@ inline Eigen::Matrix<T, 4, 4> posQuatToTransform(const T* const pose)
 {
     Eigen::Matrix<T, 4, 4> trans = Eigen::Matrix<T, 4, 4>::Identity();
     trans.template block<3, 1>(0, 3) = Eigen::Matrix<T, 3, 1>(pose[0], pose[1], pose[2]);
-    Eigen::Matrix<T, 3, 3> R;
+    Eigen::Matrix<T, 3, 3, Eigen::RowMajor> R;
     ceres::QuaternionToRotation(pose + 3, R.data());
     trans.template block<3, 3>(0, 0) = R;
     return trans;
@@ -241,7 +241,7 @@ inline Eigen::Matrix<T, 4, 4> posQuatToTransform(const Eigen::Matrix<T, 7, 1>& p
 {
     Eigen::Matrix<T, 4, 4> trans = Eigen::Matrix<T, 4, 4>::Identity();
     trans.template block<3, 1>(0, 3) = pose.template block<3, 1>(0, 0);
-    Eigen::Matrix<T, 3, 3> R;
+    Eigen::Matrix<T, 3, 3, Eigen::RowMajor> R;
     ceres::QuaternionToRotation(pose.template block<4, 1>(3, 0).data(), R.data());
     trans.template block<3, 3>(0, 0) = R;
     return trans;
@@ -268,10 +268,11 @@ inline Eigen::Matrix<T, 6, 1> posQuatToPosRot(const Eigen::Matrix<T, 7, 1>& pose
     // Translation part
     pose_vec.template block<3, 1>(0, 0) = pose.template block<3, 1>(0, 0);
     // Rotation part (using logarithm map)
-    Eigen::Matrix<T, 3, 3> R;
+    Eigen::Matrix<T, 3, 3, Eigen::RowMajor> R;
     ceres::QuaternionToRotation(pose.template block<4, 1>(3, 0).data(), R.data());
+    Eigen::Matrix<T, 3, 3> R_col_major = R;
     Eigen::Matrix<T, 3, 1> rot_vec;
-    ceres::RotationMatrixToAngleAxis(R.data(), rot_vec.data());
+    ceres::RotationMatrixToAngleAxis(R_col_major.data(), rot_vec.data());
     pose_vec.template block<3, 1>(3, 0) = rot_vec;
     return pose_vec;
 }
