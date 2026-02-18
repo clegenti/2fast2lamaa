@@ -26,6 +26,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Ceres 2.2 REQUIRED)
 find_package(message_filters REQUIRED)
+find_package(OpenCV REQUIRED)
 
 
 find_package(rosidl_default_generators REQUIRED)
@@ -90,6 +91,7 @@ target_link_libraries(gp_map
 target_link_libraries(pose_graph
   "${cpp_typesupport_target}"
   lice
+  ${OpenCV_LIBS}
 )
 
 target_link_libraries(map_cleaner
@@ -139,6 +141,7 @@ ament_target_dependencies(pose_graph
   std_msgs
   tf2
   tf2_ros
+  OpenCV
   )
 
 
