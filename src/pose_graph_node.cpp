@@ -11,8 +11,11 @@
 #include "ffastllamaa/msg/submap_info.hpp"
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/features2d.hpp>
 
 const float kCapHeight = 0.5; // Maximum height to consider for the submap images
+const double kNeighborRadius = 60.0;
+const double kMaxDrift = 0.02;
 
 
 class PoseGraphNode: public rclcpp::Node
@@ -45,6 +48,7 @@ class PoseGraphNode: public rclcpp::Node
         double free_space_carving_radius_ = -1.0;
         double image_res_ = 0.5;
         double map_res_ = 0.15;
+        bool low_ram_mode_ = false;
 
         std::vector<std::string> map_paths_;
         std::vector<std::string> traj_files_;
@@ -52,18 +56,26 @@ class PoseGraphNode: public rclcpp::Node
         std::string output_folder_ = "";
 
         std::vector<std::shared_ptr<MapDistField> > maps_;
+        std::vector<std::vector<int64_t> > map_scans_times_;
         std::vector<std::pair<int64_t, int64_t> > map_time_ranges_;
         std::vector<Mat4> submap_original_poses_;
+        std::vector<Mat4> submap_init_poses_;
         std::vector<Mat2_3> cam_mats_;
 
         MapDistFieldOptions map_options_;
 
         std::map<int64_t, std::shared_ptr<Vec7> > time_and_pose_;
-        int64_t last_odometry_time_ = -1;
+        std::vector<std::shared_ptr<Vec7> > poses_in_order_;
+        std::vector<int> pose_to_submap_id_;
+        std::vector<double> distance_travelled_;
+        int last_closed_pose_index_ = -1;
         bool has_been_gravity_aligned_ = false;
+        
 
         // Add the storage of the submap images
-        std::vector<cv::Mat> submap_images_;
+        std::vector<MatX> submap_images_;
+        std::vector<std::vector<cv::KeyPoint> > submap_keypoints_;
+        std::vector<cv::Mat> submap_descriptors_;
 
 
         rclcpp::Subscription<ffastllamaa::msg::SubmapInfo>::SharedPtr sub_;
@@ -97,9 +109,15 @@ class PoseGraphNode: public rclcpp::Node
             // Load the trajectory
             std::vector<std::pair<int64_t, Vec7> > trajectory = readTrajectoryFile(msg->traj_file);
             addSubmapTrajectoryToState(trajectory);
+            map_scans_times_.emplace_back();
+            for(const auto& [timestamp, pose] : trajectory)
+            {
+                map_scans_times_.back().push_back(timestamp);
+            }
 
             map_time_ranges_.emplace_back(trajectory.front().first, trajectory.back().first);
             submap_original_poses_.emplace_back(posQuatToTransform(trajectory.front().second));
+            submap_init_poses_.emplace_back(posQuatToTransform(*(time_and_pose_[trajectory.front().first])));
             cam_mats_.emplace_back(Mat2_3::Zero());
 
             if(free_space_carving_radius_ > 0.0)
@@ -118,9 +136,27 @@ class PoseGraphNode: public rclcpp::Node
             }
 
             // Create the submap image
-            cv::Mat image = getSubmapImage(maps_.size() - 1);
-            submap_images_.push_back(image);
+            auto [laplace_image, height_image] = getSubmapImages(maps_.size() - 1);
+            submap_images_.push_back(height_image); // Store the height image for later use
             std::cout << "Created submap image for map " << maps_.size() - 1 << std::endl;
+            
+            auto [keypoints, descriptors] = extractFeatures(laplace_image);
+            submap_keypoints_.push_back(keypoints);
+            submap_descriptors_.push_back(descriptors);
+            
+            std::set<int> submap_canditates = getSubmapIdsInRadius();
+
+            std::cout << "Submaps in radius for the last pose: ";
+            for(int submap_id : submap_canditates)
+            {
+                std::cout << submap_id << " ";
+            }
+            std::cout << std::endl;
+
+
+            std::vector<std::pair<int, Mat4> > submap_id_and_coarse_poses = attemptVisualRegistration(submap_canditates);
+
+
 
             writeFullTrajectory();
         }
@@ -231,6 +267,9 @@ class PoseGraphNode: public rclcpp::Node
                     std::cout << "Adding first pose with timestamp " << timestamp << std::endl;
                     auto pose_ptr = std::make_shared<Vec7>(pose);
                     time_and_pose_[timestamp] = pose_ptr;
+                    poses_in_order_.push_back(pose_ptr);
+                    distance_travelled_.push_back(0.0);
+                    pose_to_submap_id_.push_back(maps_.size() - 1);
                     continue;
                 }
                 if(i == 0 && (time_and_pose_.find(timestamp) == time_and_pose_.end()))
@@ -249,6 +288,10 @@ class PoseGraphNode: public rclcpp::Node
 
                     auto pose = std::make_shared<Vec7>(transformToPosQuat<double>(posQuatToTransform<double>(*time_and_pose_[trajectory[i-1].first]) * delta_mat));
                     time_and_pose_[timestamp] = pose;
+                    poses_in_order_.push_back(pose);
+                    double distance = (posQuatToTransform(*time_and_pose_[trajectory[i-1].first]).block<3,1>(0,3) - posQuatToTransform(*pose).block<3,1>(0,3)).norm();
+                    distance_travelled_.push_back(distance_travelled_.back() + distance);
+                    pose_to_submap_id_.push_back(maps_.size() - 1);
                 }
             }
             RCLCPP_INFO(this->get_logger(), "Added %zu poses to the state from trajectory.", trajectory.size());
@@ -323,7 +366,7 @@ class PoseGraphNode: public rclcpp::Node
         }
 
 
-        cv::Mat getSubmapImage(int map_id)
+        std::pair<cv::Mat, MatX> getSubmapImages(int map_id)
         {
             std::shared_ptr<MapDistField> map = maps_[map_id];
             std::vector<Pointd> pts = map->getPts();
@@ -354,12 +397,13 @@ class PoseGraphNode: public rclcpp::Node
             }
 
             // Create an image with the given resolution
-            int width = static_cast<int>(std::ceil((max_x - min_x) / image_res_))+1;
-            int height = static_cast<int>(std::ceil((max_y - min_y) / image_res_))+1;
-            MatX counter = MatX::Zero(height, width);
-            MatX sum_squared = MatX::Zero(height, width);
-            MatX sum = MatX::Zero(height, width);
-            cv::Mat image(height, width, CV_32F, cv::Scalar(0.0f));
+            int rows = static_cast<int>(std::ceil((max_x - min_x) / image_res_))+1;
+            int cols = static_cast<int>(std::ceil((max_y - min_y) / image_res_))+1;
+            MatX counter = MatX::Zero(rows, cols);
+            MatX sum_squared = MatX::Zero(rows, cols);
+            MatX sum = MatX::Zero(rows, cols);
+            cv::Mat laplace_image(rows, cols, CV_32F, cv::Scalar(0.0f));
+            MatX height_image = MatX::Constant(rows, cols, std::numeric_limits<double>::quiet_NaN());
 
             Mat2_3 cam_mat;
             cam_mat << 1.0/image_res_, 0.0, -min_x/image_res_,
@@ -372,66 +416,289 @@ class PoseGraphNode: public rclcpp::Node
                 Vec2 cam_pt = cam_mat * Vec3(pt(0), pt(1), 1.0);
                 int x = static_cast<int>(std::floor(cam_pt(0)));
                 int y = static_cast<int>(std::floor(cam_pt(1)));
-                if(x >= 0 && x < width && y >= 0 && y < height)
+                if(x >= 0 && x < rows && y >= 0 && y < cols)
                 {
-                    counter(y, x) += 1.0f;
-                    sum(y, x) += pt(2);
-                    sum_squared(y, x) += pt(2) * pt(2);
+                    counter(x, y) += 1.0f;
+                    sum(x, y) += pt(2);
+                    sum_squared(x, y) += pt(2) * pt(2);
                 }
             }
-            for(int y = 1; y < height-1; ++y)
+
+            for(int x = 0; x < rows; ++x)
             {
-                for(int x = 1; x < width-1; ++x)
+                for(int y = 0; y < cols; ++y)
+                {
+                    if(counter(x, y) > 0)
+                    {
+                        height_image(x, y) = sum(x, y) / counter(x, y);
+                    }
+                }
+            }
+
+            for(int x = 1; x < rows-1; ++x)
+            {
+                for(int y = 1; y < cols-1; ++y)
                 {
                     int local_count = 0;
                     double local_sum = 0;
-                    if(counter(y, x) == 0)
+                    if(counter(x, y) == 0)
                     {
                         continue;
                     }
-                    if(counter(y-1, x) > 0)
+                    if(counter(x-1, y) > 0)
                     {
                         local_count++;
-                        local_sum += sum(y-1, x) / counter(y-1, x);
+                        local_sum += sum(x-1, y) / counter(x-1, y);
                     }
-                    if(counter(y+1, x) > 0)
+                    if(counter(x+1, y) > 0)
                     {
                         local_count++;
-                        local_sum += sum(y+1, x) / counter(y+1, x);
+                        local_sum += sum(x+1, y) / counter(x+1, y);
                     }
-                    if(counter(y, x-1) > 0)
+                    if(counter(x, y-1) > 0)
                     {
                         local_count++;
-                        local_sum += sum(y, x-1) / counter(y, x-1);
+                        local_sum += sum(x, y-1) / counter(x, y-1);
                     }
-                    if(counter(y, x+1) > 0)
+                    if(counter(x, y+1) > 0)
                     {
                         local_count++;
-                        local_sum += sum(y, x+1) / counter(y, x+1);
+                        local_sum += sum(x, y+1) / counter(x, y+1);
                     }
-                    image.at<float>(y, x) = static_cast<float>((local_sum - local_count*sum(y, x) / counter(y, x))/(4.0*kCapHeight));
-                    if(image.at<float>(y, x) < -1.0f)
+                    laplace_image.at<float>(x, y) = static_cast<float>((local_sum - local_count*sum(x, y) / counter(x, y))/(4.0*kCapHeight));
+                    if(laplace_image.at<float>(x, y) < -1.0f)
                     {
-                        image.at<float>(y, x) = -1.0f;
+                        laplace_image.at<float>(x, y) = -1.0f;
                     }
-                    else if(image.at<float>(y, x) > 1.0f)
+                    else if(laplace_image.at<float>(x, y) > 1.0f)
                     {
-                        image.at<float>(y, x) = 1.0f;
+                        laplace_image.at<float>(x, y) = 1.0f;
                     }
                 }
             }
             // Apply a simple gaussian blur to smooth the image
-            cv::GaussianBlur(image, image, cv::Size(3, 3), 0, 0, cv::BORDER_DEFAULT);
+            cv::GaussianBlur(laplace_image, laplace_image, cv::Size(3, 3), 0, 0, cv::BORDER_DEFAULT);
+            // Normalize to [0, 255] for visualization
+            cv::normalize(laplace_image, laplace_image, 0, 255, cv::NORM_MINMAX);
+            // Convert to 8-bit image
+            laplace_image.convertTo(laplace_image, CV_8U);
+
+            return {laplace_image, height_image};
+        }
+
+        std::pair<std::vector<cv::KeyPoint>, cv::Mat> extractFeatures(const cv::Mat& image)
+        {
+            // Use SIFT to extract features from the image
+            cv::Ptr<cv::SIFT> sift = cv::SIFT::create();
+            std::vector<cv::KeyPoint> keypoints;
+            cv::Mat descriptors;
+            sift->detectAndCompute(image, cv::noArray(), keypoints, descriptors);
+            std::cout << "Extracted " << keypoints.size() << " keypoints from the submap image." << std::endl;
+            return {keypoints, descriptors};
+        }
+
+        std::set<int> getSubmapIdsInRadius()
+        {
+            std::set<int> submap_ids;
+            int current_submap_id = pose_to_submap_id_.back();
+            for(int i = pose_to_submap_id_.size() - 1; (i >= 0) && (pose_to_submap_id_[i] == current_submap_id); i--)
+            {
+                for(int j = i-1; j > 0; j--)
+                {
+                    if(pose_to_submap_id_[j] < current_submap_id - 1)
+                    {
+                        double distance = distance_travelled_[i] - distance_travelled_[j];
+                        distance = distance*kMaxDrift + kNeighborRadius;
+
+                        Vec3 pos = poses_in_order_[j]->head<3>();
+                        Vec3 current_pos = poses_in_order_.back()->head<3>();
+                        double euclidean_distance = (current_pos - pos).norm();
+                        if(euclidean_distance < distance)
+                        {
+                            submap_ids.insert(pose_to_submap_id_[j]);
+                        }
+                    }
+                }
+            }
+            return submap_ids;
+        }
 
 
-            // For debug, save the image
-            std::string image_file = output_folder_ + "/submap_image_" + std::to_string(map_id) + ".png";
-            cv::Mat debug_img;
-            image.convertTo(debug_img, CV_8U, 127.5, 127.5); // Scale to [0, 255] for visualization
-            cv::imwrite(image_file, debug_img);
-            std::cout << "Saved submap image to: " << image_file << std::endl;
+        std::vector<std::pair<int, Mat4> > attemptVisualRegistration(const std::set<int>& submap_candidates)
+        {
+            std::vector<std::pair<int, Mat4> > submap_id_and_coarse_poses;
+            cv::BFMatcher matcher(cv::NORM_L2, false);
+            for(int submap_id : submap_candidates)
+            {
+                std::cout << "Attempting visual registration between " << pose_to_submap_id_.back() << " and " << submap_id << std::endl;
+                std::vector<cv::KeyPoint> keypoints1 = submap_keypoints_[pose_to_submap_id_.back()];
+                cv::Mat descriptors1 = submap_descriptors_[pose_to_submap_id_.back()];
+                std::vector<cv::KeyPoint> keypoints2 = submap_keypoints_[submap_id];
+                cv::Mat descriptors2 = submap_descriptors_[submap_id];
 
-            return image;
+                std::vector<std::vector<cv::DMatch> > knn_matches;
+                matcher.knnMatch(descriptors1, descriptors2, knn_matches, 2);
+
+                std::vector<cv::DMatch> good_matches;
+                for(size_t i = 0; i < knn_matches.size(); i++)
+                {
+                    auto kp1 = keypoints1[knn_matches[i][0].queryIdx];
+                    auto kp2 = keypoints2[knn_matches[i][0].trainIdx];
+                    double scale_ratio = kp1.size / kp2.size;
+                    if( (std::abs(scale_ratio - 1.0) < 0.05) && (knn_matches[i][0].distance < 0.75 * knn_matches[i][1].distance) )
+                    {
+                        good_matches.push_back(knn_matches[i][0]);
+                    }
+
+                }
+
+                if (good_matches.size() < 4)
+                {
+                    std::cout << "Not enough good matches (" << good_matches.size() << ") between submap " << pose_to_submap_id_.back() << " and " << submap_id << " for visual registration." << std::endl;
+                    continue;
+                }
+
+                // Extract the matched keypoints
+                std::vector<cv::Point2f> dst_pts, src_pts;
+                for (const auto& match : good_matches)
+                {
+                    src_pts.push_back(cv::Point2f(keypoints1[match.queryIdx].pt.y, keypoints1[match.queryIdx].pt.x)); // Note the swap of x and y
+                    dst_pts.push_back(cv::Point2f(keypoints2[match.trainIdx].pt.y, keypoints2[match.trainIdx].pt.x)); // Note the swap of x and y
+                }
+
+                // Estimate the Affine partial 2D
+                cv::Mat inliers;
+                std::cout << " ------------------------------------------------ " << std::endl;
+                cv::Mat affine = cv::estimateAffinePartial2D(src_pts, dst_pts, inliers, cv::RANSAC, 2.0);
+                std::cout << "/////////// Estimated affine transformation between submap " << pose_to_submap_id_.back() << " and " << submap_id << ":" << std::endl;
+
+                if (affine.empty())
+                {
+                    std::cout << "Could not estimate a valid affine transformation between submap " << pose_to_submap_id_.back() << " and " << submap_id << "." << std::endl;
+                    continue;
+                }
+                // If less than 3 inliers, skip this match
+                int inlier_count = cv::countNonZero(inliers);
+                if(inlier_count < 3)
+                {
+                    std::cout << "Not enough inliers (" << inlier_count << ") after RANSAC between submap " << pose_to_submap_id_.back() << " and " << submap_id << "." << std::endl;
+                    continue;
+                }
+
+
+                // Convert the affine transformation to a 4x4 matrix
+                auto [pose_3d, scale] = affineToPoseAndScale(affine, pose_to_submap_id_.back(), submap_id);
+                if(std::isnan(scale) || std::isinf(scale))
+                {
+                    std::cout << "Estimated scale is invalid between submap " << pose_to_submap_id_.back() << " and " << submap_id << ". Skipping this match." << std::endl;
+                    continue;
+                }
+                if(std::abs(scale - 1.0) > 0.1)
+                {
+                    std::cout << "Estimated scale is too different from 1.0 (scale: " << scale << ") between submap " << pose_to_submap_id_.back() << " and " << submap_id << ". Skipping this match." << std::endl;
+                    continue;
+                }
+                submap_id_and_coarse_poses.emplace_back(submap_id, pose_3d);
+
+            }
+            return submap_id_and_coarse_poses;
+        }
+
+
+        std::pair<Mat4, double> affineToPoseAndScale(const cv::Mat& affine, const int id_source, const int id_target)
+        {
+            double scale = std::sqrt(affine.at<double>(0,0)*affine.at<double>(0,0) + affine.at<double>(0,1)*affine.at<double>(0,1));
+            double angle = std::atan2(affine.at<double>(1,0), affine.at<double>(0,0));
+            Mat3 pose_2d = Mat3::Identity();
+            pose_2d(0,0) = std::cos(angle);
+            pose_2d(0,1) = -std::sin(angle);
+            pose_2d(1,0) = std::sin(angle);
+            pose_2d(1,1) = std::cos(angle);
+            pose_2d(0,2) = affine.at<double>(0,2);
+            pose_2d(1,2) = affine.at<double>(1,2);
+
+
+            Mat3 cam_mat_source_3 = Mat3::Identity();
+            cam_mat_source_3.block<2,3>(0,0) = cam_mats_[id_source];
+            Mat3 cam_mat_target_3 = Mat3::Identity();
+            cam_mat_target_3.block<2,3>(0,0) = cam_mats_[id_target];
+
+            Mat3 image_trans = pose_2d;
+            pose_2d = cam_mat_target_3.inverse() * pose_2d * cam_mat_source_3;
+
+            Mat4 pose_3d = Mat4::Identity();
+            pose_3d.block<2,2>(0,0) = pose_2d.block<2,2>(0,0);
+            pose_3d(0,3) = pose_2d(0,2);
+            pose_3d(1,3) = pose_2d(1,2);
+
+                
+            if ( std::abs(scale - 1.0) > 0.05)
+            {
+                return {pose_3d, scale};
+            }
+
+            auto pts_source = maps_[id_source]->getPts();
+            auto pts_target = maps_[id_target]->getPts();
+            ankerl::unordered_dense::map<std::pair<int, int>, std::pair<int, double>> target_cells;
+            Mat4 target_transform = submap_init_poses_[id_target] * submap_original_poses_[id_target].inverse();
+            for(const auto& pt : pts_target)
+            {
+                Vec3 pt_W = target_transform.block<3,3>(0,0) * pt.vec3() + target_transform.block<3,1>(0,3);
+                int cell_x = static_cast<int>(std::floor(pt_W(0) / image_res_));
+                int cell_y = static_cast<int>(std::floor(pt_W(1) / image_res_));
+                std::pair<int, int> cell_idx = {cell_x, cell_y};
+                double height = pt_W(2);
+                if(target_cells.find(cell_idx) == target_cells.end())
+                {
+                    target_cells[cell_idx] = {1, height};
+                }
+                else
+                {
+                    target_cells[cell_idx].first += 1;
+                    target_cells[cell_idx].second += height;
+                }
+            }
+            ankerl::unordered_dense::map<std::pair<int, int>, std::pair<int, double>> source_cells;
+            Mat4 source_transform = pose_3d * submap_init_poses_[id_source] * submap_original_poses_[id_source].inverse();
+            for(const auto& pt : pts_source)
+            {
+                Vec3 pt_W = source_transform.block<3,3>(0,0) * pt.vec3() + source_transform.block<3,1>(0,3);
+                int cell_x = static_cast<int>(std::floor(pt_W(0) / image_res_));
+                int cell_y = static_cast<int>(std::floor(pt_W(1) / image_res_));
+                std::pair<int, int> cell_idx = {cell_x, cell_y};
+                double height = pt_W(2);
+                if(source_cells.find(cell_idx) == source_cells.end())
+                {
+                    source_cells[cell_idx] = {1, height};
+                }
+                else
+                {
+                    source_cells[cell_idx].first += 1;
+                    source_cells[cell_idx].second += height;
+                }
+            }
+
+            std::vector<double> height_differences;
+            for(const auto& [cell_idx, target_cell_data] : target_cells)
+            {
+                if(source_cells.find(cell_idx) != source_cells.end())
+                {
+                    double target_cell_height = target_cell_data.second / target_cell_data.first;
+                    double source_cell_height = source_cells[cell_idx].second / source_cells[cell_idx].first;
+                    height_differences.push_back(target_cell_height - source_cell_height);
+                }
+            }
+            double median_height = 0.0;
+            if(height_differences.size() > 2)            {
+                std::sort(height_differences.begin(), height_differences.end());
+                median_height = height_differences[height_differences.size()/2];
+            }
+            pose_3d(2,3) = median_height;
+
+        
+            pose_3d = submap_original_poses_[id_target] * submap_init_poses_[id_target].inverse() * pose_3d * submap_init_poses_[id_source] * submap_original_poses_[id_source].inverse(); 
+
+            return {pose_3d, scale};
         }
 
 
