@@ -408,6 +408,7 @@ MapDistField::MapDistField(const MapDistFieldOptions& options, GpMapPublisher* p
     , opt_(options)
     , publisher_(publisher)
     , cell_hyperparameters(options.gp_lengthscale < 0 ? 2.0*options.cell_size : options.gp_lengthscale, options.gp_sigma_z, options.use_voxel_weights)
+    , num_threads_(options.num_threads)
 {
     hash_map_ = std::make_unique<HashMap<CellPtr> >();
     if(opt_.edge_field)
@@ -512,7 +513,7 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     std::vector<double> weights(pts.size(), 1.0);
     if(opt_.use_temporal_weights)
     {
-        #pragma omp parallel for num_threads(8)
+        #pragma omp parallel for num_threads(num_threads_)
         for(size_t i = 0; i < pts.size(); i++)
         {
             weights[i] = getMinTime(pts[i].vec3());
@@ -551,7 +552,7 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     // Optimization with openMP in the cost function
     bool use_loss = (loss_scale > 0.0);
-    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss);
+    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_);
     problem.AddResidualBlock(cost_function, NULL, pose_correction_state.data());
 
 
@@ -1072,7 +1073,7 @@ std::pair<std::vector<Pointd>, std::vector<Vec3> > MapDistField::getPtsAndNormal
 
     pts.resize(num_cells_);
     normals.resize(num_cells_);
-    #pragma omp parallel for num_threads(16)
+    #pragma omp parallel for num_threads(num_threads_)
     for(size_t i = 0; i < cells.size(); i++)
     {
         Vec3 pt = cells[i]->getPt();
@@ -1161,7 +1162,7 @@ std::pair<double, double> MapDistField::queryDistFieldAndUncertaintyProxy(const 
 std::vector<double> MapDistField::queryDistField(const std::vector<Vec3>& pts, const bool field)
 {
     std::vector<double> dists(pts.size());
-    #pragma omp parallel for num_threads(12)
+    #pragma omp parallel for num_threads(num_threads_)
     for(size_t i = 0; i < pts.size(); i++)
     {
         dists[i] = queryDistField(pts[i], field);
@@ -1490,11 +1491,12 @@ void MapDistField::loadMap(const std::string& filename)
 
 
 
-RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss)
+RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads)
     : prior_(prior)
     , map_(map)
     , weights_(weights)
     , use_field_(use_field)
+    , num_threads_(num_threads)
 {
     pts_.reserve(pts.size());
     type_.reserve(pts.size());
@@ -1551,7 +1553,7 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
 
             Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> jacobian(jacobians[0], pts_.size(), 6);
 
-            #pragma omp parallel for num_threads(8)
+            #pragma omp parallel for num_threads(num_threads_)
             for(size_t i = 0; i < pts_.size(); i++)
             {
                 Vec3 temp_pt = pts_w.col(i);
@@ -1574,7 +1576,7 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
         MatX pts_w = R_w*pts;
         pts_w.colwise() += p_w;
 
-        #pragma omp parallel for num_threads(8)
+        #pragma omp parallel for num_threads(num_threads_)
         for(size_t i = 0; i < pts_.size(); i++)
         {
             residuals[i] = map_->queryDistField(pts_w.col(i), use_field_, type_[i]);

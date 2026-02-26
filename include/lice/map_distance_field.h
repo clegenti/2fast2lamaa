@@ -150,6 +150,7 @@ struct MapDistFieldOptions {
     double max_range = std::numeric_limits<double>::max();
     bool last_scan_carving = false;
     bool edge_field = true;
+    int num_threads = 8;
     std::string scan_folder = "";
 };
 
@@ -170,6 +171,7 @@ class MapDistField {
         const float cell_size_f_;
         const float half_cell_size_f_;
         const int dim_ = 3;
+        const int num_threads_;
 
         std::mutex clean_mutex_;
         ankerl::unordered_dense::set<GridIndex> cells_to_clean_;
@@ -269,7 +271,7 @@ class MapDistField {
 class RegistrationCostFunction: public ceres::CostFunction
 {
     public:
-        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true);
+        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8);
         
         virtual bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const;
 
@@ -282,6 +284,7 @@ class RegistrationCostFunction: public ceres::CostFunction
         MapDistField* map_;
         const std::vector<double>& weights_;
         bool use_field_;
+        int num_threads_ = 8;
 
         std::unique_ptr<ceres::LossFunction> loss_function_;
 

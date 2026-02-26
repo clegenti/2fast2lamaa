@@ -15,7 +15,6 @@
 
 const float kCapHeight = 0.5; // Maximum height to consider for the submap images
 const double kNeighborRadius = 60.0;
-const double kMaxDrift = 0.02;
 
 
 class PoseGraphNode: public rclcpp::Node
@@ -27,6 +26,13 @@ class PoseGraphNode: public rclcpp::Node
             RCLCPP_INFO(this->get_logger(), "Pose Graph Node has been started.");
             
             free_space_carving_radius_ = readFieldDouble(this, "free_space_carving_radius", 40.0);
+            max_drift_ = readFieldDouble(this, "max_drift", 0.02);
+            voxel_size_factor_ = readFieldDouble(this, "voxel_size_factor_for_registration", 2.0);
+            max_nb_points_ = readFieldInt(this, "max_num_pts_for_registration", 8000);
+            loss_scale_ = readFieldDouble(this, "loss_function_scale", 0.5);
+
+
+
 
             
             sub_ = this->create_subscription<ffastllamaa::msg::SubmapInfo>(
@@ -41,6 +47,7 @@ class PoseGraphNode: public rclcpp::Node
             map_options_.last_scan_carving = false;
             map_options_.min_range = 0.0;
             map_options_.max_range = std::numeric_limits<double>::max();
+            map_options_.num_threads = 1;
 
         }
 
@@ -49,6 +56,10 @@ class PoseGraphNode: public rclcpp::Node
         double image_res_ = 0.5;
         double map_res_ = 0.15;
         bool low_ram_mode_ = false;
+        double max_drift_ = 0.02;
+        double voxel_size_factor_ = 2.0;
+        int max_nb_points_ = 8000;
+        double loss_scale_ = 0.5;
 
         std::vector<std::string> map_paths_;
         std::vector<std::string> traj_files_;
@@ -56,8 +67,7 @@ class PoseGraphNode: public rclcpp::Node
         std::string output_folder_ = "";
 
         std::vector<std::shared_ptr<MapDistField> > maps_;
-        std::vector<std::vector<int64_t> > map_scans_times_;
-        std::vector<std::pair<int64_t, int64_t> > map_time_ranges_;
+        std::vector<std::vector<std::pair<int64_t, Mat4> > > map_scans_poses_;
         std::vector<Mat4> submap_original_poses_;
         std::vector<Mat4> submap_init_poses_;
         std::vector<Mat2_3> cam_mats_;
@@ -109,13 +119,7 @@ class PoseGraphNode: public rclcpp::Node
             // Load the trajectory
             std::vector<std::pair<int64_t, Vec7> > trajectory = readTrajectoryFile(msg->traj_file);
             addSubmapTrajectoryToState(trajectory);
-            map_scans_times_.emplace_back();
-            for(const auto& [timestamp, pose] : trajectory)
-            {
-                map_scans_times_.back().push_back(timestamp);
-            }
 
-            map_time_ranges_.emplace_back(trajectory.front().first, trajectory.back().first);
             submap_original_poses_.emplace_back(posQuatToTransform(trajectory.front().second));
             submap_init_poses_.emplace_back(posQuatToTransform(*(time_and_pose_[trajectory.front().first])));
             cam_mats_.emplace_back(Mat2_3::Zero());
@@ -156,6 +160,7 @@ class PoseGraphNode: public rclcpp::Node
 
             std::vector<std::pair<int, Mat4> > submap_id_and_coarse_poses = attemptVisualRegistration(submap_canditates);
 
+            std::vector<std::tuple<int64_t, int64_t, Mat4> > pose_graph_edges = attemptFineRegistration(submap_id_and_coarse_poses);
 
 
             writeFullTrajectory();
@@ -257,6 +262,16 @@ class PoseGraphNode: public rclcpp::Node
 
         void addSubmapTrajectoryToState(const std::vector<std::pair<int64_t, Vec7> >& trajectory)
         {
+            map_scans_poses_.emplace_back();
+            // Add 4 poses spread across the trajectory
+            Mat4 first_pose_mat_inv = posQuatToTransform(trajectory.front().second).inverse();
+            for(size_t i = 0; i < trajectory.size(); i++)
+            {
+                int64_t timestamp = trajectory[i].first;
+                Vec7 pose = trajectory[i].second;
+                map_scans_poses_.back().emplace_back(timestamp, first_pose_mat_inv * posQuatToTransform(pose));
+            }
+
             for(size_t i = 0; i < trajectory.size(); i++)
             {
                 int64_t timestamp = trajectory[i].first;
@@ -329,7 +344,21 @@ class PoseGraphNode: public rclcpp::Node
             RCLCPP_INFO(this->get_logger(), "Wrote full trajectory with %zu poses to file: %s", time_and_pose_.size(), full_traj_file.c_str());
         }
 
-
+        std::string getScanPath(int64_t timestamp)
+        {
+            if(scans_folder_ == "")
+            {
+                RCLCPP_ERROR(this->get_logger(), "Scans folder is not set. Cannot get scan path.");
+                return "";
+            }
+            std::string scan_file = scans_folder_ + "/" + std::to_string(timestamp) + ".ply";
+            if(!std::filesystem::exists(scan_file))
+            {
+                RCLCPP_WARN(this->get_logger(), "Scan file does not exist: %s", scan_file.c_str());
+                return "";
+            }
+            return scan_file;
+        }
 
         void cleanMap(std::shared_ptr<MapDistField> map,
                       const std::string& scans_folder,
@@ -344,7 +373,7 @@ class PoseGraphNode: public rclcpp::Node
             for(const auto& [timestamp, pose] : trajectory)
             {
                 std::cout << "Processing scan " << count++ << " out of " << trajectory.size() << std::endl;
-                std::string scan_file = scans_folder + "/" + std::to_string(timestamp) + ".ply";
+                std::string scan_file = getScanPath(timestamp);
                 if(!std::filesystem::exists(scan_file))
                 {
                     RCLCPP_WARN(this->get_logger(), "Scan file does not exist: %s", scan_file.c_str());
@@ -378,7 +407,7 @@ class PoseGraphNode: public rclcpp::Node
 
             // Get the points in the reference frame of the first submap_pose
             Mat4 first_submap_pose = submap_original_poses_[map_id];
-            Mat4 current_submap_pose = posQuatToTransform(*time_and_pose_[map_time_ranges_[map_id].first]);
+            Mat4 current_submap_pose = posQuatToTransform(*time_and_pose_[map_scans_poses_[map_id].front().first]);
             Mat4 transform = current_submap_pose * first_submap_pose.inverse();
             std::vector<Vec3> transformed_pts;
             double min_x = std::numeric_limits<double>::max();
@@ -493,7 +522,7 @@ class PoseGraphNode: public rclcpp::Node
             std::vector<cv::KeyPoint> keypoints;
             cv::Mat descriptors;
             sift->detectAndCompute(image, cv::noArray(), keypoints, descriptors);
-            std::cout << "Extracted " << keypoints.size() << " keypoints from the submap image." << std::endl;
+            RCLCPP_INFO(this->get_logger(), "Extracted %zu keypoints from the submap image.", keypoints.size());
             return {keypoints, descriptors};
         }
 
@@ -508,7 +537,7 @@ class PoseGraphNode: public rclcpp::Node
                     if(pose_to_submap_id_[j] < current_submap_id - 1)
                     {
                         double distance = distance_travelled_[i] - distance_travelled_[j];
-                        distance = distance*kMaxDrift + kNeighborRadius;
+                        distance = distance*max_drift_ + kNeighborRadius;
 
                         Vec3 pos = poses_in_order_[j]->head<3>();
                         Vec3 current_pos = poses_in_order_.back()->head<3>();
@@ -530,7 +559,7 @@ class PoseGraphNode: public rclcpp::Node
             cv::BFMatcher matcher(cv::NORM_L2, false);
             for(int submap_id : submap_candidates)
             {
-                std::cout << "Attempting visual registration between " << pose_to_submap_id_.back() << " and " << submap_id << std::endl;
+                RCLCPP_INFO(this->get_logger(), "Attempting visual registration between submap %d and %d.", pose_to_submap_id_.back(), submap_id);
                 std::vector<cv::KeyPoint> keypoints1 = submap_keypoints_[pose_to_submap_id_.back()];
                 cv::Mat descriptors1 = submap_descriptors_[pose_to_submap_id_.back()];
                 std::vector<cv::KeyPoint> keypoints2 = submap_keypoints_[submap_id];
@@ -554,7 +583,7 @@ class PoseGraphNode: public rclcpp::Node
 
                 if (good_matches.size() < 4)
                 {
-                    std::cout << "Not enough good matches (" << good_matches.size() << ") between submap " << pose_to_submap_id_.back() << " and " << submap_id << " for visual registration." << std::endl;
+                    RCLCPP_WARN(this->get_logger(), "Not enough good matches (%zu) between submap %d and %d for visual registration. Skipping this match.", good_matches.size(), pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
 
@@ -568,20 +597,18 @@ class PoseGraphNode: public rclcpp::Node
 
                 // Estimate the Affine partial 2D
                 cv::Mat inliers;
-                std::cout << " ------------------------------------------------ " << std::endl;
                 cv::Mat affine = cv::estimateAffinePartial2D(src_pts, dst_pts, inliers, cv::RANSAC, 2.0);
-                std::cout << "/////////// Estimated affine transformation between submap " << pose_to_submap_id_.back() << " and " << submap_id << ":" << std::endl;
 
                 if (affine.empty())
                 {
-                    std::cout << "Could not estimate a valid affine transformation between submap " << pose_to_submap_id_.back() << " and " << submap_id << "." << std::endl;
+                    RCLCPP_WARN(this->get_logger(), "Could not estimate a valid affine transformation between submap %d and %d.", pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
                 // If less than 3 inliers, skip this match
                 int inlier_count = cv::countNonZero(inliers);
                 if(inlier_count < 3)
                 {
-                    std::cout << "Not enough inliers (" << inlier_count << ") after RANSAC between submap " << pose_to_submap_id_.back() << " and " << submap_id << "." << std::endl;
+                    RCLCPP_WARN(this->get_logger(), "Not enough inliers (%d) after RANSAC between submap %d and %d. Skipping this match.", inlier_count, pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
 
@@ -590,12 +617,12 @@ class PoseGraphNode: public rclcpp::Node
                 auto [pose_3d, scale] = affineToPoseAndScale(affine, pose_to_submap_id_.back(), submap_id);
                 if(std::isnan(scale) || std::isinf(scale))
                 {
-                    std::cout << "Estimated scale is invalid between submap " << pose_to_submap_id_.back() << " and " << submap_id << ". Skipping this match." << std::endl;
+                    RCLCPP_WARN(this->get_logger(), "Estimated scale is invalid (scale: %f) between submap %d and %d. Skipping this match.", scale, pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
                 if(std::abs(scale - 1.0) > 0.1)
                 {
-                    std::cout << "Estimated scale is too different from 1.0 (scale: " << scale << ") between submap " << pose_to_submap_id_.back() << " and " << submap_id << ". Skipping this match." << std::endl;
+                    RCLCPP_WARN(this->get_logger(), "Estimated scale is too different from 1.0 (scale: %f) between submap %d and %d. Skipping this match.", scale, pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
                 submap_id_and_coarse_poses.emplace_back(submap_id, pose_3d);
@@ -623,7 +650,6 @@ class PoseGraphNode: public rclcpp::Node
             Mat3 cam_mat_target_3 = Mat3::Identity();
             cam_mat_target_3.block<2,3>(0,0) = cam_mats_[id_target];
 
-            Mat3 image_trans = pose_2d;
             pose_2d = cam_mat_target_3.inverse() * pose_2d * cam_mat_source_3;
 
             Mat4 pose_3d = Mat4::Identity();
@@ -701,6 +727,122 @@ class PoseGraphNode: public rclcpp::Node
             return {pose_3d, scale};
         }
 
+
+
+        std::vector<std::tuple<int64_t, int64_t, Mat4> > attemptFineRegistration(const std::vector<std::pair<int, Mat4> >& submap_id_and_coarse_poses)
+        {
+            std::vector<std::tuple<int64_t, int64_t, Mat4> > pose_graph_edges;
+            for(const auto& [submap_id, coarse_pose] : submap_id_and_coarse_poses)
+            {
+                Mat4 target_submap_pose = posQuatToTransform(*time_and_pose_[map_scans_poses_[submap_id].front().first]);
+                Mat4 coarse_pose_inv = coarse_pose.inverse();
+                // Get 4 poses / scans from the target submap (evenly spread throughout the submap time range)
+                std::vector<std::pair<int64_t, Mat4> > target_poses;
+                target_poses.push_back(map_scans_poses_[submap_id].front());
+                target_poses.push_back(map_scans_poses_[submap_id][map_scans_poses_[submap_id].size()/3]);
+                target_poses.push_back(map_scans_poses_[submap_id][2*map_scans_poses_[submap_id].size()/3]);
+                target_poses.push_back(map_scans_poses_[submap_id].back());
+
+                for(auto [target_timestamp, relative_pose] : target_poses)
+                {
+                    std::vector<Pointd> scan = loadPointCloudFromPly(getScanPath(target_timestamp));
+                    if(scan.size() == 0)
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Scan file is empty for timestamp: %ld. Skipping fine registration for this timestamp.", target_timestamp);
+                        continue;
+                    }
+                    Mat4 target_scan_pose = posQuatToTransform(*time_and_pose_[target_timestamp]);
+                    Mat4 initial_guess = coarse_pose_inv * submap_original_poses_[submap_id] * target_submap_pose.inverse() * target_scan_pose;
+
+
+                    std::vector<Pointd> downsampled_scan = downsamplePointCloud(scan, voxel_size_factor_*map_res_, max_nb_points_,true);
+                    if(downsampled_scan.size() == 0)                    {
+                        RCLCPP_WARN(this->get_logger(), "Downsampled scan is empty for timestamp: %ld. Skipping fine registration for this timestamp.", target_timestamp);
+                        continue;
+                    }
+
+                    Mat4 T_o_target = maps_.back()->registerPts(downsampled_scan, initial_guess, 1, false, 5.0, 10);
+                    T_o_target = maps_.back()->registerPts(downsampled_scan, T_o_target, 1, false, 2.0, 10);
+                    T_o_target = maps_.back()->registerPts(downsampled_scan, T_o_target, 1, false, loss_scale_);
+
+                    // Align the scan to test the number of inliers
+                    std::vector<Pointd> transformed_scan;
+                    for(const auto& pt : scan)
+                    {
+                        Vec3 transformed_vec = T_o_target.block<3,3>(0,0) * pt.vec3() + T_o_target.block<3,1>(0,3);
+                        transformed_scan.emplace_back(Vec3(transformed_vec(0), transformed_vec(1), transformed_vec(2)), 0);
+                    }
+                    int inlier_count = 0;
+                    for(const auto& pt : transformed_scan)
+                    {
+                        double distance = maps_.back()->queryDistField(pt.vec3());
+                        if(distance < map_res_)
+                        {
+                            inlier_count++;
+                        }
+                    }
+                    double inlier_ratio = static_cast<double>(inlier_count) / static_cast<double>(scan.size());
+
+                    if(inlier_ratio < 0.8)
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Low inlier ratio (%f) after fine registration between submap %d and scan at timestamp %ld. Skipping this match.", inlier_ratio, submap_id, target_timestamp);
+                        continue;
+                    }
+
+                    // Get the closest pose/timestamp in the current submap to the target pose
+                    int64_t closest_timestamp = -1;
+                    double closest_distance = std::numeric_limits<double>::max();
+                    Mat4 T_o_source = Mat4::Identity();
+                    for(const auto& [timestamp, rel_pose] : map_scans_poses_.back())
+                    {
+                        Mat4 current_pose = submap_original_poses_.back() * rel_pose;
+                        double distance = (current_pose.block<3,1>(0,3) - T_o_target.block<3,1>(0,3)).norm();
+                        if(distance < closest_distance)
+                        {
+                            closest_distance = distance;
+                            closest_timestamp = timestamp;
+                            T_o_source = current_pose;
+                        }
+                    }
+                    if(closest_timestamp == -1)
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Could not find a closest timestamp in the current submap for scan at timestamp %ld. Skipping this match.", target_timestamp);
+                        continue;
+                    }
+
+                    Mat4 T_target_source = T_o_target.inverse() * T_o_source;
+                    pose_graph_edges.emplace_back(target_timestamp, closest_timestamp, T_target_source);
+                    
+
+                    // Read both the target and closest scans, transform the closest scan with the estimated transformation and save both for visualization
+                    std::vector<Pointd> source_scan = loadPointCloudFromPly(getScanPath(closest_timestamp));
+                    if(source_scan.size() == 0)                    {
+                        RCLCPP_WARN(this->get_logger(), "Scan file is empty for closest timestamp: %ld. Skipping saving transformed scan for visualization.", closest_timestamp);
+                        continue;
+                    }
+                    std::vector<Pointd> transformed_closest_scan;
+                    for(const auto& pt : source_scan)                    {
+                        Vec3 transformed_vec = T_target_source.block<3,3>(0,0) * pt.vec3() + T_target_source.block<3,1>(0,3);
+                        transformed_closest_scan.emplace_back(Vec3(transformed_vec(0), transformed_vec(1), transformed_vec(2)), 0);
+                    }
+                    std::vector<Pointd> target_scan = loadPointCloudFromPly(getScanPath(target_timestamp));
+                    if(target_scan.size() == 0)                    {
+                        RCLCPP_WARN(this->get_logger(), "Scan file is empty for target timestamp: %ld. Skipping saving target scan for visualization.", target_timestamp);
+                        continue;
+                    }
+                    // Save the target scan, and the transformed closest scan for visualization
+                    std::string target_scan_file = output_folder_ + "/loop_from_submap_" + std::to_string(submap_id) + "_timestamp_" + std::to_string(target_timestamp) + "_inlier_ratio_" + std::to_string(inlier_ratio) + "_target.ply";
+                    savePointCloudToPly(target_scan_file, target_scan);
+                    RCLCPP_INFO(this->get_logger(), "Saved target scan to %s", target_scan_file.c_str());
+                    std::string transformed_closest_scan_file = output_folder_ + "/loop_from_submap_" + std::to_string(submap_id) + "_timestamp_" + std::to_string(target_timestamp) + "_inlier_ratio_" + std::to_string(inlier_ratio) + "_closest_transformed.ply";
+                    savePointCloudToPly(transformed_closest_scan_file, transformed_closest_scan);
+                    RCLCPP_INFO(this->get_logger(), "Saved transformed closest scan to %s", transformed_closest_scan_file.c_str());
+
+
+                }
+            }
+            return pose_graph_edges;
+        }
 
 };
 
