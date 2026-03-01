@@ -342,6 +342,10 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
                         && (std::abs(delta_1) < threshold)
                         && ((dt_2 > time_thr_far) || (delta_2 < -local_thr)) )
                 {
+                    if(params_.intensity_threshold > 0.0 && channels[i][j].i < params_.intensity_threshold)
+                    {
+                        continue; // Skip points that do not meet the intensity threshold
+                    }
                     output->push_back(channels[i][j]);
                     output->back().type = 2; // Set the type to 2 (edge)
                     continue;
@@ -350,6 +354,10 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
                         && (std::abs(delta_2) < threshold)
                         && ((dt_1 > time_thr_far) || (delta_1 < -local_thr)) )
                 {
+                    if(params_.intensity_threshold > 0.0 && channels[i][j].i < params_.intensity_threshold)
+                    {
+                        continue; // Skip points that do not meet the intensity threshold
+                    }
                     output->push_back(channels[i][j]);
                     output->back().type = 2; // Set the type to 2 (edge)
                     continue;
@@ -365,6 +373,10 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
             if(distance > params_.feature_voxel_size*(0.5 + rand_val))
             //if(distance > params_.feature_voxel_size)
             {
+                if(params_.intensity_threshold > 0.0 && channels[i][j].i < params_.intensity_threshold)
+                {
+                    continue; // Skip points that do not meet the intensity threshold
+                }
                 last_point = channels[i][j];
                 downsample->push_back(channels[i][j]);
                 downsample->back().type = is_2d_ ? 2 : 1; // Set the type to 1 (planar) or 2 (edge) depending on is_2d_

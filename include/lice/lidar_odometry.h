@@ -46,6 +46,8 @@ struct LidarOdometryParams
     double acc_std = 0.02;
     double lidar_std = 0.02;
 
+    double intensity_threshold = -1.0; // If > 0, only use points with intensity above this threshold for feature extraction
+
     double association_filter_lin_quantum = 0.45;
 
     bool unsorted_pc = false; // If true, the incoming point clouds are not sorted by time

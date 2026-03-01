@@ -39,6 +39,7 @@ def generate_launch_description():
                 {'loss_function_scale': 0.5},
                 {"state_freq": 200.0},
                 {"max_associations_per_type": 1000},
+                {"minimum_intensity": 2.0},
                 {"broken_channels": "69"},
 
                 # Adapting IMU measurements for some weird IMUs
