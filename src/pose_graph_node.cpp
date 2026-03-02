@@ -17,6 +17,99 @@ const float kCapHeight = 0.5; // Maximum height to consider for the submap image
 const double kNeighborRadius = 60.0;
 
 
+struct RelativePoseCostFunctor
+{
+    RelativePoseCostFunctor(const Mat4& measured_rel_pose, const Mat6& cov)
+        : measured_rel_pose_(measured_rel_pose)
+    {
+        // LLt decomposition for weight matrix
+        Eigen::LLT<Mat6> llt(cov.inverse());
+        weight_ = llt.matrixL();
+    }
+
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const
+    {
+        // Convert poses to transformation matrices
+        Eigen::Matrix<T, 4, 4> Ti = posQuatToTransform(pose_i);
+        Eigen::Matrix<T, 4, 4> Tj = posQuatToTransform(pose_j);
+        Eigen::Matrix<T, 4, 4> Tij_measured = measured_rel_pose_.template cast<T>();
+        // Compute the predicted relative transformation
+        Eigen::Matrix<T, 4, 4> Tij_predicted = Ti.inverse() * Tj;
+        // Compute the error transformation
+        Eigen::Matrix<T, 4, 4> Te = Tij_measured.inverse() * Tij_predicted;
+        // Convert the error transformation to a 6D vector (3 for rotation, 3 for translation)
+        Eigen::Matrix<T, 6, 1> error = transformToPoseVector(Te);
+        // Scale the residuals by the weight
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residual_map(residuals);
+        residual_map = weight_.template cast<T>() * error;
+        return true;
+    }
+
+    Mat4 measured_rel_pose_;
+    Mat6 weight_;
+};
+
+struct RelativePositionCostFunctor
+{
+    RelativePositionCostFunctor(const Vec3& measured_rel_pos, const Mat3& cov)
+        : measured_rel_pos_(measured_rel_pos)
+    {
+        // LLt decomposition for weight matrix
+        Eigen::LLT<Mat3> llt(cov.inverse());
+        weight_ = llt.matrixL();
+    }
+
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const
+    {
+        // Convert poses to transformation matrices
+        Eigen::Matrix<T, 4, 4> Ti = posQuatToTransform(pose_i);
+        Eigen::Matrix<T, 4, 4> Tj = posQuatToTransform(pose_j);
+        // Compute the predicted relative transformation
+        Eigen::Matrix<T, 4, 4> Tij_predicted = Ti.inverse() * Tj;
+        // Compute the error transformation
+        Eigen::Map<Eigen::Matrix<T, 3, 1>> residual_map(residuals);
+        residual_map = weight_.template cast<T>() * (Tij_predicted.template block<3,1>(0,3) - measured_rel_pos_.template cast<T>());
+        return true;
+    }
+
+    Vec3 measured_rel_pos_;
+    Mat3 weight_;
+};
+
+struct RelativeRotationCostFunctor
+{
+    RelativeRotationCostFunctor(const Mat3& measured_rel_rot, const Mat3& cov)
+        : measured_rel_rot_inv_(measured_rel_rot.inverse())
+    {
+        // LLt decomposition for weight matrix
+        Eigen::LLT<Mat3> llt(cov.inverse());
+        weight_ = llt.matrixL();
+    }
+
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const
+    {
+        // Convert poses to transformation matrices
+        Eigen::Matrix<T, 4, 4> Ti = posQuatToTransform(pose_i);
+        Eigen::Matrix<T, 4, 4> Tj = posQuatToTransform(pose_j);
+        // Compute the predicted relative transformation
+        Eigen::Matrix<T, 4, 4> Tij_predicted = Ti.inverse() * Tj;
+        // Compute the error transformation
+        Eigen::Map<Eigen::Matrix<T, 3, 1>> residual_map(residuals);
+        Eigen::Matrix<T, 3, 3> rot_diff = measured_rel_rot_inv_.template cast<T>() * Tij_predicted.template block<3,3>(0,0);
+        residual_map = weight_.template cast<T>() * rotMatToAngleAxis(rot_diff);
+        return true;
+    }
+
+    Mat3 measured_rel_rot_inv_;
+    Mat3 weight_;
+};
+
+
+
+
 class PoseGraphNode: public rclcpp::Node
 {
     public:
@@ -31,7 +124,14 @@ class PoseGraphNode: public rclcpp::Node
             max_nb_points_ = readFieldInt(this, "max_num_pts_for_registration", 8000);
             loss_scale_ = readFieldDouble(this, "loss_function_scale", 0.5);
 
+            odom_error_pos_ = readFieldDouble(this, "odom_typical_pos_error", 0.01);
+            odom_rotation_error_ = readFieldDouble(this, "odom_typical_rot_error_deg_per_m", 0.01) * M_PI / 180.0;
 
+
+            loop_loss_scale_pos_ = readFieldDouble(this, "loop_closure_loss_scale_pos", 0.5);
+            loop_loss_scale_rot_ = readFieldDouble(this, "loop_closure_loss_scale_rot", 0.5) * M_PI / 180.0;
+            loop_pos_std = readFieldDouble(this, "loop_closure_std_pos", 0.50);
+            loop_rot_std = readFieldDouble(this, "loop_closure_std_rot", 0.50) * M_PI / 180.0;
 
 
             
@@ -49,6 +149,10 @@ class PoseGraphNode: public rclcpp::Node
             map_options_.max_range = std::numeric_limits<double>::max();
             map_options_.num_threads = 1;
 
+            solver_options_.max_num_iterations = 100;
+            solver_options_.num_threads = 1;
+            solver_options_.minimizer_progress_to_stdout = true;
+
         }
 
     private:
@@ -60,6 +164,17 @@ class PoseGraphNode: public rclcpp::Node
         double voxel_size_factor_ = 2.0;
         int max_nb_points_ = 8000;
         double loss_scale_ = 0.5;
+        double odom_error_pos_ = 0.01;
+        double odom_rotation_error_ = 0.01 * M_PI / 180.0;
+        double loop_loss_scale_pos_ = 0.5;
+        double loop_loss_scale_rot_ = 0.5 * M_PI / 180.0;
+        double loop_pos_std = 0.50;
+        double loop_rot_std = 0.50 * M_PI / 180.0;
+
+        int64_t last_time_register_ = -1;
+
+        ceres::Problem pose_graph_problem_;
+        ceres::Solver::Options solver_options_;
 
         std::vector<std::string> map_paths_;
         std::vector<std::string> traj_files_;
@@ -75,7 +190,7 @@ class PoseGraphNode: public rclcpp::Node
         MapDistFieldOptions map_options_;
 
         std::map<int64_t, std::shared_ptr<Vec7> > time_and_pose_;
-        std::vector<std::shared_ptr<Vec7> > poses_in_order_;
+        std::vector<int64_t> times_in_order_;
         std::vector<int> pose_to_submap_id_;
         std::vector<double> distance_travelled_;
         int last_closed_pose_index_ = -1;
@@ -162,9 +277,98 @@ class PoseGraphNode: public rclcpp::Node
 
             std::vector<std::tuple<int64_t, int64_t, Mat4> > pose_graph_edges = attemptFineRegistration(submap_id_and_coarse_poses);
 
+            addLoopClosuresToPoseGraph(pose_graph_edges);
 
             writeFullTrajectory();
         }
+
+        void addLoopClosuresToPoseGraph(const std::vector<std::tuple<int64_t, int64_t, Mat4> >& pose_graph_edges)
+        {
+            if(pose_graph_edges.size() > 0)
+            {
+
+std::cout << "Adding " << pose_graph_edges.size() << " loop closures to the pose graph optimization problem." << std::endl;
+                initializeLoopClosureState(pose_graph_edges);
+std::cout << "State initialized for loop closure optimization." << std::endl;
+
+                for(const auto& [timestamp_i, timestamp_j, rel_pose] : pose_graph_edges)
+                {
+std::cout << "Adding loop closure edge between timestamps " << timestamp_i << " and " << timestamp_j << std::endl;
+                    Mat3 cov = Mat3::Zero();
+                    cov = Mat3::Identity() * loop_pos_std * loop_pos_std;
+                    ceres::CostFunction* cost_function = new ceres::AutoDiffCostFunction<RelativePositionCostFunctor, 3, 7, 7>(
+                        new RelativePositionCostFunctor(rel_pose.block<3,1>(0,3), cov)
+                    );
+                    pose_graph_problem_.AddResidualBlock(cost_function, new ceres::CauchyLoss(loop_loss_scale_pos_), time_and_pose_[timestamp_i]->data(), time_and_pose_[timestamp_j]->data());
+
+                    cov = Mat3::Identity() * loop_rot_std * loop_rot_std;
+                    cost_function = new ceres::AutoDiffCostFunction<RelativeRotationCostFunctor, 3, 7, 7>(
+                        new RelativeRotationCostFunctor(rel_pose.block<3,3>(0,0), cov)
+                    );
+                    pose_graph_problem_.AddResidualBlock(cost_function, new ceres::CauchyLoss(loop_loss_scale_rot_), time_and_pose_[timestamp_i]->data(), time_and_pose_[timestamp_j]->data());
+
+                    last_time_register_ = std::max(last_time_register_, std::max(timestamp_i, timestamp_j));
+                }
+
+                ceres::Solver::Summary summary;
+                ceres::Solve(solver_options_, &pose_graph_problem_, &summary);
+                std::cout << summary.FullReport() << std::endl;
+            }
+        }
+
+
+        void initializeLoopClosureState(const std::vector<std::tuple<int64_t, int64_t, Mat4> >& pose_graph_edges)
+        {
+            // Get the most recent pose in the state that is in the new edges
+            int64_t most_recent_timestamp_j_in_edges = -1;
+            int64_t most_recent_timestamp_i_in_edges = -1;
+            Mat4 most_recent_rel_pose = Mat4::Identity();
+            for(const auto& [timestamp_i, timestamp_j, rel_pose] : pose_graph_edges)
+            {
+                if(timestamp_j > most_recent_timestamp_j_in_edges)
+                {
+                    most_recent_timestamp_j_in_edges = timestamp_j;
+                    most_recent_timestamp_i_in_edges = timestamp_i;
+                    most_recent_rel_pose = rel_pose;
+                }
+            }
+std::cout << "Most recent edge in new loop closures is between timestamps " << most_recent_timestamp_i_in_edges << " and " << most_recent_timestamp_j_in_edges << std::endl;
+
+            // Get the delta pose between the current state and the most recent edge pose
+            Mat4 current_delta_pose = posQuatToTransform(*time_and_pose_[most_recent_timestamp_i_in_edges]).inverse() * posQuatToTransform(*time_and_pose_[most_recent_timestamp_j_in_edges]);
+            Mat4 delta_to_spread = current_delta_pose.inverse() * most_recent_rel_pose;
+            Vec3 delta_rot_vec = logMap(delta_to_spread.block<3,3>(0,0));
+            Vec3 delta_pos = delta_to_spread.block<3,1>(0,3);
+
+            int64_t timestamp_to_spread = std::max(most_recent_timestamp_i_in_edges, last_time_register_);
+            int64_t delta_time = most_recent_timestamp_j_in_edges - timestamp_to_spread;
+
+std::cout << "Spreading loop closure correction to poses between timestamps " << timestamp_to_spread << " and " << most_recent_timestamp_j_in_edges << std::endl;
+
+            // Loop the poses from the end
+            for(int i = times_in_order_.size() - 1; (i >= 0) && (times_in_order_[i] >= timestamp_to_spread); i--)
+            {
+std::cout << "Updating pose at timestamp " << times_in_order_[i] << std::endl;
+                if(times_in_order_[i] > most_recent_timestamp_j_in_edges)
+                {
+std::cout << "Pose is after the most recent timestamp in edges, applying full correction." << std::endl;
+                    Mat4 last_j_to_i = posQuatToTransform(*time_and_pose_[most_recent_timestamp_j_in_edges]).inverse() * posQuatToTransform(*time_and_pose_[times_in_order_[i]]);
+                    Mat4 new_pose = posQuatToTransform(*time_and_pose_[most_recent_timestamp_j_in_edges]) * delta_to_spread * last_j_to_i;
+                    *time_and_pose_[times_in_order_[i]] = transformToPosQuat(new_pose);
+                }
+                else
+                {
+std::cout << "Pose is between the timestamp to spread and the most recent timestamp in edges, applying partial correction." << std::endl;
+                    Mat4 delta_pose = Mat4::Identity();
+                    double ratio = double(times_in_order_[i] - timestamp_to_spread) / double(delta_time);
+                    delta_pose.block<3,3>(0,0) = expMap(delta_rot_vec * ratio);
+                    delta_pose.block<3,1>(0,3) = delta_pos * ratio;
+                    Mat4 new_pose = posQuatToTransform(*time_and_pose_[times_in_order_[i]]) * delta_pose;
+                    *time_and_pose_[times_in_order_[i]] = transformToPosQuat(new_pose);
+                }
+            }
+        }
+
 
 
         void alignGravity(const Vec3& gravity)
@@ -282,9 +486,11 @@ class PoseGraphNode: public rclcpp::Node
                     std::cout << "Adding first pose with timestamp " << timestamp << std::endl;
                     auto pose_ptr = std::make_shared<Vec7>(pose);
                     time_and_pose_[timestamp] = pose_ptr;
-                    poses_in_order_.push_back(pose_ptr);
+                    times_in_order_.push_back(timestamp);
                     distance_travelled_.push_back(0.0);
                     pose_to_submap_id_.push_back(maps_.size() - 1);
+                    pose_graph_problem_.AddParameterBlock(pose_ptr->data(), 7);
+                    pose_graph_problem_.SetParameterBlockConstant(pose_ptr->data());
                     continue;
                 }
                 if(i == 0 && (time_and_pose_.find(timestamp) == time_and_pose_.end()))
@@ -303,10 +509,23 @@ class PoseGraphNode: public rclcpp::Node
 
                     auto pose = std::make_shared<Vec7>(transformToPosQuat<double>(posQuatToTransform<double>(*time_and_pose_[trajectory[i-1].first]) * delta_mat));
                     time_and_pose_[timestamp] = pose;
-                    poses_in_order_.push_back(pose);
+                    times_in_order_.push_back(timestamp);
                     double distance = (posQuatToTransform(*time_and_pose_[trajectory[i-1].first]).block<3,1>(0,3) - posQuatToTransform(*pose).block<3,1>(0,3)).norm();
                     distance_travelled_.push_back(distance_travelled_.back() + distance);
                     pose_to_submap_id_.push_back(maps_.size() - 1);
+
+                    Mat6 cov = Mat6::Zero();
+                    cov.block<3,3>(0,0) = Mat3::Identity() * (distance+0.5) * odom_error_pos_;
+                    cov.block<3,3>(3,3) = Mat3::Identity() * (distance+0.5) * odom_rotation_error_;
+                    cov = cov*cov;
+                    ceres::CostFunction* cost_function = new ceres::AutoDiffCostFunction<RelativePoseCostFunctor, 6, 7, 7>(
+                        new RelativePoseCostFunctor(delta_mat, cov)
+                    );
+                    pose_graph_problem_.AddResidualBlock(
+                        cost_function,
+                        nullptr,
+                        time_and_pose_[trajectory[i-1].first]->data(),
+                        pose->data());
                 }
             }
             RCLCPP_INFO(this->get_logger(), "Added %zu poses to the state from trajectory.", trajectory.size());
@@ -539,8 +758,10 @@ class PoseGraphNode: public rclcpp::Node
                         double distance = distance_travelled_[i] - distance_travelled_[j];
                         distance = distance*max_drift_ + kNeighborRadius;
 
-                        Vec3 pos = poses_in_order_[j]->head<3>();
-                        Vec3 current_pos = poses_in_order_.back()->head<3>();
+                        Vec7 pose_i = *time_and_pose_[times_in_order_[i]];
+                        Vec3 pos = pose_i.head<3>();
+                        Vec7 pose_j = *time_and_pose_[times_in_order_[j]];
+                        Vec3 current_pos = pose_j.head<3>();
                         double euclidean_distance = (current_pos - pos).norm();
                         if(euclidean_distance < distance)
                         {
