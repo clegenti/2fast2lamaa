@@ -199,6 +199,7 @@ struct DataAssociation
     RowX computeJacobian(const Vec3& feature, const std::vector<Vec3>& targets) const
     {
         RowX output(3+(3*targets.size()));
+        output.setZero();
         if(type == 1)
         {
             Vec3 v1 = targets[0] - targets[1];
@@ -242,18 +243,25 @@ struct DataAssociation
             double v3_norm = v3.norm();
             if (v3_norm < 1e-6)
             {
-                output.setZero();
                 return output;
             }
             double v3_norm_inv = 1.0/v3_norm;
             Vec3 n = v1.cross(v2);
-            
-            double temp_norm = (n/(v1.norm()*v2.norm())).norm();
-            if( std::isnan(temp_norm) || temp_norm < 1e-4)
+
+            double v1_sq_norm = v1.squaredNorm();
+            double v2_sq_norm = v2.squaredNorm();
+            if ((v1_sq_norm < 1e-12) || (v2_sq_norm < 1e-12))
             {
-                output.setZero();
                 return output;
-            }   
+            }
+
+            double n_sq_norm = n.squaredNorm();
+            if (n_sq_norm < 1e-8 * v1_sq_norm * v2_sq_norm)
+            {
+                return output;
+            }
+
+            double n_norm_inv = 1.0 / std::sqrt(n_sq_norm);
 
             Mat3_6 temp_d_vector_prod;
             temp_d_vector_prod(0,0) = 0.0;
@@ -283,7 +291,7 @@ struct DataAssociation
             temp_d_v3_norm[4] = v3[1]*v3_norm_inv;
             temp_d_v3_norm[5] = v3[2]*v3_norm_inv;
 
-            MatX temp(3, 9);
+            Eigen::Matrix<double, 3, 9> temp;
             temp(0,0) = 0.0;
             temp(0,1) = v3_norm_inv*(-v3[2]);
             temp(0,2) = v3_norm_inv*(v3[1]);
@@ -296,7 +304,7 @@ struct DataAssociation
 
             temp.block<3,6>(0,3) = temp_d_vector_prod * v3_norm_inv - (v3_norm_inv*v3_norm_inv*n)*temp_d_v3_norm;
 
-            output =  ((n.transpose() * v3_norm_inv) / ((n*v3_norm_inv).norm()))*temp;
+            output = (n.transpose() * n_norm_inv) * temp;
         }
 
         return output;

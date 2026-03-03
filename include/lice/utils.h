@@ -33,25 +33,25 @@ class StopWatch
             if(!stopped_)
             {
                 duration_ += (temp - last_);
-                output = std::chrono::duration_cast<std::chrono::microseconds>(duration_).count();
+                output = std::chrono::duration_cast<std::chrono::nanoseconds>(duration_).count();
             }
             last_ = temp;
             stopped_ = false;
-            return output/1000.0;
+            return output/1000000.0;
         }
 
         // Since the first "start after the last reset"
         double getTotal()
         {
             auto temp = std::chrono::high_resolution_clock::now();
-            return std::chrono::duration_cast<std::chrono::microseconds>(duration_ + (temp - last_)).count()/1000.0;
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(duration_ + (temp - last_)).count()/1000000.0;
         }
 
         // Since the 
         double getLast()
         {
             auto temp = std::chrono::high_resolution_clock::now();
-            return std::chrono::duration_cast<std::chrono::microseconds>(temp - last_).count()/1000.0;
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(temp - last_).count()/1000000.0;
 
         }
 
@@ -62,7 +62,7 @@ class StopWatch
                 auto temp = std::chrono::high_resolution_clock::now();
                 stopped_ = true;
                 duration_ += (temp - last_);
-                return std::chrono::duration_cast<std::chrono::microseconds>(duration_).count()/1000.0;
+                return std::chrono::duration_cast<std::chrono::nanoseconds>(duration_).count()/1000000.0;
             }
             else
             {
@@ -85,7 +85,7 @@ class StopWatch
 
         void print(std::string str)
         {
-            std::cout << str << " " << std::chrono::duration_cast<std::chrono::microseconds>(duration_).count()/1000.0 << " ms" << std::endl;
+            std::cout << str << " " << std::chrono::duration_cast<std::chrono::nanoseconds>(duration_).count()/1000000.0 << " ms" << std::endl;
         }
 
     private:

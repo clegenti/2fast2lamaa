@@ -50,7 +50,6 @@ std::vector<std::pair<Vec3, Vec3> > State::queryApprox(
         , const Vec3& gyr_bias
         , const Vec3& gravity
         , const Vec3& vel
-        , const double dt
         ) const
 {
     std::vector<std::pair<Vec3, Vec3> > query_pose(query_time.size());
@@ -70,14 +69,14 @@ std::vector<std::pair<Vec3, Vec3> > State::queryApprox(
         {
             const ugpm::PreintMeas& preint = preint_meas_.at(i);
 
-            R = preint.delta_R * ugpm::expMap(preint.d_delta_R_d_bw * gyr_bias + preint.d_delta_R_d_t * dt);
+            R = preint.delta_R * ugpm::expMap(preint.d_delta_R_d_bw * gyr_bias);
             if(mode_ == LidarOdometryMode::GYR)
             {
                 p = vel * (state_time_.at(i) - start_t_);
             }
             else
             {
-                p = preint.delta_p + preint.d_delta_p_d_bf * acc_bias + preint.d_delta_p_d_bw * gyr_bias + preint.d_delta_p_d_t * dt + vel*preint.dt + gravity*preint.dt_sq_half;
+                p = preint.delta_p + preint.d_delta_p_d_bf * acc_bias + preint.d_delta_p_d_bw * gyr_bias + vel*preint.dt + gravity*preint.dt_sq_half;
             }
         }
         state_pose.at(i) = {p, ugpm::logMap(R)};
@@ -121,7 +120,7 @@ std::pair<Vec3, Vec3> State::query(
         , const Vec3& gyr_bias
         , const Vec3& gravity
         , const Vec3& vel
-        , const double dt
+        , const bool use_cache
         ) const
 {
     std::pair<Vec3, Vec3> query_pose;
@@ -159,11 +158,30 @@ std::pair<Vec3, Vec3> State::query(
         }
         else
         {
-            p0 = preint_meas_[state_id].delta_p + preint_meas_[state_id].d_delta_p_d_bf * acc_bias + preint_meas_[state_id].d_delta_p_d_bw * gyr_bias + preint_meas_[state_id].d_delta_p_d_t * dt + vel*preint_meas_[state_id].dt + gravity*preint_meas_[state_id].dt_sq_half;
-            p1 = preint_meas_[state_id+1].delta_p + preint_meas_[state_id+1].d_delta_p_d_bf * acc_bias + preint_meas_[state_id+1].d_delta_p_d_bw * gyr_bias + preint_meas_[state_id+1].d_delta_p_d_t * dt + vel*preint_meas_[state_id+1].dt + gravity*preint_meas_[state_id+1].dt_sq_half;
+            if(use_cache && !cached_state_poses_.empty())
+            {
+                p0 = cached_state_poses_[state_id].first;
+                p1 = cached_state_poses_[state_id+1].first;
+            }
+            else
+            {
+                p0 = preint_meas_[state_id].delta_p + preint_meas_[state_id].d_delta_p_d_bf * acc_bias + preint_meas_[state_id].d_delta_p_d_bw * gyr_bias + vel*preint_meas_[state_id].dt + gravity*preint_meas_[state_id].dt_sq_half;
+                p1 = preint_meas_[state_id+1].delta_p + preint_meas_[state_id+1].d_delta_p_d_bf * acc_bias + preint_meas_[state_id+1].d_delta_p_d_bw * gyr_bias + vel*preint_meas_[state_id+1].dt + gravity*preint_meas_[state_id+1].dt_sq_half;
+            }
         }
-        const Mat3 R0 = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * gyr_bias + preint_meas_[state_id].d_delta_R_d_t * dt);
-        const Mat3 R1 = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * gyr_bias + preint_meas_[state_id+1].d_delta_R_d_t * dt);
+        
+        Mat3 R0;
+        Mat3 R1;
+        if(use_cache && !cached_state_poses_.empty())
+        {
+            R0 = cached_state_poses_[state_id].second;
+            R1 = cached_state_poses_[state_id+1].second;
+        }
+        else
+        {
+             R0 = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * gyr_bias);
+             R1 = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * gyr_bias);
+        }
 
         query_pose.first = p0 + alpha * (p1 - p0);
         Vec3 delta_r = ugpm::logMap(R0.transpose() * R1);
@@ -175,17 +193,17 @@ std::pair<Vec3, Vec3> State::query(
 
 // Overload to query a single time
 std::tuple<std::pair<Vec3, Vec3>,
-        std::vector<std::pair<MatX, MatX> > > State::queryWthJacobian(
+        std::array<std::pair<Mat3, Mat3>, 4> > State::queryWthJacobian(
         const double query_time
         , const Vec3& acc_bias
         , const Vec3& gyr_bias
         , const Vec3& gravity
         , const Vec3& vel
-        , const double dt
+        , const bool use_cache
         ) const
 {
     std::pair<Vec3, Vec3> query_pose;
-    std::vector<std::pair<MatX, MatX> > query_jacobian(5);
+    std::array<std::pair<Mat3, Mat3>, 4> query_jacobian;
 
     if( mode_ == LidarOdometryMode::NO_IMU)
     {
@@ -202,21 +220,19 @@ std::tuple<std::pair<Vec3, Vec3>,
         query_jacobian[2].second = Mat3::Zero();
         query_jacobian[3].first = Mat3::Identity()*dt;
         query_jacobian[3].second = Mat3::Zero();
-        query_jacobian[4].first = Mat3::Zero();
-        query_jacobian[4].second = Mat3::Zero();
 
     }
     else
     {
         // Get the pose at the state time
-        std::vector<MatX> state_jacobian_0(5);
-        std::vector<MatX> state_jacobian_1(5);
+        std::array<Mat3, 4> state_jacobian_0;
+        std::array<Mat3, 4> state_jacobian_1;
 
 
-        std::vector<Mat3> state_R_shift_dw_0(3);
-        std::vector<Mat3> state_R_shift_dw_1(3);
+        std::array<Mat3, 3> state_R_shift_dw_0;
+        std::array<Mat3, 3> state_R_shift_dw_1;
 
-        double eps = 1e-6;
+        double eps = eps_;
 
 
         double t = query_time;
@@ -244,45 +260,66 @@ std::tuple<std::pair<Vec3, Vec3>,
             state_jacobian_0[1] = Mat3::Zero();
             state_jacobian_0[2] = Mat3::Zero();
             state_jacobian_0[3] = Mat3::Identity()* (state_time_[state_id] - start_t_);
-            state_jacobian_0[4] = Vec3::Zero();
 
             state_jacobian_1[0] = Mat3::Zero();
             state_jacobian_1[1] = Mat3::Zero();
             state_jacobian_1[2] = Mat3::Zero();
             state_jacobian_1[3] = Mat3::Identity()* (state_time_[state_id+1] - start_t_);
-            state_jacobian_1[4] = Vec3::Zero();
         }
         else
         {
-            p0 = preint_meas_[state_id].delta_p + preint_meas_[state_id].d_delta_p_d_bf * acc_bias + preint_meas_[state_id].d_delta_p_d_bw * gyr_bias + preint_meas_[state_id].d_delta_p_d_t * dt + vel*preint_meas_[state_id].dt + gravity*preint_meas_[state_id].dt_sq_half;
-            p1 = preint_meas_[state_id+1].delta_p + preint_meas_[state_id+1].d_delta_p_d_bf * acc_bias + preint_meas_[state_id+1].d_delta_p_d_bw * gyr_bias + preint_meas_[state_id+1].d_delta_p_d_t * dt + vel*preint_meas_[state_id+1].dt + gravity*preint_meas_[state_id+1].dt_sq_half;
+            if(use_cache && !cached_state_poses_.empty())
+            {
+                p0 = cached_state_poses_[state_id].first;
+                p1 = cached_state_poses_[state_id+1].first;
+            
+                state_jacobian_0 = cached_state_jacobians_[state_id];
+                state_jacobian_1 = cached_state_jacobians_[state_id+1];
+            }
+            else
+            {
+                p0 = preint_meas_[state_id].delta_p + preint_meas_[state_id].d_delta_p_d_bf * acc_bias + preint_meas_[state_id].d_delta_p_d_bw * gyr_bias + vel*preint_meas_[state_id].dt + gravity*preint_meas_[state_id].dt_sq_half;
+                p1 = preint_meas_[state_id+1].delta_p + preint_meas_[state_id+1].d_delta_p_d_bf * acc_bias + preint_meas_[state_id+1].d_delta_p_d_bw * gyr_bias + vel*preint_meas_[state_id+1].dt + gravity*preint_meas_[state_id+1].dt_sq_half;
 
-            state_jacobian_0[0] = preint_meas_[state_id].d_delta_p_d_bf;
-            state_jacobian_0[1] = preint_meas_[state_id].d_delta_p_d_bw;
-            state_jacobian_0[2] = Mat3::Identity()*preint_meas_[state_id].dt_sq_half;
-            state_jacobian_0[3] = Mat3::Identity()*preint_meas_[state_id].dt;
-            state_jacobian_0[4] = preint_meas_[state_id].d_delta_p_d_t;
+                state_jacobian_0[0] = preint_meas_[state_id].d_delta_p_d_bf;
+                state_jacobian_0[1] = preint_meas_[state_id].d_delta_p_d_bw;
+                state_jacobian_0[2] = Mat3::Identity()*preint_meas_[state_id].dt_sq_half;
+                state_jacobian_0[3] = Mat3::Identity()*preint_meas_[state_id].dt;
 
-            state_jacobian_1[0] = preint_meas_[state_id+1].d_delta_p_d_bf;
-            state_jacobian_1[1] = preint_meas_[state_id+1].d_delta_p_d_bw;
-            state_jacobian_1[2] = Mat3::Identity()*preint_meas_[state_id+1].dt_sq_half;
-            state_jacobian_1[3] = Mat3::Identity()*preint_meas_[state_id+1].dt;
-            state_jacobian_1[4] = preint_meas_[state_id+1].d_delta_p_d_t;
+                state_jacobian_1[0] = preint_meas_[state_id+1].d_delta_p_d_bf;
+                state_jacobian_1[1] = preint_meas_[state_id+1].d_delta_p_d_bw;
+                state_jacobian_1[2] = Mat3::Identity()*preint_meas_[state_id+1].dt_sq_half;
+                state_jacobian_1[3] = Mat3::Identity()*preint_meas_[state_id+1].dt;
+            }
         }
-        const Mat3 R0 = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * gyr_bias + preint_meas_[state_id].d_delta_R_d_t * dt);
-        const Mat3 R1 = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * gyr_bias + preint_meas_[state_id+1].d_delta_R_d_t * dt);
-
-
-        Mat3 state_R_shift_dt_0 = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * gyr_bias + preint_meas_[state_id].d_delta_R_d_t * (dt+eps));
-        Mat3 state_R_shift_dt_1 = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * gyr_bias + preint_meas_[state_id+1].d_delta_R_d_t * (dt+eps));
-
-        Vec3 dw_shift = gyr_bias;
-        for(int j = 0; j < 3; ++j)
+        Mat3 R0;
+        Mat3 R1;
+        
+        if(use_cache && !cached_state_poses_.empty())
         {
-            dw_shift[j] += eps;
-            state_R_shift_dw_0[j] = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * dw_shift + preint_meas_[state_id].d_delta_R_d_t * dt);
-            state_R_shift_dw_1[j] = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * dw_shift + preint_meas_[state_id+1].d_delta_R_d_t * dt);
-            dw_shift[j] -= eps;
+            R0 = cached_state_poses_[state_id].second;
+            R1 = cached_state_poses_[state_id+1].second;
+
+            state_jacobian_0 = cached_state_jacobians_[state_id];
+            state_jacobian_1 = cached_state_jacobians_[state_id+1];
+
+            state_R_shift_dw_0 = cached_state_R_shift_bw_[state_id];
+            state_R_shift_dw_1 = cached_state_R_shift_bw_[state_id+1];
+        }
+        else
+        {
+
+            R0 = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * gyr_bias);
+            R1 = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * gyr_bias);
+
+            Vec3 dw_shift = gyr_bias;
+            for(int j = 0; j < 3; ++j)
+            {
+                dw_shift[j] += eps;
+                state_R_shift_dw_0[j] = preint_meas_[state_id].delta_R * ugpm::expMap(preint_meas_[state_id].d_delta_R_d_bw * dw_shift);
+                state_R_shift_dw_1[j] = preint_meas_[state_id+1].delta_R * ugpm::expMap(preint_meas_[state_id+1].d_delta_R_d_bw * dw_shift);
+                dw_shift[j] -= eps;
+            }
         }
 
         query_pose.first = p0 + alpha * (p1 - p0);
@@ -290,23 +327,25 @@ std::tuple<std::pair<Vec3, Vec3>,
         query_pose.second = ugpm::logMap(R0 * ugpm::expMap(delta_r * alpha));
 
         // Compute the jacobian
-        for(int j = 0; j < 5; ++j)
+        for(int j = 0; j < 4; ++j)
         {
             query_jacobian[j].first = state_jacobian_0[j] + alpha * (state_jacobian_1[j] - state_jacobian_0[j]);
 
             if(j == 1)
             {
-                query_jacobian[j].second.resize(3,3);
                 for(int k = 0; k < 3; ++k)
                 {
-                    Vec3 r_shift = ugpm::logMap(state_R_shift_dw_0[k] * ugpm::expMap( ugpm::logMap(state_R_shift_dw_0[k].transpose() * state_R_shift_dw_1[k]) * alpha));
+                    Vec3 r_shift;
+                    if(use_cache && !cached_state_poses_.empty())
+                    {
+                        r_shift = ugpm::logMap(state_R_shift_dw_0[k] * ugpm::expMap( cached_delta_r_shift_bw_[state_id][k] * alpha));
+                    }
+                    else
+                    {
+                        r_shift = ugpm::logMap(state_R_shift_dw_0[k] * ugpm::expMap( ugpm::logMap(state_R_shift_dw_0[k].transpose() * state_R_shift_dw_1[k]) * alpha));
+                    }
                     query_jacobian[j].second.col(k) = (r_shift - query_pose.second) / eps;
                 }
-            }
-            else if(j == 4)
-            {
-                Vec3 r_shift = ugpm::logMap(state_R_shift_dt_0 * ugpm::expMap( ugpm::logMap(state_R_shift_dt_0.transpose() * state_R_shift_dt_1) * alpha));
-                query_jacobian[j].second = (r_shift - query_pose.second) / eps;
             }
         }
     }
@@ -322,7 +361,6 @@ std::pair<Vec3, Vec3> State::queryTwist(
         , const Vec3& gyr_bias
         , const Vec3& gravity
         , const Vec3& vel
-        , const double dt
         ) const
 {
     std::pair<Vec3, Vec3> query_vel;
@@ -340,7 +378,7 @@ std::pair<Vec3, Vec3> State::queryTwist(
         {
             const ugpm::PreintMeas& preint = preint_meas_.at(i);
 
-            Mat3 R = preint.delta_R * ugpm::expMap(preint.d_delta_R_d_bw * gyr_bias + preint.d_delta_R_d_t * dt);
+            Mat3 R = preint.delta_R * ugpm::expMap(preint.d_delta_R_d_bw * gyr_bias);
             Vec3 v;
             if(mode_ == LidarOdometryMode::GYR)
             {
@@ -348,7 +386,7 @@ std::pair<Vec3, Vec3> State::queryTwist(
             }
             else
             {
-                v = vel + preint.delta_v + preint.d_delta_v_d_bf * acc_bias + preint.d_delta_v_d_bw * gyr_bias + preint.d_delta_v_d_t * dt + gravity*preint.dt;
+                v = vel + preint.delta_v + preint.d_delta_v_d_bf * acc_bias + preint.d_delta_v_d_bw * gyr_bias + gravity*preint.dt;
             }
             state_pose.at(i) = {Vec3::Zero(), R, v};
         }
@@ -384,125 +422,46 @@ std::pair<Vec3, Vec3> State::queryTwist(
 }
 
 
-
-void testStateMonoJacobians(LidarOdometryMode mode)
+void State::computeCache(const Vec3& acc_bias, const Vec3& gyr_bias, const Vec3& gravity, const Vec3& vel)
 {
-    std::cout << "============== testStateJacobians (analytical then numerical)" << std::endl;
-
-    // Create fake IMU data with sinuses
-    ugpm::ImuData imu_data;
-    imu_data.acc.resize(100);
-    imu_data.gyr.resize(100);
-    for(int i = 0; i < 100; ++i)
+    cached_state_poses_.clear();
+    cached_state_jacobians_.clear();
+    cached_state_R_shift_bw_.clear();
+    cached_delta_r_shift_bw_.clear();
+    for(int i = 0; i < nb_state_; ++i)
     {
-        double t = i * 0.01;
-        imu_data.acc[i].data[0] = std::sin(t);
-        imu_data.acc[i].data[1] = std::cos(t);
-        imu_data.acc[i].data[2] = std::sin(t);
-        imu_data.gyr[i].data[0] = std::cos(t);
-        imu_data.gyr[i].data[1] = std::sin(t);
-        imu_data.gyr[i].data[2] = std::cos(t);
-        imu_data.acc[i].t = t;
-        imu_data.gyr[i].t = t;
-    }
+        Vec3 p = preint_meas_[i].delta_p + preint_meas_[i].d_delta_p_d_bf * acc_bias + preint_meas_[i].d_delta_p_d_bw * gyr_bias + vel*preint_meas_[i].dt + gravity*preint_meas_[i].dt_sq_half;
+        Mat3 R = preint_meas_[i].delta_R * ugpm::expMap(preint_meas_[i].d_delta_R_d_bw * gyr_bias);
+        cached_state_poses_.push_back({p, R});
 
-    // Create a state
-    State state(imu_data, 0, 9, mode);
 
-    Vec3 bf = Vec3::Random();
-    Vec3 bw = Vec3::Random();
-    Vec3 gravity = Vec3::Random();
-    Vec3 vel = Vec3::Random();
-    double dt = vel[0];
-    vel = Vec3::Random();
+        std::array<Mat3, 4> state_jacobian;
+        state_jacobian[0] = preint_meas_[i].d_delta_p_d_bf;
+        state_jacobian[1] = preint_meas_[i].d_delta_p_d_bw;
+        state_jacobian[2] = Mat3::Identity()*preint_meas_[i].dt_sq_half;
+        state_jacobian[3] = Mat3::Identity()*preint_meas_[i].dt;
+        cached_state_jacobians_.push_back(state_jacobian);
 
-    // Query the state
-    double query_time = 0.085;
-    auto [query_pose, query_jacobian] = state.queryWthJacobian(query_time, bf, bw, gravity, vel, dt);
-
-    // Compute the jacobian numerically
-    double eps = 1e-6;
-    std::vector<std::pair<MatX, MatX> > query_jacobian_num(5);
-
-    for(int i = 0; i < 5; ++i)
-    {
-        for(int j = 0; j < std::max(query_jacobian[i].first.cols(), query_jacobian[i].second.cols()); ++j)
+        Vec3 dw_shift = gyr_bias;
+        std::array<Mat3, 3> R_shift_dw;
+        for(int j = 0; j < 3; ++j)
         {
-            Vec3 bf_eps = bf;
-            Vec3 bw_eps = bw;
-            Vec3 gravity_eps = gravity;
-            Vec3 vel_eps = vel;
-            double dt_eps = dt;
-            switch(i)
-            {
-                case 0:
-                    bf_eps[j] += eps;
-                    break;
-                case 1:
-                    bw_eps[j] += eps;
-                    break;
-                case 2:
-                    gravity_eps[j] += eps;
-                    break;
-                case 3:
-                    vel_eps[j] += eps;
-                    break;
-                case 4:
-                    dt_eps += eps;
-                    break;
-            }
+            dw_shift[j] += eps_;
+            R_shift_dw[j] = preint_meas_[i].delta_R * ugpm::expMap(preint_meas_[i].d_delta_R_d_bw * dw_shift);
+            dw_shift[j] -= eps_;
+        }
+        cached_state_R_shift_bw_.push_back(R_shift_dw);
 
-            std::pair<Vec3, Vec3> query_pose_eps = state.query(query_time, bf_eps, bw_eps, gravity_eps, vel_eps, dt_eps);
 
-            if(query_jacobian[i].first.size() > 0)
+        if(i > 0)
+        {
+            std::array<Vec3, 3> delta_r_shift_bw;
+            for(int j = 0; j < 3; ++j)
             {
-                if(j == 0)
-                {
-                    query_jacobian_num[i].first.resize(3, query_jacobian[i].first.cols());
-                }
-                query_jacobian_num[i].first.col(j) = (query_pose_eps.first - query_pose.first) / eps;
+                delta_r_shift_bw[j] = ugpm::logMap(cached_state_R_shift_bw_.at(i-1)[j].transpose() * cached_state_R_shift_bw_.at(i)[j]);
             }
-            if(query_jacobian[i].second.size() > 0)
-            {
-                if(j == 0)
-                {
-                    query_jacobian_num[i].second.resize(3, query_jacobian[i].second.cols());
-                }
-                query_jacobian_num[i].second.col(j) = (query_pose_eps.second - query_pose.second) / eps;
-            }
+            cached_delta_r_shift_bw_.push_back(delta_r_shift_bw);
         }
     }
-
-    // Compare the jacobians
-    std::cout << std::endl << std::endl;
-    for(int j = 0; j < 5; ++j)
-    {
-        if(query_jacobian[j].first.size() > 0)
-        {
-            std::cout << "Jacobian query state " << j << " pos" << std::endl;
-            std::cout << query_jacobian[j].first << std::endl;
-            std::cout << "vs" << std::endl;
-            std::cout << query_jacobian_num[j].first << std::endl;
-        }
-        else
-        {
-            std::cout << "Jacobian query state " << j << " pos" << std::endl;
-            std::cout << "Empty" << std::endl;
-        }
-        if(query_jacobian[j].second.size() > 0)
-        {
-            std::cout << "Jacobian query state " << j << " rot" << std::endl;
-            std::cout << query_jacobian[j].second << std::endl;
-            std::cout << "vs" << std::endl;
-            std::cout << query_jacobian_num[j].second << std::endl;
-        }
-        else
-        {
-            std::cout << "Jacobian query state " << j << " rot" << std::endl;
-            std::cout << "Empty" << std::endl;
-        }
-    }
-
-
-
 }
+

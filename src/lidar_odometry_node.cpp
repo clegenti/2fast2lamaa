@@ -41,6 +41,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             params.lidar_std = readFieldDouble(this, "lidar_std", 0.02);
             params.g = readFieldDouble(this, "g", 9.80);
             params.intensity_threshold = readFieldDouble(this, "minimum_intensity", -1.0);
+            params.num_threads = readFieldInt(this, "num_threads", 4);
             std::string mode = readFieldString(this, "mode", "imu");
             if(kLidarOdometryModeMap.find(mode) != kLidarOdometryModeMap.end())
             {

@@ -80,15 +80,36 @@ class GaussianPrior : public ceres::CostFunction
 };
 
 
+class StateCacheCallback: public ceres::EvaluationCallback
+{
+    private:
+        State& state_;
+        Vec3& acc_bias_;
+        Vec3& gyr_bias_;
+        Vec3& gravity_;
+        Vec3& vel_;
+    public:
+        StateCacheCallback(State& state, Vec3& acc_bias, Vec3& gyr_bias, Vec3& gravity, Vec3& vel): state_(state), acc_bias_(acc_bias), gyr_bias_(gyr_bias), gravity_(gravity), vel_(vel)
+        {}
 
-class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3,1>
+        virtual void PrepareForEvaluation(bool evaluate_jacobians, bool new_evaluation_point) override
+        {
+            if (new_evaluation_point)
+            {
+                state_.computeCache(acc_bias_, gyr_bias_, gravity_, vel_);
+            }
+        }
+};
+
+
+
+class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3>
 {
     private:
         const State& state_;
         const DataAssociation data_association_;
         Vec3 source_pt_;
         std::vector<Vec3> target_pts_;
-        const std::vector<int> block_sizes_;
         std::vector<double> feature_times_;
         const double weight_ = 1.0;
 
@@ -104,7 +125,6 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3,1>
                 , const Vec7& extrinsic)
                 : state_(state)
                 , data_association_(data_association)
-                , block_sizes_({3,3,3,3,1})
                 , weight_(weight)
         {
             feature_times_.resize(1+data_association_.target_ids.size());
@@ -136,23 +156,22 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3,1>
             Eigen::Map<const Vec3> arg_1(parameters[1]);
             Eigen::Map<const Vec3> arg_2(parameters[2]);
             Eigen::Map<const Vec3> arg_3(parameters[3]);
-            double time_offset = parameters[4][0];
 
             std::vector<std::pair<Vec3, Vec3> > poses(1+data_association_.target_ids.size());
-            std::vector<std::vector<std::pair<MatX, MatX> > > pose_jacobians;
+            std::vector<std::array<std::pair<Mat3, Mat3>, 4> > pose_jacobians;
             if(jacobians != NULL)
             {
                 pose_jacobians.resize(1+data_association_.target_ids.size());
                 for(size_t i = 0; i < feature_times_.size(); ++i)
                 {
-                    std::tie(poses[i], pose_jacobians[i]) = state_.queryWthJacobian(feature_times_[i], arg_0, arg_1, arg_2, arg_3, time_offset);
+                    std::tie(poses[i], pose_jacobians[i]) = state_.queryWthJacobian(feature_times_[i], arg_0, arg_1, arg_2, arg_3, true);
                 }
             }
             else
             {
                 for(size_t i = 0; i < feature_times_.size(); ++i)
                 {
-                    poses[i] = state_.query(feature_times_[i], arg_0, arg_1, arg_2, arg_3, time_offset);
+                    poses[i] = state_.query(feature_times_[i], arg_0, arg_1, arg_2, arg_3, true);
                 }
             }
 
@@ -193,28 +212,20 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3,1>
                 }
 
 
-                for(int j = 0; j < 5; ++j)
+                for(int j = 0; j < 4; ++j)
                 {
                     if(jacobians[j] != NULL)
                     {
-                        int block_size = block_sizes_[j];
-                        Eigen::Map<Eigen::Matrix<double, 1,Eigen::Dynamic> > j_s(&(jacobians[j][0]),1,block_size);
-                        j_s.setZero();
-                        if(pose_jacobians[0][j].first.size() > 0)
-                        {
-                            j_s += d_res_d_pts.segment<3>(0) * pose_jacobians[0][j].first;
-                        }
-                        if(pose_jacobians[0][j].second.size() > 0)
+                        Eigen::Map<Eigen::Matrix<double, 1,3> > j_s(&(jacobians[j][0]));
+                        j_s = d_res_d_pts.segment<3>(0) * pose_jacobians[0][j].first;
+                        if(j==1)
                         {
                             j_s += d_res_d_pts.segment<3>(0) * d_feature_d_rot * pose_jacobians[0][j].second;
                         }
                         for(size_t k = 0; k < data_association_.target_ids.size(); ++k)
                         {
-                            if(pose_jacobians[k+1][j].first.size() > 0)
-                            {
-                                j_s += d_res_d_pts.segment<3>(3*(k+1)) * pose_jacobians[k+1][j].first;
-                            }
-                            if(pose_jacobians[k+1][j].second.size() > 0)
+                            j_s += d_res_d_pts.segment<3>(3*(k+1)) * pose_jacobians[k+1][j].first;
+                            if(j==1)
                             {
                                 j_s += d_res_d_pts.segment<3>(3*(k+1)) * d_target_d_rot[k] * pose_jacobians[k+1][j].second;
                             }

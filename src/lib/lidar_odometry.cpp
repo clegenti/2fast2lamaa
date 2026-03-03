@@ -573,7 +573,7 @@ void LidarOdometry::initState(const ugpm::ImuData& imu_data)
 std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
         const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts
         , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_pts
-        , const State& state
+        , State& state
         , const std::set<int>& types
         , const int nb_iter
         , bool vel_only)
@@ -582,7 +582,7 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
     ceres::Solver::Options options;
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = nb_iter;
-    options.num_threads = 8;
+    options.num_threads = params_.num_threads;
     options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
     options.function_tolerance = 1e-4;
 
@@ -592,13 +592,11 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
         pts,
         state,
         state_blocks_,
-        time_offset_,
         state_calib_);
     std::vector<std::shared_ptr<std::vector<Pointd> > > projected_sparse_features = projectPoints(
         sparse_pts,
         state,
         state_blocks_,
-        time_offset_,
         state_calib_);
 
 
@@ -608,6 +606,9 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
 
     ceres::Problem::Options pb_options;
     pb_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+    StateCacheCallback state_cache_callback(state, state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
+    state_cache_callback.PrepareForEvaluation(true, true);
+    pb_options.evaluation_callback = &state_cache_callback;
 
     ceres::Problem problem(pb_options);
     addBlocks(problem, vel_only);
@@ -631,7 +632,6 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
         const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts,
         const State& state,
         const std::vector<Vec3>& state_blocks,
-        const double time_offset,
         const Vec7& state_calib) const
 {
     // Prepare the output vector
@@ -655,7 +655,7 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
         {
             temp_times.push_back(nanosToImuTime(pts[i]->at(j).t));
         }
-        std::vector<std::pair<Vec3, Vec3>> poses = state.queryApprox(temp_times, state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3], time_offset);
+        std::vector<std::pair<Vec3, Vec3>> poses = state.queryApprox(temp_times, state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3]);
 
         // Apply the transformations to each point
         for(size_t j = 0; j < pts[i]->size(); ++j)
@@ -950,10 +950,6 @@ void LidarOdometry::addBlocks(ceres::Problem& problem, bool vel_only)
         problem.AddParameterBlock(state_blocks_[3].data(), 3);
     }
 
-    problem.AddParameterBlock(&time_offset_, 1);
-
-    problem.SetParameterBlockConstant(&time_offset_);
-
     if(vel_only)
     {
         problem.SetParameterBlockConstant(state_blocks_[0].data());
@@ -982,7 +978,7 @@ void LidarOdometry::addLidarResiduals(ceres::Problem& problem
     {
         LidarNoCalCostFunction* cost_function = new LidarNoCalCostFunction(state, data_associations[i], pts, sparse_pts, lidar_weight_, imu_time_offset_, state_calib_);
 
-        problem.AddResidualBlock(cost_function, loss_function_, state_blocks_[0].data(), state_blocks_[1].data(), state_blocks_[2].data(), state_blocks_[3].data(), &time_offset_);
+        problem.AddResidualBlock(cost_function, loss_function_, state_blocks_[0].data(), state_blocks_[1].data(), state_blocks_[2].data(), state_blocks_[3].data());
     }
 
 }
@@ -1035,7 +1031,7 @@ void LidarOdometry::logState()
     }
     if(first_optimisation_)
     {
-        log_file << "time,x,y,z,rx,ry,rz,acc_bias_x,acc_bias_y,acc_bias_z,gyr_bias_x,gyr_bias_y,gyr_bias_z,gravity_x,gravity_y,gravity_z,vel_x,vel_y,vel_z,time_offset,calib_qw,calib_qx,calib_qy,calib_qz,calib_tx,calib_ty,calib_tz\n";
+        log_file << "time,x,y,z,rx,ry,rz,acc_bias_x,acc_bias_y,acc_bias_z,gyr_bias_x,gyr_bias_y,gyr_bias_z,gravity_x,gravity_y,gravity_z,vel_x,vel_y,vel_z,calib_qw,calib_qx,calib_qy,calib_qz,calib_tx,calib_ty,calib_tz\n";
     }
 
     log_file << std::fixed << current_time_ << ","
@@ -1045,7 +1041,6 @@ void LidarOdometry::logState()
                 << state_blocks_[1][0] << "," << state_blocks_[1][1] << "," << state_blocks_[1][2] << ","
                 << state_blocks_[2][0] << "," << state_blocks_[2][1] << "," << state_blocks_[2][2] << ","
                 << state_blocks_[3][0] << "," << state_blocks_[3][1] << "," << state_blocks_[3][2] << ","
-                << time_offset_ << ","
                 << state_calib_[0] << "," << state_calib_[1] << "," << state_calib_[2] << "," << state_calib_[3] << ","
                 << state_calib_[4] << "," << state_calib_[5] << "," << state_calib_[6] << "\n";
     log_file.flush();
@@ -1061,7 +1056,7 @@ void LidarOdometry::prepareNextState(const State& state)
     int64_t next_query_time = (params_.low_latency) ? pc_chunks_t_.at(1) : pc_chunks_t_.at(2);
     pc_mutex_.unlock();
 
-    auto [next_pos, next_rot] = state.query(nanosToImuTime(next_query_time), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
+    auto [next_pos, next_rot] = state.query(nanosToImuTime(next_query_time), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
     Mat3 R = ugpm::expMap(next_rot);
 
     if(params_.mode != LidarOdometryMode::NO_IMU)
@@ -1115,8 +1110,8 @@ void LidarOdometry::prepareNextState(const State& state)
 
 void LidarOdometry::updateCurrentPose(const int64_t t0, const int64_t t1)
 {
-    auto [pos_t0, rot_t0] = prev_state_.query(nanosToImuTime(t0), prev_state_blocks_[0], prev_state_blocks_[1], prev_state_blocks_[2], prev_state_blocks_[3], prev_time_offset_);
-    auto [pos_t1, rot_t1] = prev_state_.query(nanosToImuTime(t1), prev_state_blocks_[0], prev_state_blocks_[1], prev_state_blocks_[2], prev_state_blocks_[3], prev_time_offset_);
+    auto [pos_t0, rot_t0] = prev_state_.query(nanosToImuTime(t0), prev_state_blocks_[0], prev_state_blocks_[1], prev_state_blocks_[2], prev_state_blocks_[3]);
+    auto [pos_t1, rot_t1] = prev_state_.query(nanosToImuTime(t1), prev_state_blocks_[0], prev_state_blocks_[1], prev_state_blocks_[2], prev_state_blocks_[3]);
     auto [inv_pos_t0, inv_rot_t0] = invertTransform(pos_t0, rot_t0);
     auto [increment_pos, increment_rot] = combineTransforms(inv_pos_t0, inv_rot_t0, pos_t1, rot_t1);
     current_pose_mutex_.lock();
@@ -1136,7 +1131,7 @@ void LidarOdometry::publishResults(const State& state)
     int64_t t1 = pc_chunks_t_.at(1);
     pc_mutex_.unlock();
 
-    auto [pos_t1, rot_t1] = state.query(nanosToImuTime(t1), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
+    auto [pos_t1, rot_t1] = state.query(nanosToImuTime(t1), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
     auto [inv_pos_t1, inv_rot_t1] = invertTransform(pos_t1, rot_t1);
 
 
@@ -1153,15 +1148,15 @@ void LidarOdometry::publishResults(const State& state)
     }
 
     // Publish the velocity at the current time
-    auto [current_twist_linear, current_twist_angular] = state.queryTwist(nanosToImuTime(t1), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
+    auto [current_twist_linear, current_twist_angular] = state.queryTwist(nanosToImuTime(t1), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
     if(node_ != nullptr) node_->publishTwist(t1, current_twist_linear, current_twist_angular);
     
     // Publish the odometry at the end of the scan
     int64_t end_t = anchor_t + (int64_t)(scan_time_sum_ / scan_count_);
-    auto [pos_end, rot_end] = state.query(nanosToImuTime(end_t), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
+    auto [pos_end, rot_end] = state.query(nanosToImuTime(end_t), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
     auto [increment_pos, increment_rot] = combineTransforms(inv_pos_t1, inv_rot_t1, pos_end, rot_end);
     auto [current_end_pos, current_end_rot] = combineTransforms(current_pos_, current_rot_, increment_pos, increment_rot);
-    auto [twist_linear, twist_angular] = state.queryTwist(nanosToImuTime(end_t), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], time_offset_);
+    auto [twist_linear, twist_angular] = state.queryTwist(nanosToImuTime(end_t), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
     if(node_ != nullptr) node_->publishGlobalOdom(end_t, current_end_pos, current_end_rot, twist_linear, twist_angular);
 
 
@@ -1169,10 +1164,10 @@ void LidarOdometry::publishResults(const State& state)
     // Launch the correction of the point clouds in a separate thread
     if(params_.dense_pc_output)
     {
-        std::thread dense_correction_thread(&LidarOdometry::correctAndPublishPc, this, pc_chunks_,pc_chunks_t_, state, state_blocks_, state_calib_, time_offset_, true);
+        std::thread dense_correction_thread(&LidarOdometry::correctAndPublishPc, this, pc_chunks_,pc_chunks_t_, state, state_blocks_, state_calib_, true);
         dense_correction_thread.detach();
     }
-    std::thread correction_thread(&LidarOdometry::correctAndPublishPc, this, pc_chunk_features_, pc_chunks_t_, state, state_blocks_, state_calib_, time_offset_, false);
+    std::thread correction_thread(&LidarOdometry::correctAndPublishPc, this, pc_chunk_features_, pc_chunks_t_, state, state_blocks_, state_calib_, false);
     correction_thread.detach();
 
 
@@ -1181,7 +1176,6 @@ void LidarOdometry::publishResults(const State& state)
     prev_state_ = state;
     prev_state_blocks_ = state_blocks_;
     prev_state_calib_ = state_calib_;
-    prev_time_offset_ = time_offset_;
 
 
     sw.stop();
@@ -1196,7 +1190,6 @@ void LidarOdometry::correctAndPublishPc(
         const State state,
         const std::vector<Vec3> state_blocks,
         const Vec7 state_calib,
-        const double time_offset,
         const bool dense)
 {
     StopWatch sw;
@@ -1216,7 +1209,7 @@ void LidarOdometry::correctAndPublishPc(
     }
     
 
-    auto [pos_t1, rot_t1] = state.query(nanosToImuTime(pc_chunks_t.at(1)), state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3], time_offset);
+    auto [pos_t1, rot_t1] = state.query(nanosToImuTime(pc_chunks_t.at(1)), state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3]);
 
     auto [inv_pos_t1, inv_rot_t1] = invertTransform(pos_t1, rot_t1);
 
@@ -1243,7 +1236,7 @@ void LidarOdometry::correctAndPublishPc(
         {
             chunk_t.push_back(nanosToImuTime(pts.at(i)->at(j).t));
         }
-        std::vector<std::pair<Vec3, Vec3>> poses = state.queryApprox(chunk_t, state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3], time_offset);
+        std::vector<std::pair<Vec3, Vec3>> poses = state.queryApprox(chunk_t, state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3]);
 
         for(size_t j = 0; j < pts.at(i)->size(); ++j)
         {

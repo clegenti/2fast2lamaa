@@ -46,6 +46,8 @@ struct LidarOdometryParams
     double acc_std = 0.02;
     double lidar_std = 0.02;
 
+    int num_threads = 4;
+
     double intensity_threshold = -1.0; // If > 0, only use points with intensity above this threshold for feature extraction
 
     double association_filter_lin_quantum = 0.45;
@@ -154,7 +156,6 @@ class LidarOdometry
         // State variables (blocks in ceres)
         // acc_bias, gyr_bias, gravity, vel
         std::vector<Vec3> state_blocks_;
-        double time_offset_ = 0.0;
         Vec7 state_calib_;
 
         // Optimisation related flags and objects
@@ -164,7 +165,6 @@ class LidarOdometry
 
         State prev_state_;
         std::vector<Vec3> prev_state_blocks_;
-        double prev_time_offset_ = 0.0;
         Vec7 prev_state_calib_;
 
 
@@ -198,7 +198,7 @@ class LidarOdometry
         std::vector<DataAssociation> createProblemAssociateAndOptimise(
                 const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts
                 , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_pts
-                , const State& state
+                , State& state
                 , const std::set<int>& types
                 , const int nb_iter=50
                 , bool vel_only = false
@@ -210,7 +210,6 @@ class LidarOdometry
             const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts,
             const State& state,
             const std::vector<Vec3>& state_blocks,
-            const double time_offset,
             const Vec7& state_calib) const;
 
 
@@ -255,7 +254,6 @@ class LidarOdometry
             const State state,
             const std::vector<Vec3> state_blocks,
             const Vec7 state_calib,
-            const double time_offset,
             const bool dense = false);
 
 
@@ -267,7 +265,7 @@ class LidarOdometry
             const Vec3& pos,
             const Vec3& rot);
 
-        void prepareSubmap(const State state, const std::vector<std::shared_ptr<std::vector<Pointd> > > pcs, const std::vector<double> pcs_t, std::vector<Vec3> state_blocks, Vec7 state_calib, double time_offset);
+        void prepareSubmap(const State state, const std::vector<std::shared_ptr<std::vector<Pointd> > > pcs, const std::vector<double> pcs_t, std::vector<Vec3> state_blocks, Vec7 state_calib);
 
 
         // For DEBUG

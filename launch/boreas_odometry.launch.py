@@ -36,7 +36,7 @@ def generate_launch_description():
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
                 {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.5},
+                {'feature_voxel_size': 0.3},
                 {'max_feature_dist': 1.5},
                 {'loss_function_scale': 0.5},
                 {"state_freq": 200.0},
@@ -101,7 +101,7 @@ def generate_launch_description():
                 # Path to where the map will be saved
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
-                {"submap_length": 200.0},
+                {"submap_length": 300.0},
                 {"submap_overlap": 0.2},
 
                 {"write_scans": True}
