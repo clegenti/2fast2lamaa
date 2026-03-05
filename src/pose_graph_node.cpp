@@ -119,6 +119,7 @@ class PoseGraphNode: public rclcpp::Node
             RCLCPP_INFO(this->get_logger(), "Pose Graph Node has been started.");
             
             free_space_carving_radius_ = readFieldDouble(this, "free_space_carving_radius", 40.0);
+            min_dist_for_carving_ = readFieldDouble(this, "min_dist_for_carving", 4.0);
             max_drift_ = readFieldDouble(this, "max_drift", 0.02);
             voxel_size_factor_ = readFieldDouble(this, "voxel_size_factor_for_registration", 2.0);
             max_nb_points_ = readFieldInt(this, "max_num_pts_for_registration", 8000);
@@ -127,12 +128,15 @@ class PoseGraphNode: public rclcpp::Node
             odom_error_pos_ = readFieldDouble(this, "odom_typical_pos_error", 0.01);
             odom_rotation_error_ = readFieldDouble(this, "odom_typical_rot_error_deg_per_m", 0.01) * M_PI / 180.0;
 
+            num_threads_ = readFieldInt(this, "num_threads", 4);
 
-            loop_loss_scale_pos_ = readFieldDouble(this, "loop_closure_loss_scale_pos", 0.5);
-            loop_loss_scale_rot_ = readFieldDouble(this, "loop_closure_loss_scale_rot", 0.5) * M_PI / 180.0;
-            loop_pos_std = readFieldDouble(this, "loop_closure_std_pos", 0.50);
+
+            loop_loss_scale_pos_ = readFieldDouble(this, "loop_closure_loss_scale_pos", 2.0);
+            loop_loss_scale_rot_ = readFieldDouble(this, "loop_closure_loss_scale_rot", 1.0);
+            loop_pos_std = readFieldDouble(this, "loop_closure_std_pos", 0.15);
             loop_rot_std = readFieldDouble(this, "loop_closure_std_rot", 0.50) * M_PI / 180.0;
 
+            se3_manifold_ = new ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>();
 
             
             sub_ = this->create_subscription<ffastllamaa::msg::SubmapInfo>(
@@ -147,10 +151,10 @@ class PoseGraphNode: public rclcpp::Node
             map_options_.last_scan_carving = false;
             map_options_.min_range = 0.0;
             map_options_.max_range = std::numeric_limits<double>::max();
-            map_options_.num_threads = 1;
+            map_options_.num_threads = num_threads_;
 
             solver_options_.max_num_iterations = 100;
-            solver_options_.num_threads = 1;
+            solver_options_.num_threads = num_threads_;
             solver_options_.minimizer_progress_to_stdout = true;
 
         }
@@ -170,6 +174,10 @@ class PoseGraphNode: public rclcpp::Node
         double loop_loss_scale_rot_ = 0.5 * M_PI / 180.0;
         double loop_pos_std = 0.50;
         double loop_rot_std = 0.50 * M_PI / 180.0;
+        double min_dist_for_carving_ = 4.0;
+        int num_threads_ = 4;
+
+        ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>* se3_manifold_;
 
         int64_t last_time_register_ = -1;
 
@@ -215,7 +223,7 @@ class PoseGraphNode: public rclcpp::Node
             if(scans_folder_ == "" && msg->scan_folder != "")
             {
                 scans_folder_ = msg->scan_folder;
-                image_res_ = msg->map_res*2.5;
+                image_res_ = msg->map_res*1.5;
                 map_res_ = msg->map_res;
             }
             if(map_options_.cell_size < 0.0)
@@ -262,6 +270,12 @@ class PoseGraphNode: public rclcpp::Node
             auto [keypoints, descriptors] = extractFeatures(laplace_image);
             submap_keypoints_.push_back(keypoints);
             submap_descriptors_.push_back(descriptors);
+
+// For debugging, save the submap image with keypoints drawn on it
+cv::Mat debug_image;
+cv::cvtColor(laplace_image, debug_image, cv::COLOR_GRAY2BGR);
+cv::drawKeypoints(debug_image, keypoints, debug_image, cv::Scalar(0, 255, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+cv::imwrite(output_folder_ + "/features_submap_" + std::to_string(maps_.size() - 1) + ".png", debug_image);
             
             std::set<int> submap_canditates = getSubmapIdsInRadius();
 
@@ -280,10 +294,31 @@ class PoseGraphNode: public rclcpp::Node
             addLoopClosuresToPoseGraph(pose_graph_edges);
 
             writeFullTrajectory();
+
+            // Cleanup the maps to save RAM
+            maps_.back()->clear();
         }
 
         void addLoopClosuresToPoseGraph(const std::vector<std::tuple<int64_t, int64_t, Mat4> >& pose_graph_edges)
         {
+
+// Debug check is the current state containes any NaN
+bool has_nan = false;
+for(const auto& [timestamp, pose] : time_and_pose_)
+{
+    if(pose->hasNaN())
+    {
+        has_nan = true;
+        std::cout << "NaN detected in pose at timestamp " << timestamp << std::endl;
+    }
+}
+if(has_nan)
+{
+    std::cout << "NaN detected in the current state." << std::endl;
+    throw std::runtime_error("NaN detected in the current state.");
+}
+
+
             if(pose_graph_edges.size() > 0)
             {
 
@@ -294,6 +329,13 @@ std::cout << "State initialized for loop closure optimization." << std::endl;
                 for(const auto& [timestamp_i, timestamp_j, rel_pose] : pose_graph_edges)
                 {
 std::cout << "Adding loop closure edge between timestamps " << timestamp_i << " and " << timestamp_j << std::endl;
+
+// Check for NaN in the relative pose
+if(rel_pose.hasNaN())
+{
+    std::cout << "NaN detected in relative pose for edge between timestamps " << timestamp_i << " and " << timestamp_j << ". Skipping this edge." << std::endl;
+    throw std::runtime_error("NaN detected in relative pose for loop closure edge.");
+}
                     Mat3 cov = Mat3::Zero();
                     cov = Mat3::Identity() * loop_pos_std * loop_pos_std;
                     ceres::CostFunction* cost_function = new ceres::AutoDiffCostFunction<RelativePositionCostFunctor, 3, 7, 7>(
@@ -319,6 +361,21 @@ std::cout << "Adding loop closure edge between timestamps " << timestamp_i << " 
 
         void initializeLoopClosureState(const std::vector<std::tuple<int64_t, int64_t, Mat4> >& pose_graph_edges)
         {
+// Check if the current state contains any NaN
+bool has_nan = false;
+for(const auto& [timestamp, pose] : time_and_pose_)
+{
+    if(pose->hasNaN())
+    {
+        has_nan = true;
+        std::cout << "NaN detected in pose at timestamp " << timestamp << " before loop closure state initialization." << std::endl;
+    }
+}
+if(has_nan)
+{
+    std::cout << "NaN detected in the current state before loop closure state initialization." << std::endl;
+    throw std::runtime_error("NaN detected in the current state before loop closure state initialization.");
+}
             // Get the most recent pose in the state that is in the new edges
             int64_t most_recent_timestamp_j_in_edges = -1;
             int64_t most_recent_timestamp_i_in_edges = -1;
@@ -332,7 +389,12 @@ std::cout << "Adding loop closure edge between timestamps " << timestamp_i << " 
                     most_recent_rel_pose = rel_pose;
                 }
             }
-std::cout << "Most recent edge in new loop closures is between timestamps " << most_recent_timestamp_i_in_edges << " and " << most_recent_timestamp_j_in_edges << std::endl;
+
+            if(most_recent_timestamp_j_in_edges <= last_time_register_)
+            {
+                std::cout << "Most recent timestamp in new edges is not newer than the last registered time. No need to initialize state for loop closure." << std::endl;
+                return;
+            }
 
             // Get the delta pose between the current state and the most recent edge pose
             Mat4 current_delta_pose = posQuatToTransform(*time_and_pose_[most_recent_timestamp_i_in_edges]).inverse() * posQuatToTransform(*time_and_pose_[most_recent_timestamp_j_in_edges]);
@@ -343,22 +405,34 @@ std::cout << "Most recent edge in new loop closures is between timestamps " << m
             int64_t timestamp_to_spread = std::max(most_recent_timestamp_i_in_edges, last_time_register_);
             int64_t delta_time = most_recent_timestamp_j_in_edges - timestamp_to_spread;
 
-std::cout << "Spreading loop closure correction to poses between timestamps " << timestamp_to_spread << " and " << most_recent_timestamp_j_in_edges << std::endl;
+            if(delta_time <= 0)
+            {
+                std::cout << "Delta time for loop closure state initialization is non-positive. No need to initialize state for loop closure." << std::endl;
+                return;
+            }
+if(delta_time <= 0)
+{
+    std::string message = "Delta time <= 0 for loop closure state initialization: BUG? most_recent_timestamp_j_in_edges: " + std::to_string(most_recent_timestamp_j_in_edges) + ", timestamp_to_spread: " + std::to_string(timestamp_to_spread) + ", delta_time: " + std::to_string(delta_time);
+    RCLCPP_WARN(this->get_logger(), message.c_str());
+    throw std::runtime_error(message);
+}
+if(delta_to_spread.hasNaN())
+{
+    RCLCPP_WARN(this->get_logger(), "Delta to spread contains NaN for loop closure state initialization: BUG?");
+    throw std::runtime_error("Delta to spread contains NaN for loop closure state initialization.");
+}
 
             // Loop the poses from the end
             for(int i = times_in_order_.size() - 1; (i >= 0) && (times_in_order_[i] >= timestamp_to_spread); i--)
             {
-std::cout << "Updating pose at timestamp " << times_in_order_[i] << std::endl;
                 if(times_in_order_[i] > most_recent_timestamp_j_in_edges)
                 {
-std::cout << "Pose is after the most recent timestamp in edges, applying full correction." << std::endl;
                     Mat4 last_j_to_i = posQuatToTransform(*time_and_pose_[most_recent_timestamp_j_in_edges]).inverse() * posQuatToTransform(*time_and_pose_[times_in_order_[i]]);
                     Mat4 new_pose = posQuatToTransform(*time_and_pose_[most_recent_timestamp_j_in_edges]) * delta_to_spread * last_j_to_i;
                     *time_and_pose_[times_in_order_[i]] = transformToPosQuat(new_pose);
                 }
                 else
                 {
-std::cout << "Pose is between the timestamp to spread and the most recent timestamp in edges, applying partial correction." << std::endl;
                     Mat4 delta_pose = Mat4::Identity();
                     double ratio = double(times_in_order_[i] - timestamp_to_spread) / double(delta_time);
                     delta_pose.block<3,3>(0,0) = expMap(delta_rot_vec * ratio);
@@ -367,6 +441,20 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                     *time_and_pose_[times_in_order_[i]] = transformToPosQuat(new_pose);
                 }
             }
+// Check if the initialized state has any NaN
+has_nan = false;
+for(const auto& [timestamp, pose] : time_and_pose_)
+{
+    if(pose->hasNaN())
+    {
+        has_nan = true;
+        std::cout << "NaN detected in pose at timestamp " << timestamp << " after loop closure state initialization." << std::endl;
+    }
+}
+if(has_nan)
+{
+    std::cout << "NaN detected in the current state after loop closure state initialization." << std::endl;
+}
         }
 
 
@@ -466,6 +554,25 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
 
         void addSubmapTrajectoryToState(const std::vector<std::pair<int64_t, Vec7> >& trajectory)
         {
+// Check if the trajectory contains any NaN
+bool has_nan = false;
+for(const auto& [timestamp, pose] : trajectory)
+{
+    if(pose.hasNaN())
+    {
+        has_nan = true;
+        std::cout << "NaN detected in trajectory pose at timestamp " << timestamp << " during addSubmapTrajectoryToState." << std::endl;
+    }
+    else if(std::abs(pose.segment<4>(3).norm() - 1.0) > 1e-3)
+    {
+        has_nan = true;
+        std::cout << "Invalid quaternion detected in trajectory pose at timestamp " << timestamp << " during addSubmapTrajectoryToState. Quaternion norm: " << pose.segment<4>(3).norm() << std::endl;
+    }
+}
+if(has_nan)
+{
+    throw std::runtime_error("NaN or invalid quaternion detected in trajectory.");
+}
             map_scans_poses_.emplace_back();
             // Add 4 poses spread across the trajectory
             Mat4 first_pose_mat_inv = posQuatToTransform(trajectory.front().second).inverse();
@@ -489,7 +596,7 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                     times_in_order_.push_back(timestamp);
                     distance_travelled_.push_back(0.0);
                     pose_to_submap_id_.push_back(maps_.size() - 1);
-                    pose_graph_problem_.AddParameterBlock(pose_ptr->data(), 7);
+                    pose_graph_problem_.AddParameterBlock(pose_ptr->data(), 7, se3_manifold_);
                     pose_graph_problem_.SetParameterBlockConstant(pose_ptr->data());
                     continue;
                 }
@@ -514,6 +621,8 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                     distance_travelled_.push_back(distance_travelled_.back() + distance);
                     pose_to_submap_id_.push_back(maps_.size() - 1);
 
+                    pose_graph_problem_.AddParameterBlock(pose->data(), 7, se3_manifold_);
+
                     Mat6 cov = Mat6::Zero();
                     cov.block<3,3>(0,0) = Mat3::Identity() * (distance+0.5) * odom_error_pos_;
                     cov.block<3,3>(3,3) = Mat3::Identity() * (distance+0.5) * odom_rotation_error_;
@@ -529,6 +638,22 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                 }
             }
             RCLCPP_INFO(this->get_logger(), "Added %zu poses to the state from trajectory.", trajectory.size());
+// Check if the state contains any NaN after adding the trajectory
+has_nan = false;
+for(const auto& [timestamp, pose] : time_and_pose_)
+{
+    if(pose->hasNaN())
+    {
+        has_nan = true;
+        std::cout << "NaN detected in pose at timestamp " << timestamp << " after adding trajectory to state." << std::endl;
+        std::cout << "Trajectory from " << trajectory.front().first << " to " << trajectory.back().first << std::endl;
+    }
+}
+if(has_nan)
+{
+    std::cout << "NaN detected in the current state after adding trajectory to state." << std::endl;
+    throw std::runtime_error("NaN detected in the current state after adding trajectory to state.");
+}
         }
 
 
@@ -589,9 +714,13 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                 return;
             }
             int count = 0;
+            Vec7 last_pose = trajectory.front().second;
             for(const auto& [timestamp, pose] : trajectory)
             {
-                std::cout << "Processing scan " << count++ << " out of " << trajectory.size() << std::endl;
+                if((last_pose.segment<3>(0) - pose.segment<3>(0)).norm() < min_dist_for_carving_)
+                {
+                    continue;
+                }
                 std::string scan_file = getScanPath(timestamp);
                 if(!std::filesystem::exists(scan_file))
                 {
@@ -609,7 +738,6 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                 Mat4 pose_mat = posQuatToTransform(pose);
                 // Carve free space
                 map->freeSpaceCarving(scan, pose_mat);
-                RCLCPP_INFO(this->get_logger(), "Carved free space from scan: %s", scan_file.c_str());
             }
         }
 
@@ -688,32 +816,45 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                 for(int y = 1; y < cols-1; ++y)
                 {
                     int local_count = 0;
-                    double local_sum = 0;
+                    double local_sum = 4;
+                    double center_value = sum(x, y) / counter(x, y);
                     if(counter(x, y) == 0)
                     {
                         continue;
                     }
                     if(counter(x-1, y) > 0)
                     {
-                        local_count++;
-                        local_sum += sum(x-1, y) / counter(x-1, y);
+                        local_sum += std::abs(sum(x-1, y) / counter(x-1, y) - center_value);
+                    }
+                    else
+                    {
+                        local_sum += kCapHeight;
                     }
                     if(counter(x+1, y) > 0)
                     {
-                        local_count++;
-                        local_sum += sum(x+1, y) / counter(x+1, y);
+                        local_sum += std::abs(sum(x+1, y) / counter(x+1, y) - center_value);
+                    }
+                    else
+                    {
+                        local_sum += kCapHeight;
                     }
                     if(counter(x, y-1) > 0)
                     {
-                        local_count++;
-                        local_sum += sum(x, y-1) / counter(x, y-1);
+                        local_sum += std::abs(sum(x, y-1) / counter(x, y-1) - center_value);
+                    }
+                    else
+                    {
+                        local_sum += kCapHeight;
                     }
                     if(counter(x, y+1) > 0)
                     {
-                        local_count++;
-                        local_sum += sum(x, y+1) / counter(x, y+1);
+                        local_sum += std::abs(sum(x, y+1) / counter(x, y+1) - center_value);
                     }
-                    laplace_image.at<float>(x, y) = static_cast<float>((local_sum - local_count*sum(x, y) / counter(x, y))/(4.0*kCapHeight));
+                    else
+                    {
+                        local_sum += kCapHeight;
+                    }
+                    laplace_image.at<float>(x, y) = static_cast<float>(local_sum / (4.0*kCapHeight));
                     if(laplace_image.at<float>(x, y) < -1.0f)
                     {
                         laplace_image.at<float>(x, y) = -1.0f;
@@ -725,7 +866,7 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                 }
             }
             // Apply a simple gaussian blur to smooth the image
-            cv::GaussianBlur(laplace_image, laplace_image, cv::Size(3, 3), 0, 0, cv::BORDER_DEFAULT);
+            cv::GaussianBlur(laplace_image, laplace_image, cv::Size(9, 9), 0, 0, cv::BORDER_DEFAULT);
             // Normalize to [0, 255] for visualization
             cv::normalize(laplace_image, laplace_image, 0, 255, cv::NORM_MINMAX);
             // Convert to 8-bit image
@@ -737,7 +878,7 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
         std::pair<std::vector<cv::KeyPoint>, cv::Mat> extractFeatures(const cv::Mat& image)
         {
             // Use SIFT to extract features from the image
-            cv::Ptr<cv::SIFT> sift = cv::SIFT::create();
+            cv::Ptr<cv::SIFT> sift = cv::SIFT::create(0, 3, 0.04, 10);
             std::vector<cv::KeyPoint> keypoints;
             cv::Mat descriptors;
             sift->detectAndCompute(image, cv::noArray(), keypoints, descriptors);
@@ -789,13 +930,15 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                 std::vector<std::vector<cv::DMatch> > knn_matches;
                 matcher.knnMatch(descriptors1, descriptors2, knn_matches, 2);
 
+                std::cout << "Found " << knn_matches.size() << " initial matches between submap " << pose_to_submap_id_.back() << " and submap " << submap_id << "." << std::endl;
+
                 std::vector<cv::DMatch> good_matches;
                 for(size_t i = 0; i < knn_matches.size(); i++)
                 {
                     auto kp1 = keypoints1[knn_matches[i][0].queryIdx];
                     auto kp2 = keypoints2[knn_matches[i][0].trainIdx];
                     double scale_ratio = kp1.size / kp2.size;
-                    if( (std::abs(scale_ratio - 1.0) < 0.05) && (knn_matches[i][0].distance < 0.75 * knn_matches[i][1].distance) )
+                    if( (std::abs(scale_ratio - 1.0) < 0.25) && (knn_matches[i][0].distance < 0.5 * knn_matches[i][1].distance) )
                     {
                         good_matches.push_back(knn_matches[i][0]);
                     }
@@ -818,16 +961,49 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
 
                 // Estimate the Affine partial 2D
                 cv::Mat inliers;
-                cv::Mat affine = cv::estimateAffinePartial2D(src_pts, dst_pts, inliers, cv::RANSAC, 2.0);
+                cv::Mat affine = cv::estimateAffinePartial2D(src_pts, dst_pts, inliers, cv::RANSAC, 3.0);
 
                 if (affine.empty())
                 {
                     RCLCPP_WARN(this->get_logger(), "Could not estimate a valid affine transformation between submap %d and %d.", pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
+
+                // Remove the inlier matches that are too close from each other to avoid having many matches in a small area that can bias the registration
+                std::vector<cv::DMatch> inlier_matches;
+                for(size_t i = 0; i < good_matches.size(); i++)
+                {
+                    if(inliers.at<uchar>(i))
+                    {
+                        inlier_matches.push_back(good_matches[i]);
+                    }
+                }
+                std::vector<cv::DMatch> filtered_inlier_matches;
+                double min_distance = 2.0; // Minimum distance between inlier matches in pixels
+                for(size_t i = 0; i < inlier_matches.size(); i++)
+                {
+                    cv::Point2f pt1 = keypoints1[inlier_matches[i].queryIdx].pt;
+                    bool too_close = false;
+                    for(size_t j = 0; j < filtered_inlier_matches.size(); j++)
+                    {
+                        cv::Point2f pt2 = keypoints1[filtered_inlier_matches[j].queryIdx].pt;
+                        if(cv::norm(pt1 - pt2) < min_distance)
+                        {
+                            too_close = true;
+                            break;
+                        }
+                    }
+                    if(!too_close)
+                    {
+                        filtered_inlier_matches.push_back(inlier_matches[i]);
+                    }
+                }
+
+                int inlier_count = filtered_inlier_matches.size();
+
                 // If less than 3 inliers, skip this match
-                int inlier_count = cv::countNonZero(inliers);
-                if(inlier_count < 3)
+                //int inlier_count = cv::countNonZero(inliers);
+                if(inlier_count < 5)
                 {
                     RCLCPP_WARN(this->get_logger(), "Not enough inliers (%d) after RANSAC between submap %d and %d. Skipping this match.", inlier_count, pose_to_submap_id_.back(), submap_id);
                     continue;
@@ -847,6 +1023,35 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                     continue;
                 }
                 submap_id_and_coarse_poses.emplace_back(submap_id, pose_3d);
+
+// Display the matched keypoints and the inliers for debugging
+cv::Mat debug_image_A(submap_images_[pose_to_submap_id_.back()].rows(), submap_images_[pose_to_submap_id_.back()].cols(), CV_64F);
+cv::Mat debug_image_B(submap_images_[submap_id].rows(), submap_images_[submap_id].cols(), CV_64F);
+for(size_t x = 0; x < debug_image_A.rows; x++)
+{
+    for(size_t y = 0; y < debug_image_A.cols; y++)
+    {
+        debug_image_A.at<double>(x,y) = static_cast<double>(submap_images_[pose_to_submap_id_.back()](x,y));
+    }
+}
+for(size_t x = 0; x < debug_image_B.rows; x++)
+{
+    for(size_t y = 0; y < debug_image_B.cols; y++)
+    {
+        debug_image_B.at<double>(x,y) = static_cast<double>(submap_images_[submap_id](x,y));
+    }
+}
+// Normalize to 0-255 for visualization, convert to 8-bit images, and convert to 3-channel images for drawing colored matches
+cv::normalize(debug_image_A, debug_image_A, 0, 255, cv::NORM_MINMAX);
+cv::normalize(debug_image_B, debug_image_B, 0, 255, cv::NORM_MINMAX);
+debug_image_A.convertTo(debug_image_A, CV_8U);
+debug_image_B.convertTo(debug_image_B, CV_8U);
+cv::cvtColor(debug_image_A, debug_image_A, cv::COLOR_GRAY2BGR);
+cv::cvtColor(debug_image_B, debug_image_B, cv::COLOR_GRAY2BGR);
+cv::Mat combined_image;
+cv::drawMatches(debug_image_A, keypoints1, debug_image_B, keypoints2, good_matches, combined_image, cv::Scalar::all(-1), cv::Scalar::all(-1), inliers);
+std::string debug_image_path = output_folder_ + "/debug_match_submap_" + std::to_string(pose_to_submap_id_.back()) + "_and_" + std::to_string(submap_id) + "_" + std::to_string(inlier_count) + "_inliers.png";
+cv::imwrite(debug_image_path, combined_image);
 
             }
             return submap_id_and_coarse_poses;
@@ -1028,6 +1233,11 @@ std::cout << "Pose is between the timestamp to spread and the most recent timest
                     if(closest_timestamp == -1)
                     {
                         RCLCPP_WARN(this->get_logger(), "Could not find a closest timestamp in the current submap for scan at timestamp %ld. Skipping this match.", target_timestamp);
+                        continue;
+                    }
+                    if(closest_timestamp == target_timestamp)
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Closest timestamp in the current submap is the same as the target timestamp for scan at timestamp %ld. Skipping this match.", target_timestamp);
                         continue;
                     }
 

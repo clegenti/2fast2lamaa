@@ -4,6 +4,8 @@ from launch.events import Shutdown
 from launch_ros.substitutions import FindPackageShare
 from launch.substitutions import PathJoinSubstitution
 from ament_index_python.packages import get_package_prefix
+from launch.actions import SetEnvironmentVariable
+SetEnvironmentVariable(name='RCUTILS_COLORIZED_OUTPUT', value='1'),
 
 
 min_range = float(1.0)
@@ -38,12 +40,12 @@ def generate_launch_description():
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
                 {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.15},
+                {'feature_voxel_size': 0.3},
                 {'max_feature_dist': 1.5},
                 {'loss_function_scale': 0.5},
                 {"state_freq": 200.0},
-                {"max_associations_per_type": 750},
-                {"planar_only": True},
+                {"max_associations_per_type": 1000},
+                {"planar_only": False},
 
                 # Adapting IMU measurements for some weird IMUs
                 {"acc_in_m_per_s2": True},
@@ -61,7 +63,12 @@ def generate_launch_description():
                 {"unsorted_pc": False},
 
             ],
-            output='screen',
+            output='log',
+            arguments=[
+                '--ros-args',
+                '--log-level', 'fatal',      # only fatal logs
+                '--disable-stdout-logs',     # disable console logger output
+            ],
         ),
         Node(
             package='ffastllamaa', 
@@ -70,6 +77,9 @@ def generate_launch_description():
             remappings=[
                 ('/points_input', '/lidar_scan_undistorted'),
                 ('/pose_input', '/undistortion_pose'),
+                ('/gp_map/acc', '/ouster/imu'),
+                ('/gp_map/gyr', '/ouster/imu'),
+                ('/twist', '/start_of_scan_twist')
                 ],
             parameters=[
                 {"point_cloud_internal_type": True},
@@ -78,9 +88,9 @@ def generate_launch_description():
                 {"register": True},
                 {"register_with_approximate_field": False},
                 {"voxel_size_factor_for_registration": 2.0},
-                {"max_num_pts_for_registration": 1500},
+                {"max_num_pts_for_registration": 2000},
                 {"loss_function_scale": 0.5},
-                {"use_temporal_weights": True}, # If true, registration weight are 10 times bigger for voxels associated to the older scans than for the newer ones
+                {"use_temporal_weights": False}, # If true, registration weight are 10 times bigger for voxels associated to the older scans than for the newer ones
                 {"with_init_guess": True},
                 {"map_publish_period": 0.5},
                 {"key_framing": key_framing},
@@ -90,20 +100,36 @@ def generate_launch_description():
 
                 # Free space carving (<= 0.0 to disable it)
                 {"min_range": min_range},
-                {"free_space_carving_radius": float(-50)},
+                {"free_space_carving_radius": float(50)},
                 {"over_reject": over_reject},
-                {"last_scan_carving": False},
+                {"last_scan_carving": True},
 
                 # Path to where the map will be saved
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
                 {"submap_length": 20.0},
-                {"submap_overlap": 0.2}
+                {"submap_overlap": 0.2},
+
+                {"write_scans": True}
 
             ],
-            output='screen',
+            arguments=[
+                '--ros-args',
+                '--log-level', 'fatal',      # only fatal logs
+                '--disable-stdout-logs',     # disable console logger output
+            ],
+            output='log',
             on_exit=Shutdown()
         ),
+        Node(package = "ffastllamaa",
+             executable = "pose_graph",
+             name = "pose_graph",
+             output = "screen",
+             emulate_tty=True,
+             on_exit=Shutdown()
+        ),
+
+
         Node(package = "tf2_ros", 
                        executable = "static_transform_publisher",
                        arguments = ["0", "0", "0", "0", "0", "0",  "map", "map_viz"]),

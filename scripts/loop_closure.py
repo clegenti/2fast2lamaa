@@ -782,6 +782,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         path = sys.argv[1]
     else:
-        path = "vbr_output/colosseo_train0/raw_output"
+        path = "vbr_output/diag_train0/raw_output"
 
     performLoopClosure(path, visualize=True)
