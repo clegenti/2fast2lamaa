@@ -8,6 +8,7 @@ from ament_index_python.packages import get_package_prefix
 
 min_range = float(0.05)
 max_range = float(200.0)
+voxel_size = float(0.05)
 
 key_framing = False
 key_frame_dist_thr = float(10.0)
@@ -46,15 +47,12 @@ def generate_launch_description():
                 ('/lidar_raw_points', '/lidar_points')
             ],
             parameters=[
-                {'low_latency': True}, # Set to True for estimation at each scan, False for every second scan
                 {'dense_pc_output': False}, # Set to True to output dense point cloud
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
-                {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.05},
+                {'feature_voxel_size': float(voxel_size)},
                 {'max_feature_dist': 0.2},
                 {'loss_function_scale': 0.15},
-                {"state_freq": 200.0},
                 {"max_associations_per_type": 1000},
                 {"planar_only": False},
                 {"mode": "no_imu"},  # State representation mode: imu (acc and gyr preint), gyr (gyr preint and const vel), no_imu (const linear and angular vel)
@@ -88,7 +86,7 @@ def generate_launch_description():
                 ],
             parameters=[
                 {"point_cloud_internal_type": True},
-                {"voxel_size": 0.05},
+                {"voxel_size": float(voxel_size)},
                 {"neighbourhood_size": 2},
                 {"register": True},
                 {"register_with_approximate_field": False},

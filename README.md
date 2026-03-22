@@ -197,9 +197,9 @@ calib_rx, calib_ry, calib_rz = rvec
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `min_range` | double | `1.0` | Minimum point range to consider (meters) |
 | `max_range` | double | `150.0` | Maximum point range to consider (meters) |
-| `min_feature_dist` | double | `0.05` | Minimum distance for feature detection (meters) |
-| `max_feature_dist` | double | `0.5` | Maximum distance for feature detection (meters) |
-| `max_feature_range` | double | `150.0` | Maximum range for feature extraction (meters) |
+| `min_feature_dist` | double | `0.05` | Minimum distance for feature association (meters) |
+| `max_feature_dist` | double | `0.5` | Maximum distance for feature association (meters) |
+| `max_feature_range` | double | `max_range` | Maximum range for feature extraction (meters) |
 | `feature_voxel_size` | double | `0.3` | Voxel size for (planar) feature downsampling (meters) |
 | `planar_only` | bool | `false` | Use only planar features (ignore edge features) |
 | `point_cloud_scale` | double | `1.0` | Scale factor applied to incoming point cloud coordinates in case there is a discrepancy in scale or unit between the LiDAR data and the map |
@@ -217,13 +217,12 @@ calib_rx, calib_ry, calib_rz = rvec
 | Back-end/estimation parameters |  |  |  |
 |---------------------|--|--|--|
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
-| `loss_function_scale` | double | `1.0` | Scale parameter for robust loss function |
+| `loss_function_scale` | double | `5/3*feature_voxel_size` | Scale parameter for robust loss function |
 | `max_associations_per_type` | int | `1000` | Maximum number of feature associations per type |
-| `low_latency` | bool | `true` | Putting to false would compute the odometry and undistortion only every second scan |
-| `state_freq` | double | `200.0` | Imu state frequency (Hz), it does not really matter |
 | `g` | double | `9.80` | Gravitational acceleration magnitude (m/s²) |
 | `dense_pc_output` | bool | `false` | Enable publishing of dense undistorted point cloud |
 | `mode` | string | `imu` | Mode of operation: `imu` (acc. and gyr. preintegration), `gyr` (gyr. preintegration and constant linear velocity model), or `no_imu` (constant linear and angular velocity model) |
+| `num_threads` | int | `4` | Number of threads for parallel residual computation |
 
 
 

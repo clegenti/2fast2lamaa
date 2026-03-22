@@ -8,6 +8,7 @@ from ament_index_python.packages import get_package_prefix
 
 min_range = float(1.0)
 max_range = float(200.0)
+voxel_size = float(0.3)
 
 key_framing = True
 key_frame_dist_thr = float(1.5)
@@ -31,15 +32,10 @@ def generate_launch_description():
                 ('/lidar_raw_points', '/os_cloud_node/points')
             ],
             parameters=[
-                {'low_latency': True}, # Set to True for estimation at each scan, False for every second scan
                 {'dense_pc_output': False}, # Set to True to output dense point cloud
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
-                {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.5},
-                {'max_feature_dist': 1.5},
-                {'loss_function_scale': 0.5},
-                {"state_freq": 200.0},
+                {'feature_voxel_size': float(voxel_size)},
                 {"max_associations_per_type": 1000},
 
                 # Adapting IMU measurements for some weird IMUs
@@ -70,7 +66,7 @@ def generate_launch_description():
                 ],
             parameters=[
                 {"point_cloud_internal_type": True},
-                {"voxel_size": 0.15},
+                {"voxel_size": float(voxel_size)},
                 {"neighbourhood_size": 2},
                 {"register": False},
                 {"register_with_approximate_field": False},
@@ -85,7 +81,7 @@ def generate_launch_description():
                 {"key_framing_time_thr": key_frame_time_thr},
 
                 # Free space carving (<= 0.0 to disable it)
-                {"min_range": min_range},
+                {"min_range": float(min_range)},
                 {"free_space_carving_radius": float(20)},
                 {"over_reject": over_reject},
                 {"last_scan_carving": True},

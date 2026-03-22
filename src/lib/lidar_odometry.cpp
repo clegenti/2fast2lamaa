@@ -161,7 +161,7 @@ void LidarOdometry::run()
              last_time_t += (int64_t)(imu_data_.gyr.back().t * 1e9);
         }
         imu_mutex_.unlock();
-        size_t id_to_run = (params_.low_latency) ? 1 : 2;
+        size_t id_to_run = 1;
         pc_mutex_.lock();
         bool has_data = false;
         if(params_.mode == LidarOdometryMode::IMU)
@@ -216,18 +216,6 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
 
     double threshold = params_.feature_voxel_size;
 
-    pc_mutex_.lock();
-    bool is_odd = (pc_chunks_.size() % 2 == 1);
-    if((!params_.low_latency) && is_odd)
-    {
-        pc_chunk_features_.push_back(std::make_shared<std::vector<Pointd> >());
-        pc_chunk_features_sparse_.push_back(std::make_shared<std::vector<Pointd> >());
-        pc_chunks_.push_back(pc);
-        pc_chunks_t_.push_back(t);
-        pc_mutex_.unlock();
-        return;
-    }
-    pc_mutex_.unlock();
 
     // Split the point cloud into channels and remove points too close
     std::vector<std::vector<Pointd> > channels;
@@ -420,23 +408,15 @@ std::tuple<std::vector<std::shared_ptr<std::vector<Pointd> > >, std::vector<std:
 {
     pc_mutex_.lock();
     int64_t t0 = pc_chunks_t_.at(0);
-    int64_t t1 = pc_chunks_t_.at( (params_.low_latency) ? 1 : 2);
+    int64_t t1 = pc_chunks_t_.at(1);
     // Get the first and third chunks of point clouds as features
     std::vector<std::shared_ptr<std::vector<Pointd> > > features;
     std::vector<std::shared_ptr<std::vector<Pointd> > > sparse_features;
     
     features.push_back(pc_chunk_features_.at(0));
     sparse_features.push_back(pc_chunk_features_sparse_.at(0));
-    if(params_.low_latency)
-    {
-        features.push_back(pc_chunk_features_.at(1));
-        sparse_features.push_back(pc_chunk_features_sparse_.at(1));
-    }
-    else
-    {
-        features.push_back(pc_chunk_features_.at(2));
-        sparse_features.push_back(pc_chunk_features_sparse_.at(2));
-    }
+    features.push_back(pc_chunk_features_.at(1));
+    sparse_features.push_back(pc_chunk_features_sparse_.at(1));
     if(features.at(0)->size() == 0 || features.at(1)->size() == 0)
     {
         throw std::runtime_error("LidarOdometry::getDataForOptimisation: No features available for optimisation.");
@@ -480,14 +460,12 @@ std::tuple<std::vector<std::shared_ptr<std::vector<Pointd> > >, std::vector<std:
 
 void LidarOdometry::optimise()
 {   
-    StopWatch sw;
-    sw.start();
 
     // Get the data for optimisation
     auto [features, sparse_features, imu_data, t0, t1] = getDataForOptimisation();
 
 
-    State state(imu_data, nanosToImuTime(t0), params_.state_frequency, params_.mode);
+    State state(imu_data, nanosToImuTime(t0), 200.0, params_.mode);
 
     // Initialize the state on the first optimisation
     if(first_optimisation_)
@@ -500,13 +478,6 @@ void LidarOdometry::optimise()
         updateCurrentPose(t0, t1);
     }
 
-
-    sw.stop();
-    sw.print("Precomputations: ");
-
-
-    sw.reset();
-    sw.start();
 
     std::set<int> types = kTypes;
     if(params_.planar_only)
@@ -535,13 +506,10 @@ void LidarOdometry::optimise()
 
     publishResults(state);
 
-    printState();
+    //printState();
     logState();
 
     prepareNextState(state);
-
-    sw.stop();
-    sw.print("Optimisation and launch publisher: ");
 
     
     first_optimisation_ = false;
@@ -629,7 +597,7 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
     // Solve the problem
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-    std::cout << summary.BriefReport() << std::endl;
+    //std::cout << summary.BriefReport() << std::endl;
 
 
     return data_associations;
@@ -1062,7 +1030,7 @@ void LidarOdometry::logState()
 void LidarOdometry::prepareNextState(const State& state)
 {
     pc_mutex_.lock();
-    int64_t next_query_time = (params_.low_latency) ? pc_chunks_t_.at(1) : pc_chunks_t_.at(2);
+    int64_t next_query_time = pc_chunks_t_.at(1);
     pc_mutex_.unlock();
 
     auto [next_pos, next_rot] = state.query(nanosToImuTime(next_query_time), state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
@@ -1106,7 +1074,7 @@ void LidarOdometry::prepareNextState(const State& state)
     }
 
     // Remove the first 2 chunks of point clouds and features
-    int n_to_remove = (params_.low_latency) ? 1 : 2;
+    int n_to_remove = 1;
     pc_mutex_.lock();
     pc_chunks_.erase(pc_chunks_.begin(), pc_chunks_.begin() + n_to_remove);
     pc_chunk_features_.erase(pc_chunk_features_.begin(), pc_chunk_features_.begin() + n_to_remove);
@@ -1131,10 +1099,7 @@ void LidarOdometry::updateCurrentPose(const int64_t t0, const int64_t t1)
 
 void LidarOdometry::publishResults(const State& state)
 {
-    StopWatch sw;
-    sw.start();
-
-    int id_to_run = (params_.low_latency) ? 1 : 2;
+    int id_to_run = 1;
     pc_mutex_.lock();
     int64_t anchor_t = pc_chunks_t_.at(id_to_run);
     int64_t t1 = pc_chunks_t_.at(1);
@@ -1186,9 +1151,6 @@ void LidarOdometry::publishResults(const State& state)
     prev_state_blocks_ = state_blocks_;
     prev_state_calib_ = state_calib_;
 
-
-    sw.stop();
-    sw.print("Querying and publishing odom results: ");
 }
 
 
@@ -1201,15 +1163,12 @@ void LidarOdometry::correctAndPublishPc(
         const Vec7 state_calib,
         const bool dense)
 {
-    StopWatch sw;
-    sw.start();
-
     int64_t current_t;
     current_pose_mutex_.lock();
     current_t = current_time_;
     current_pose_mutex_.unlock();
 
-    int64_t end_t = (params_.low_latency) ? pc_chunks_t.at(1) : pc_chunks_t.at(2);
+    int64_t end_t = pc_chunks_t.at(1);
     end_t += (int64_t)(scan_time_sum_ / scan_count_);
     if(end_t < current_t)
     {
@@ -1228,15 +1187,8 @@ void LidarOdometry::correctAndPublishPc(
 
     // Correct the points of chuncks 1 and 2 and publish them
     std::vector<Pointd> pc_corrected;
-    if(params_.low_latency)
-    {
-        pc_corrected.reserve(pts.at(1)->size());
-    }
-    else
-    {
-        pc_corrected.reserve(pts.at(1)->size() + pts.at(2)->size());
-    }
-    int nb_to_run = (params_.low_latency) ? 2 : 3;
+    pc_corrected.reserve(pts.at(1)->size());
+    int nb_to_run = 2;
     for(int i = 1; i < nb_to_run; ++i)
     {
         std::vector<double> chunk_t;
@@ -1262,11 +1214,6 @@ void LidarOdometry::correctAndPublishPc(
 
                 
 
-    sw.stop();
-    sw.print("Correcting point clouds of " + std::to_string(pc_corrected.size()) + " points: ");
-
-    sw.reset();
-    sw.start();
 
     if(dense)
     {
@@ -1280,9 +1227,6 @@ void LidarOdometry::correctAndPublishPc(
         });
         if(node_ != nullptr) node_->publishPc(pc_chunks_t.at(1), pc_corrected);
     }
-
-    sw.stop();
-    sw.print("Publishing point cloud: ");
 
 }
 

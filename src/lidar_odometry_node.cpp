@@ -26,16 +26,14 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
 
             // Read the parameters that are passed to the lidar odometry code
             LidarOdometryParams params;
-            params.low_latency = readFieldBool(this, "low_latency", true);
             params.dense_pc_output = readFieldBool(this, "dense_pc_output", false);
             params.min_range = readFieldDouble(this, "min_range", 1.0);
             params.max_range = readFieldDouble(this, "max_range", 150.0);
             params.min_feature_dist = readFieldDouble(this, "min_feature_dist", 0.05);
-            params.max_feature_dist = readFieldDouble(this, "max_feature_dist", 0.5);
-            params.max_feature_range = readFieldDouble(this, "max_feature_range", 150.0);
+            params.max_feature_dist = readFieldDouble(this, "max_feature_dist", 1.5);
+            params.max_feature_range = readFieldDouble(this, "max_feature_range", params.max_range);
             params.feature_voxel_size = readFieldDouble(this, "feature_voxel_size", 0.3);
-            params.loss_function_scale = readFieldDouble(this, "loss_function_scale", 1.0);
-            params.state_frequency = readFieldDouble(this, "state_freq", 200.0);
+            params.loss_function_scale = readFieldDouble(this, "loss_function_scale", 5.0*params.feature_voxel_size/3.0);
             params.gyr_std = readFieldDouble(this, "gyr_std", 0.005);
             params.acc_std = readFieldDouble(this, "acc_std", 0.02);
             params.lidar_std = readFieldDouble(this, "lidar_std", 0.02);

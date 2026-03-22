@@ -9,6 +9,7 @@ import numpy as np
 
 min_range = float(1.5)
 max_range = float(60.0)
+voxel_size = float(0.15)
 
 key_framing = True
 key_frame_dist_thr = float(1.5)
@@ -32,15 +33,10 @@ def generate_launch_description():
                 ('/lidar_raw_points', '/os1_cloud_node/points')
             ],
             parameters=[
-                {'low_latency': True}, # Set to True for estimation at each scan, False for every second scan
                 {'dense_pc_output': False}, # Set to True to output dense point cloud
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
-                {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.15},
-                {'max_feature_dist': 0.75},
-                {'min_feature_dist': 0.15},
-                {'loss_function_scale': 0.5},
+                {'feature_voxel_size': float(voxel_size)},
                 {"state_freq": 200.0},
                 {"max_associations_per_type": 1000},
                 {"planar_only": True},
@@ -83,7 +79,7 @@ def generate_launch_description():
                 {"init_pose_rz": 0.0},
 
                 {"point_cloud_internal_type": True},
-                {"voxel_size": 0.25},
+                {"voxel_size": float(voxel_size)},
                 {"neighbourhood_size": 2},
                 {"register": True},
                 {"register_with_approximate_field": False},
@@ -98,7 +94,7 @@ def generate_launch_description():
                 {"key_framing_time_thr": key_frame_time_thr},
 
                 # Free space carving (<= 0.0 to disable it)
-                {"min_range": min_range},
+                {"min_range": float(min_range)},
                 {"free_space_carving_radius": float(-20)},
                 {"over_reject": over_reject},
                 {"last_scan_carving": False},

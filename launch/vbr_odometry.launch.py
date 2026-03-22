@@ -10,6 +10,7 @@ SetEnvironmentVariable(name='RCUTILS_COLORIZED_OUTPUT', value='1'),
 
 min_range = float(1.0)
 max_range = float(200.0)
+voxel_size = float(0.3)
 
 key_framing = False
 
@@ -27,20 +28,14 @@ def generate_launch_description():
             remappings=[
                 ('/imu/acc', '/ouster/imu'),
                 ('/imu/gyr', '/ouster/imu'),
-                #('/imu/acc', '/imu/data'),
-                #('/imu/gyr', '/imu/data'),
                 ('/lidar_raw_points', '/ouster/points')
             ],
             parameters=[
-                {'low_latency': True}, # Set to True for estimation at each scan, False for every second scan
                 {'dense_pc_output': False}, # Set to True to output dense point cloud
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
                 {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.3},
-                {'max_feature_dist': 1.5},
-                {'loss_function_scale': 0.5},
-                {"state_freq": 200.0},
+                {'feature_voxel_size': float(voxel_size)},
                 {"max_associations_per_type": 1000},
                 {"planar_only": False},
 
@@ -60,12 +55,7 @@ def generate_launch_description():
                 {"unsorted_pc": False},
 
             ],
-            output='log',
-            arguments=[
-                '--ros-args',
-                '--log-level', 'fatal',      # only fatal logs
-                '--disable-stdout-logs',     # disable console logger output
-            ],
+            output='screen',
         ),
         Node(
             package='ffastllamaa', 
@@ -80,7 +70,7 @@ def generate_launch_description():
                 ],
             parameters=[
                 {"point_cloud_internal_type": True},
-                {"voxel_size": 0.30},
+                {"voxel_size": float(voxel_size)},
                 {"neighbourhood_size": 2},
                 {"register": True},
                 {"register_with_approximate_field": False},
@@ -93,7 +83,7 @@ def generate_launch_description():
                 {"key_framing": key_framing},
 
                 # Free space carving (<= 0.0 to disable it)
-                {"min_range": min_range},
+                {"min_range": float(min_range)},
                 {"free_space_carving_radius": float(50)},
                 {"over_reject": over_reject},
                 {"last_scan_carving": True},
@@ -101,18 +91,13 @@ def generate_launch_description():
                 # Path to where the map will be saved
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
-                {"submap_length": 50.0},
-                {"submap_overlap": 0.2},
+                {"submap_length": float(50.0)},
+                {"submap_overlap": float(0.2)},
 
                 {"write_scans": True}
 
             ],
-            arguments=[
-                '--ros-args',
-                '--log-level', 'fatal',      # only fatal logs
-                '--disable-stdout-logs',     # disable console logger output
-            ],
-            output='log',
+            output='screen',
             on_exit=Shutdown()
         ),
         Node(package = "ffastllamaa",

@@ -23,7 +23,6 @@ const int kMaxNbAssociationPerBin = 3;
 
 struct LidarOdometryParams
 {
-    bool low_latency = false;
     bool dense_pc_output = false; // If true, also output dense point cloud
     double min_range = 1.0;
     double max_range = 150.0;
@@ -33,7 +32,6 @@ struct LidarOdometryParams
     double feature_voxel_size = 0.3;
     double loss_function_scale = 0.25;
     uint32_t max_associations_per_type = 500;
-    double state_frequency = 10;
     double g = 9.80;
     double calib_px = 0.0;
     double calib_py = 0.0;
