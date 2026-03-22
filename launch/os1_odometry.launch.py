@@ -10,10 +10,7 @@ import numpy as np
 min_range = float(1.5)
 max_range = float(150.0)
 
-key_framing = True
-key_frame_dist_thr = float(2.5)
-key_frame_rot_thr = float(25.0 * 3.14 / 180.0)
-key_frame_time_thr = float(0.05)
+key_framing = False
 
 over_reject = False # If true, also reject the neighborhood points when performing the dynamic filtering and free space carving.
 
@@ -38,9 +35,8 @@ def generate_launch_description():
                 {'max_range': float(max_range)},
                 {'max_feature_range': float(max_range)},
                 {'feature_voxel_size': 0.15},
-                {'max_feature_dist': 2.5},
-                {'min_feature_dist': 0.10},
-                {'loss_function_scale': 0.5},
+                {'max_feature_dist': 1.5},
+                {'loss_function_scale': 0.25},
                 {"state_freq": 200.0},
                 {"max_associations_per_type": 1000},
                 {"planar_only": True},
@@ -73,27 +69,27 @@ def generate_launch_description():
             remappings=[
                 ('/points_input', '/lidar_scan_undistorted'),
                 ('/pose_input', '/undistortion_pose'),
+                ('/gp_map/acc', '/os1_cloud_node/imu'),
+                ('/gp_map/gyr', '/os1_cloud_node/imu'),
+                ('/twist', '/start_of_scan_twist')
                 ],
             parameters=[
                 {"point_cloud_internal_type": True},
-                {"voxel_size": 0.25},
+                {"voxel_size": 0.15},
                 {"neighbourhood_size": 2},
                 {"register": True},
                 {"register_with_approximate_field": False},
                 {"voxel_size_factor_for_registration": 2.0},
-                {"max_num_pts_for_registration": 1500},
+                {"max_num_pts_for_registration": 2000},
                 {"loss_function_scale": 0.25},
                 {"use_temporal_weights": True}, # If true, registration weight are 10 times bigger for voxels associated to the older scans than for the newer ones
                 {"with_init_guess": True},
                 {"map_publish_period": 0.5},
                 {"key_framing": key_framing},
-                {"key_framing_dist_thr": key_frame_dist_thr},
-                {"key_framing_rot_thr": key_frame_rot_thr},
-                {"key_framing_time_thr": key_frame_time_thr},
 
                 # Free space carving (<= 0.0 to disable it)
                 {"min_range": min_range},
-                {"free_space_carving_radius": float(-20)},
+                {"free_space_carving_radius": float(-50)},
                 {"over_reject": over_reject},
                 {"last_scan_carving": True},
 
@@ -103,7 +99,6 @@ def generate_launch_description():
                 {"submap_length": -200.0},
                 {"submap_overlap": 0.2},
 
-                {"use_edge_field": False} # Use the edge field for registration (slower but a bit more robust in tunnel scenarios)
             ],
             output='screen',
             on_exit=Shutdown()

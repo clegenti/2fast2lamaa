@@ -122,7 +122,7 @@ class PoseGraphNode: public rclcpp::Node
             min_dist_for_carving_ = readFieldDouble(this, "min_dist_for_carving", 4.0);
             max_drift_ = readFieldDouble(this, "max_drift", 0.02);
             voxel_size_factor_ = readFieldDouble(this, "voxel_size_factor_for_registration", 2.0);
-            max_nb_points_ = readFieldInt(this, "max_num_pts_for_registration", 8000);
+            max_nb_points_ = readFieldInt(this, "max_num_pts_for_registration", 4000);
             loss_scale_ = readFieldDouble(this, "loss_function_scale", 0.5);
 
             odom_error_pos_ = readFieldDouble(this, "odom_typical_pos_error", 0.01);
@@ -140,7 +140,7 @@ class PoseGraphNode: public rclcpp::Node
 
             
             sub_ = this->create_subscription<ffastllamaa::msg::SubmapInfo>(
-                "/submap_info", 10,
+                "/submap_info", 1000,
                 std::bind(&PoseGraphNode::submapCallback, this, std::placeholders::_1)
             );
 
@@ -207,8 +207,10 @@ class PoseGraphNode: public rclcpp::Node
 
         // Add the storage of the submap images
         std::vector<MatX> submap_images_;
-        std::vector<std::vector<cv::KeyPoint> > submap_keypoints_;
-        std::vector<cv::Mat> submap_descriptors_;
+        std::vector<std::vector<cv::KeyPoint> > laplace_keypoints_;
+        std::vector<cv::Mat> laplace_descriptors_;
+        std::vector<std::vector<cv::KeyPoint> > height_keypoints_;
+        std::vector<cv::Mat> height_descriptors_;
 
 
         rclcpp::Subscription<ffastllamaa::msg::SubmapInfo>::SharedPtr sub_;
@@ -268,15 +270,22 @@ class PoseGraphNode: public rclcpp::Node
             std::cout << "Created submap image for map " << maps_.size() - 1 << std::endl;
             
             auto [keypoints, descriptors] = extractFeatures(laplace_image);
-            submap_keypoints_.push_back(keypoints);
-            submap_descriptors_.push_back(descriptors);
+            laplace_keypoints_.push_back(keypoints);
+            laplace_descriptors_.push_back(descriptors);
+            auto [keypoints_height, descriptors_height] = extractFeatures(eigenToImage(height_image));
+            height_keypoints_.push_back(keypoints_height);
+            height_descriptors_.push_back(descriptors_height);
 
-// For debugging, save the submap image with keypoints drawn on it
-cv::Mat debug_image;
-cv::cvtColor(laplace_image, debug_image, cv::COLOR_GRAY2BGR);
-cv::drawKeypoints(debug_image, keypoints, debug_image, cv::Scalar(0, 255, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
-cv::imwrite(output_folder_ + "/features_submap_" + std::to_string(maps_.size() - 1) + ".png", debug_image);
+            // For debugging, save the submap image with keypoints drawn on it
+            cv::Mat debug_image;
+            cv::cvtColor(laplace_image, debug_image, cv::COLOR_GRAY2BGR);
+            cv::drawKeypoints(debug_image, keypoints, debug_image, cv::Scalar(0, 255, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+            cv::imwrite(output_folder_ + "/features_submap_" + std::to_string(maps_.size() - 1) + ".png", debug_image);
+            cv::cvtColor(eigenToImage(height_image), debug_image, cv::COLOR_GRAY2BGR);
+            cv::drawKeypoints(debug_image, keypoints_height, debug_image, cv::Scalar(0, 255, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+            cv::imwrite(output_folder_ + "/features_height_submap_" + std::to_string(maps_.size() - 1) + ".png", debug_image);
             
+
             std::set<int> submap_canditates = getSubmapIdsInRadius();
 
             std::cout << "Submaps in radius for the last pose: ";
@@ -291,6 +300,18 @@ cv::imwrite(output_folder_ + "/features_submap_" + std::to_string(maps_.size() -
 
             std::vector<std::tuple<int64_t, int64_t, Mat4> > pose_graph_edges = attemptFineRegistration(submap_id_and_coarse_poses);
 
+            if(pose_graph_edges.size() == 0)
+            {
+                std::vector<std::pair<int64_t, int64_t> > direct_candidates = getDirectRegistrationCandidates();
+
+                std::vector<std::tuple<int64_t, int64_t, Mat4> > direct_loop_closures = attemptDirectRegistration(direct_candidates);
+
+                // Concatenate the direct loop closures and the ones from registration
+                pose_graph_edges.insert(pose_graph_edges.end(), direct_loop_closures.begin(), direct_loop_closures.end());
+            }
+
+
+
             addLoopClosuresToPoseGraph(pose_graph_edges);
 
             writeFullTrajectory();
@@ -301,41 +322,10 @@ cv::imwrite(output_folder_ + "/features_submap_" + std::to_string(maps_.size() -
 
         void addLoopClosuresToPoseGraph(const std::vector<std::tuple<int64_t, int64_t, Mat4> >& pose_graph_edges)
         {
-
-// Debug check is the current state containes any NaN
-bool has_nan = false;
-for(const auto& [timestamp, pose] : time_and_pose_)
-{
-    if(pose->hasNaN())
-    {
-        has_nan = true;
-        std::cout << "NaN detected in pose at timestamp " << timestamp << std::endl;
-    }
-}
-if(has_nan)
-{
-    std::cout << "NaN detected in the current state." << std::endl;
-    throw std::runtime_error("NaN detected in the current state.");
-}
-
-
             if(pose_graph_edges.size() > 0)
             {
-
-std::cout << "Adding " << pose_graph_edges.size() << " loop closures to the pose graph optimization problem." << std::endl;
-                initializeLoopClosureState(pose_graph_edges);
-std::cout << "State initialized for loop closure optimization." << std::endl;
-
                 for(const auto& [timestamp_i, timestamp_j, rel_pose] : pose_graph_edges)
                 {
-std::cout << "Adding loop closure edge between timestamps " << timestamp_i << " and " << timestamp_j << std::endl;
-
-// Check for NaN in the relative pose
-if(rel_pose.hasNaN())
-{
-    std::cout << "NaN detected in relative pose for edge between timestamps " << timestamp_i << " and " << timestamp_j << ". Skipping this edge." << std::endl;
-    throw std::runtime_error("NaN detected in relative pose for loop closure edge.");
-}
                     Mat3 cov = Mat3::Zero();
                     cov = Mat3::Identity() * loop_pos_std * loop_pos_std;
                     ceres::CostFunction* cost_function = new ceres::AutoDiffCostFunction<RelativePositionCostFunctor, 3, 7, 7>(
@@ -361,21 +351,6 @@ if(rel_pose.hasNaN())
 
         void initializeLoopClosureState(const std::vector<std::tuple<int64_t, int64_t, Mat4> >& pose_graph_edges)
         {
-// Check if the current state contains any NaN
-bool has_nan = false;
-for(const auto& [timestamp, pose] : time_and_pose_)
-{
-    if(pose->hasNaN())
-    {
-        has_nan = true;
-        std::cout << "NaN detected in pose at timestamp " << timestamp << " before loop closure state initialization." << std::endl;
-    }
-}
-if(has_nan)
-{
-    std::cout << "NaN detected in the current state before loop closure state initialization." << std::endl;
-    throw std::runtime_error("NaN detected in the current state before loop closure state initialization.");
-}
             // Get the most recent pose in the state that is in the new edges
             int64_t most_recent_timestamp_j_in_edges = -1;
             int64_t most_recent_timestamp_i_in_edges = -1;
@@ -410,17 +385,6 @@ if(has_nan)
                 std::cout << "Delta time for loop closure state initialization is non-positive. No need to initialize state for loop closure." << std::endl;
                 return;
             }
-if(delta_time <= 0)
-{
-    std::string message = "Delta time <= 0 for loop closure state initialization: BUG? most_recent_timestamp_j_in_edges: " + std::to_string(most_recent_timestamp_j_in_edges) + ", timestamp_to_spread: " + std::to_string(timestamp_to_spread) + ", delta_time: " + std::to_string(delta_time);
-    RCLCPP_WARN(this->get_logger(), message.c_str());
-    throw std::runtime_error(message);
-}
-if(delta_to_spread.hasNaN())
-{
-    RCLCPP_WARN(this->get_logger(), "Delta to spread contains NaN for loop closure state initialization: BUG?");
-    throw std::runtime_error("Delta to spread contains NaN for loop closure state initialization.");
-}
 
             // Loop the poses from the end
             for(int i = times_in_order_.size() - 1; (i >= 0) && (times_in_order_[i] >= timestamp_to_spread); i--)
@@ -441,20 +405,6 @@ if(delta_to_spread.hasNaN())
                     *time_and_pose_[times_in_order_[i]] = transformToPosQuat(new_pose);
                 }
             }
-// Check if the initialized state has any NaN
-has_nan = false;
-for(const auto& [timestamp, pose] : time_and_pose_)
-{
-    if(pose->hasNaN())
-    {
-        has_nan = true;
-        std::cout << "NaN detected in pose at timestamp " << timestamp << " after loop closure state initialization." << std::endl;
-    }
-}
-if(has_nan)
-{
-    std::cout << "NaN detected in the current state after loop closure state initialization." << std::endl;
-}
         }
 
 
@@ -554,25 +504,6 @@ if(has_nan)
 
         void addSubmapTrajectoryToState(const std::vector<std::pair<int64_t, Vec7> >& trajectory)
         {
-// Check if the trajectory contains any NaN
-bool has_nan = false;
-for(const auto& [timestamp, pose] : trajectory)
-{
-    if(pose.hasNaN())
-    {
-        has_nan = true;
-        std::cout << "NaN detected in trajectory pose at timestamp " << timestamp << " during addSubmapTrajectoryToState." << std::endl;
-    }
-    else if(std::abs(pose.segment<4>(3).norm() - 1.0) > 1e-3)
-    {
-        has_nan = true;
-        std::cout << "Invalid quaternion detected in trajectory pose at timestamp " << timestamp << " during addSubmapTrajectoryToState. Quaternion norm: " << pose.segment<4>(3).norm() << std::endl;
-    }
-}
-if(has_nan)
-{
-    throw std::runtime_error("NaN or invalid quaternion detected in trajectory.");
-}
             map_scans_poses_.emplace_back();
             // Add 4 poses spread across the trajectory
             Mat4 first_pose_mat_inv = posQuatToTransform(trajectory.front().second).inverse();
@@ -638,22 +569,6 @@ if(has_nan)
                 }
             }
             RCLCPP_INFO(this->get_logger(), "Added %zu poses to the state from trajectory.", trajectory.size());
-// Check if the state contains any NaN after adding the trajectory
-has_nan = false;
-for(const auto& [timestamp, pose] : time_and_pose_)
-{
-    if(pose->hasNaN())
-    {
-        has_nan = true;
-        std::cout << "NaN detected in pose at timestamp " << timestamp << " after adding trajectory to state." << std::endl;
-        std::cout << "Trajectory from " << trajectory.front().first << " to " << trajectory.back().first << std::endl;
-    }
-}
-if(has_nan)
-{
-    std::cout << "NaN detected in the current state after adding trajectory to state." << std::endl;
-    throw std::runtime_error("NaN detected in the current state after adding trajectory to state.");
-}
         }
 
 
@@ -794,12 +709,14 @@ if(has_nan)
                 int y = static_cast<int>(std::floor(cam_pt(1)));
                 if(x >= 0 && x < rows && y >= 0 && y < cols)
                 {
-                    counter(x, y) += 1.0f;
+                    counter(x, y) += 1;
                     sum(x, y) += pt(2);
                     sum_squared(x, y) += pt(2) * pt(2);
                 }
             }
 
+            int count_valid_pixels = 0;
+            double sum_height = 0.0;
             for(int x = 0; x < rows; ++x)
             {
                 for(int y = 0; y < cols; ++y)
@@ -807,6 +724,19 @@ if(has_nan)
                     if(counter(x, y) > 0)
                     {
                         height_image(x, y) = sum(x, y) / counter(x, y);
+                        count_valid_pixels++;
+                        sum_height += height_image(x, y);
+                    }
+                }
+            }
+            double mean_height = sum_height / count_valid_pixels;
+            for(int x = 0; x < rows; ++x)
+            {
+                for(int y = 0; y < cols; ++y)
+                {
+                    if(std::isnan(height_image(x, y)) || counter(x, y) == 0)
+                    {
+                        height_image(x, y) = mean_height;
                     }
                 }
             }
@@ -886,6 +816,141 @@ if(has_nan)
             return {keypoints, descriptors};
         }
 
+        std::vector<std::pair<int64_t, int64_t> > getDirectRegistrationCandidates()
+        {
+            std::vector<std::pair<int64_t, int64_t> > candidates;
+            int current_submap_id = pose_to_submap_id_.back();
+            for(int i = 0; (i < pose_to_submap_id_.size()) && (pose_to_submap_id_[i] < (current_submap_id-1)); i++)
+            {
+                double min_distance = std::numeric_limits<double>::max();
+                double min_j = -1;
+                for(int j = pose_to_submap_id_.size() - 1; (j > i) && (pose_to_submap_id_[j] == current_submap_id); j--) 
+                {
+                    // Check if the distance between poses is less than kNeighborRadius/2
+                    Vec7 pose_i = *time_and_pose_[times_in_order_[i]];
+                    Vec7 pose_j = *time_and_pose_[times_in_order_[j]];
+                    double distance = (pose_i.head<3>() - pose_j.head<3>()).norm();
+                    if(distance < kNeighborRadius/2 && distance < min_distance)
+                    {
+                        min_distance = distance;
+                        min_j = j;
+                    }
+                }
+                if(min_j >= 0)
+                {
+                    candidates.emplace_back(times_in_order_[i], times_in_order_[min_j]);
+                }
+            }
+            std::cout << "Found " << candidates.size() << " direct registration candidates." << std::endl;
+            return candidates;
+        }
+
+        std::vector<std::tuple<int64_t, int64_t, Mat4> > attemptDirectRegistration(const std::vector<std::pair<int64_t, int64_t> >& candidates)
+        {
+            // Attempt only for 5 candidates to save time
+            double num_attempts = std::min((double)candidates.size(), 5.0);
+            std::vector<std::tuple<int64_t, int64_t, Mat4> > successful_registrations;
+            for(size_t i = 0; i < num_attempts; i++)
+            {
+                auto [timestamp_i, timestamp_j] = candidates[int(i*candidates.size()/num_attempts)];
+                // Sanity check
+                if(timestamp_i == timestamp_j || time_and_pose_.find(timestamp_i) == time_and_pose_.end() || time_and_pose_.find(timestamp_j) == time_and_pose_.end())
+                {
+                    RCLCPP_WARN(this->get_logger(), "Invalid candidate pair with timestamps %ld and %ld. Skipping this candidate.", timestamp_i, timestamp_j);
+                    continue;
+                }
+                RCLCPP_INFO(this->get_logger(), "Attempting direct registration between poses with timestamps %ld and %ld.", timestamp_i, timestamp_j);
+                Mat4 T_o_source;
+                T_o_source(3,3) = -1.0;
+                for(const auto& [timestamp, rel_pose] : map_scans_poses_.back())
+                {
+                    if(timestamp == timestamp_j)
+                    {
+                        T_o_source = submap_original_poses_.back() * rel_pose;
+                        break;
+                    }
+                }
+                if(T_o_source(3,3) < 0.0)
+                {
+                    RCLCPP_WARN(this->get_logger(), "Could not find the pose for timestamp %ld in the current submap. Skipping this candidate.", timestamp_j);
+                    continue;
+                }
+
+                Mat4 relative_i_j = posQuatToTransform(*time_and_pose_[timestamp_i]).inverse() * posQuatToTransform(*time_and_pose_[timestamp_j]);
+                Mat4 initial_guess = T_o_source * relative_i_j.inverse();
+
+                std::string scan_file_i = getScanPath(timestamp_i);
+                std::vector<Pointd> scan_i = loadPointCloudFromPly(scan_file_i);
+
+                std::vector<Pointd> downsampled_scan_i = downsamplePointCloud(scan_i, voxel_size_factor_*map_res_, max_nb_points_, true);
+
+                Mat4 T_o_target = maps_.back()->registerPts(downsampled_scan_i, initial_guess, 1, false, 5.0, 10);
+                T_o_target = maps_.back()->registerPts(downsampled_scan_i, T_o_target, 1, false, 2.0, 10);
+                T_o_target = maps_.back()->registerPts(downsampled_scan_i, T_o_target, 1, false, loss_scale_);
+
+                std::vector<Pointd> transformed_scan_i;
+                for(const auto& pt : downsampled_scan_i)
+                {
+                    Vec3 transformed_vec = T_o_target.block<3,3>(0,0) * pt.vec3() + T_o_target.block<3,1>(0,3);
+                    transformed_scan_i.emplace_back(transformed_vec, 0);
+                }
+                int inlier_count = 0;
+                for(const auto& pt : transformed_scan_i)
+                {
+                    double distance = maps_.back()->queryDistField(pt.vec3());
+                    if(distance < map_res_)
+                    {
+                        inlier_count++;
+                    }
+                }
+                double inlier_ratio = static_cast<double>(inlier_count) / static_cast<double>(downsampled_scan_i.size());
+
+                if(inlier_ratio < 0.85)
+                {
+                    RCLCPP_WARN(this->get_logger(), "Low inlier ratio (%f) after fine registration between submap %d and scan at timestamp %ld. Skipping this match.", inlier_ratio, maps_.size() - 1, timestamp_i);
+                    continue;
+                }
+
+                // Get the closest pose/timestamp in the current submap to the target pose
+                Mat4 T_target_source = T_o_target.inverse() * T_o_source;
+                successful_registrations.emplace_back(timestamp_i, timestamp_j, T_target_source);
+                
+
+
+                /////////////// Visualization / debugging //////////////
+                // Read both the target and closest scans, transform the closest scan with the estimated transformation and save both for visualization
+                std::vector<Pointd> source_scan = loadPointCloudFromPly(getScanPath(timestamp_j));
+                if(source_scan.size() == 0)                    {
+                    RCLCPP_WARN(this->get_logger(), "Scan file is empty for closest timestamp: %ld. Skipping saving transformed scan for visualization.", timestamp_j);
+                    continue;
+                }
+                std::vector<Pointd> transformed_closest_scan;
+                for(const auto& pt : source_scan)                    {
+                    Vec3 transformed_vec = T_target_source.block<3,3>(0,0) * pt.vec3() + T_target_source.block<3,1>(0,3);
+                    transformed_closest_scan.emplace_back(Vec3(transformed_vec(0), transformed_vec(1), transformed_vec(2)), 0);
+                }
+                std::vector<Pointd> target_scan = loadPointCloudFromPly(getScanPath(timestamp_i));
+                if(target_scan.size() == 0)                    {
+                    RCLCPP_WARN(this->get_logger(), "Scan file is empty for target timestamp: %ld. Skipping saving target scan for visualization.", timestamp_i);
+                    continue;
+                }
+                // Save the target scan, and the transformed closest scan for visualization
+                std::string target_scan_file = output_folder_ + "/direct_loop_to_submap_" + std::to_string(maps_.size() - 1) + "_timestamp_" + std::to_string(timestamp_i) + "_inlier_ratio_" + std::to_string(inlier_ratio) + "_target.ply";
+                savePointCloudToPly(target_scan_file, target_scan);
+                RCLCPP_INFO(this->get_logger(), "Saved target scan to %s", target_scan_file.c_str());
+                std::string transformed_closest_scan_file = output_folder_ + "/direct_loop_to_submap_" + std::to_string(maps_.size() - 1) + "_timestamp_" + std::to_string(timestamp_i) + "_inlier_ratio_" + std::to_string(inlier_ratio) + "_closest_transformed.ply";
+                savePointCloudToPly(transformed_closest_scan_file, transformed_closest_scan);
+                RCLCPP_INFO(this->get_logger(), "Saved transformed closest scan to %s", transformed_closest_scan_file.c_str());
+                ////////////////////////////////////////////////////////
+
+            }
+            return successful_registrations;
+        }
+
+
+
+
+
         std::set<int> getSubmapIdsInRadius()
         {
             std::set<int> submap_ids;
@@ -922,30 +987,68 @@ if(has_nan)
             for(int submap_id : submap_candidates)
             {
                 RCLCPP_INFO(this->get_logger(), "Attempting visual registration between submap %d and %d.", pose_to_submap_id_.back(), submap_id);
-                std::vector<cv::KeyPoint> keypoints1 = submap_keypoints_[pose_to_submap_id_.back()];
-                cv::Mat descriptors1 = submap_descriptors_[pose_to_submap_id_.back()];
-                std::vector<cv::KeyPoint> keypoints2 = submap_keypoints_[submap_id];
-                cv::Mat descriptors2 = submap_descriptors_[submap_id];
+                // Match the laplace image features
+                std::vector<cv::KeyPoint> keypoints1 = laplace_keypoints_[pose_to_submap_id_.back()];
+                cv::Mat descriptors1 = laplace_descriptors_[pose_to_submap_id_.back()];
+                std::vector<cv::KeyPoint> keypoints2 = laplace_keypoints_[submap_id];
+                cv::Mat descriptors2 = laplace_descriptors_[submap_id];
 
                 std::vector<std::vector<cv::DMatch> > knn_matches;
                 matcher.knnMatch(descriptors1, descriptors2, knn_matches, 2);
+                // Match the height image features
+                std::vector<cv::KeyPoint> keypoints1_height = height_keypoints_[pose_to_submap_id_.back()];
+                cv::Mat descriptors1_height = height_descriptors_[pose_to_submap_id_.back()];
+                std::vector<cv::KeyPoint> keypoints2_height = height_keypoints_[submap_id];
+                cv::Mat descriptors2_height = height_descriptors_[submap_id];
+
+                std::vector<std::vector<cv::DMatch> > knn_matches_height;
+                matcher.knnMatch(descriptors1_height, descriptors2_height, knn_matches_height, 2);
+
+
+                // Concatenate the matches from the laplace and height images
+                int num_laplace_kp_1 = keypoints1.size();
+                int num_laplace_kp_2 = keypoints2.size();
+                for(size_t i = 0; i < keypoints1_height.size(); i++)
+                {
+                    keypoints1.push_back(keypoints1_height[i]);
+                }
+                for(size_t i = 0; i < keypoints2_height.size(); i++)
+                {
+                    keypoints2.push_back(keypoints2_height[i]);
+                }
+                for(size_t i = 0; i < knn_matches_height.size(); i++)
+                {
+                    for(size_t j = 0; j < knn_matches_height[i].size(); j++)
+                    {
+                        knn_matches_height[i][j].queryIdx += num_laplace_kp_1;
+                        knn_matches_height[i][j].trainIdx += num_laplace_kp_2;
+                    }
+                    knn_matches.push_back(knn_matches_height[i]);
+                }
+
+
 
                 std::cout << "Found " << knn_matches.size() << " initial matches between submap " << pose_to_submap_id_.back() << " and submap " << submap_id << "." << std::endl;
 
                 std::vector<cv::DMatch> good_matches;
                 for(size_t i = 0; i < knn_matches.size(); i++)
                 {
+                    if(knn_matches[i].size() < 2)
+                    {
+                        continue;
+                    }
                     auto kp1 = keypoints1[knn_matches[i][0].queryIdx];
                     auto kp2 = keypoints2[knn_matches[i][0].trainIdx];
                     double scale_ratio = kp1.size / kp2.size;
-                    if( (std::abs(scale_ratio - 1.0) < 0.25) && (knn_matches[i][0].distance < 0.5 * knn_matches[i][1].distance) )
+                    if((knn_matches[i][0].distance < 0.85 * knn_matches[i][1].distance) )
                     {
                         good_matches.push_back(knn_matches[i][0]);
                     }
 
                 }
+                std::cout << "Found " << good_matches.size() << " good matches after ratio test and scale consistency check between submap " << pose_to_submap_id_.back() << " and submap " << submap_id << "." << std::endl;
 
-                if (good_matches.size() < 4)
+                if (good_matches.size() < 5)
                 {
                     RCLCPP_WARN(this->get_logger(), "Not enough good matches (%zu) between submap %d and %d for visual registration. Skipping this match.", good_matches.size(), pose_to_submap_id_.back(), submap_id);
                     continue;
@@ -961,7 +1064,7 @@ if(has_nan)
 
                 // Estimate the Affine partial 2D
                 cv::Mat inliers;
-                cv::Mat affine = cv::estimateAffinePartial2D(src_pts, dst_pts, inliers, cv::RANSAC, 3.0);
+                cv::Mat affine = cv::estimateAffinePartial2D(src_pts, dst_pts, inliers, cv::RANSAC, 4.0, 5000);
 
                 if (affine.empty())
                 {
@@ -1017,41 +1120,22 @@ if(has_nan)
                     RCLCPP_WARN(this->get_logger(), "Estimated scale is invalid (scale: %f) between submap %d and %d. Skipping this match.", scale, pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
-                if(std::abs(scale - 1.0) > 0.1)
+                if(std::abs(scale - 1.0) > 0.25)
                 {
                     RCLCPP_WARN(this->get_logger(), "Estimated scale is too different from 1.0 (scale: %f) between submap %d and %d. Skipping this match.", scale, pose_to_submap_id_.back(), submap_id);
                     continue;
                 }
                 submap_id_and_coarse_poses.emplace_back(submap_id, pose_3d);
 
-// Display the matched keypoints and the inliers for debugging
-cv::Mat debug_image_A(submap_images_[pose_to_submap_id_.back()].rows(), submap_images_[pose_to_submap_id_.back()].cols(), CV_64F);
-cv::Mat debug_image_B(submap_images_[submap_id].rows(), submap_images_[submap_id].cols(), CV_64F);
-for(size_t x = 0; x < debug_image_A.rows; x++)
-{
-    for(size_t y = 0; y < debug_image_A.cols; y++)
-    {
-        debug_image_A.at<double>(x,y) = static_cast<double>(submap_images_[pose_to_submap_id_.back()](x,y));
-    }
-}
-for(size_t x = 0; x < debug_image_B.rows; x++)
-{
-    for(size_t y = 0; y < debug_image_B.cols; y++)
-    {
-        debug_image_B.at<double>(x,y) = static_cast<double>(submap_images_[submap_id](x,y));
-    }
-}
-// Normalize to 0-255 for visualization, convert to 8-bit images, and convert to 3-channel images for drawing colored matches
-cv::normalize(debug_image_A, debug_image_A, 0, 255, cv::NORM_MINMAX);
-cv::normalize(debug_image_B, debug_image_B, 0, 255, cv::NORM_MINMAX);
-debug_image_A.convertTo(debug_image_A, CV_8U);
-debug_image_B.convertTo(debug_image_B, CV_8U);
-cv::cvtColor(debug_image_A, debug_image_A, cv::COLOR_GRAY2BGR);
-cv::cvtColor(debug_image_B, debug_image_B, cv::COLOR_GRAY2BGR);
-cv::Mat combined_image;
-cv::drawMatches(debug_image_A, keypoints1, debug_image_B, keypoints2, good_matches, combined_image, cv::Scalar::all(-1), cv::Scalar::all(-1), inliers);
-std::string debug_image_path = output_folder_ + "/debug_match_submap_" + std::to_string(pose_to_submap_id_.back()) + "_and_" + std::to_string(submap_id) + "_" + std::to_string(inlier_count) + "_inliers.png";
-cv::imwrite(debug_image_path, combined_image);
+                // Display the matched keypoints and the inliers for debugging
+                cv::Mat debug_image_A = eigenToImage(submap_images_[pose_to_submap_id_.back()]);
+                cv::Mat debug_image_B = eigenToImage(submap_images_[submap_id]);
+                cv::cvtColor(debug_image_A, debug_image_A, cv::COLOR_GRAY2BGR);
+                cv::cvtColor(debug_image_B, debug_image_B, cv::COLOR_GRAY2BGR);
+                cv::Mat combined_image;
+                cv::drawMatches(debug_image_A, keypoints1, debug_image_B, keypoints2, good_matches, combined_image, cv::Scalar::all(-1), cv::Scalar::all(-1), inliers);
+                std::string debug_image_path = output_folder_ + "/debug_match_submap_" + std::to_string(pose_to_submap_id_.back()) + "_and_" + std::to_string(submap_id) + "_" + std::to_string(inlier_count) + "_inliers.png";
+                cv::imwrite(debug_image_path, combined_image);
 
             }
             return submap_id_and_coarse_poses;
@@ -1245,6 +1329,7 @@ cv::imwrite(debug_image_path, combined_image);
                     pose_graph_edges.emplace_back(target_timestamp, closest_timestamp, T_target_source);
                     
 
+                    ////////////// Visualization / debugging //////////////
                     // Read both the target and closest scans, transform the closest scan with the estimated transformation and save both for visualization
                     std::vector<Pointd> source_scan = loadPointCloudFromPly(getScanPath(closest_timestamp));
                     if(source_scan.size() == 0)                    {
@@ -1268,11 +1353,28 @@ cv::imwrite(debug_image_path, combined_image);
                     std::string transformed_closest_scan_file = output_folder_ + "/loop_from_submap_" + std::to_string(submap_id) + "_timestamp_" + std::to_string(target_timestamp) + "_inlier_ratio_" + std::to_string(inlier_ratio) + "_closest_transformed.ply";
                     savePointCloudToPly(transformed_closest_scan_file, transformed_closest_scan);
                     RCLCPP_INFO(this->get_logger(), "Saved transformed closest scan to %s", transformed_closest_scan_file.c_str());
+                    ////////////////////////////////////////////////////////
 
 
                 }
             }
             return pose_graph_edges;
+        }
+
+
+        cv::Mat eigenToImage(const MatX& mat)
+        {
+            cv::Mat image(mat.rows(), mat.cols(), CV_64F);
+            for(size_t x = 0; x < mat.rows(); x++)
+            {
+                for(size_t y = 0; y < mat.cols(); y++)
+                {
+                    image.at<double>(x,y) = mat(x,y);
+                }
+            }
+            cv::normalize(image, image, 0, 255, cv::NORM_MINMAX);
+            image.convertTo(image, CV_8U);
+            return image;
         }
 
 };

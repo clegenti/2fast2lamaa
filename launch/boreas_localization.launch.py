@@ -39,8 +39,10 @@ def generate_launch_description():
                 {'loss_function_scale': 0.5},
                 {"state_freq": 200.0},
                 {"max_associations_per_type": 1000},
+                {"planar_only": False},
                 {"minimum_intensity": 2.0},
-                {"broken_channels": "69"},
+                {"mode": "imu"},  # State representation mode: imu (acc and gyr preint), gyr (gyr preint and const vel), no_imu (const linear and angular vel)
+
 
                 # Adapting IMU measurements for some weird IMUs
                 {"acc_in_m_per_s2": True},
@@ -79,12 +81,12 @@ def generate_launch_description():
 
                 {"point_cloud_internal_type": True},
                 {"voxel_size": 0.30},
-                {'loss_function_scale': 1.0},
                 {"neighbourhood_size": 2},
                 {"register": True},
                 {"register_with_approximate_field": False},
-                {"voxel_size_factor_for_registration": 1.0},
+                {"voxel_size_factor_for_registration": 2.0},
                 {"max_num_pts_for_registration": 8000},
+                {'loss_function_scale': 0.5},
                 {"use_temporal_weights": False}, # If true, registration weight are 10 times bigger for voxels associated to the older scans than for the newer ones
                 {"with_init_guess": True},
                 {"map_publish_period": 0.1},

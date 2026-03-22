@@ -606,16 +606,25 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
 
     ceres::Problem::Options pb_options;
     pb_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
-    StateCacheCallback state_cache_callback(state, state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
-    state_cache_callback.PrepareForEvaluation(true, true);
-    pb_options.evaluation_callback = &state_cache_callback;
+    std::unique_ptr<StateCacheCallback> state_cache_callback;
+    if(params_.mode != LidarOdometryMode::NO_IMU)
+    {
+        state_cache_callback = std::make_unique<StateCacheCallback>(state, state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
+        state_cache_callback->PrepareForEvaluation(true, true);
+        pb_options.evaluation_callback = state_cache_callback.get();
+    }
+
+
 
     ceres::Problem problem(pb_options);
     addBlocks(problem, vel_only);
     addLidarResiduals(problem, data_associations, pts, sparse_pts, state);
 
-    ZeroPrior* prior = new ZeroPrior(3, 1.0);
-    problem.AddResidualBlock(prior, NULL, state_blocks_[0].data());
+    if(params_.mode == LidarOdometryMode::IMU)
+    {
+        ZeroPrior* prior = new ZeroPrior(3, 1.0);
+        problem.AddResidualBlock(prior, NULL, state_blocks_[0].data());
+    }
 
     // Solve the problem
     ceres::Solver::Summary summary;

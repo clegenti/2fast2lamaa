@@ -34,11 +34,14 @@ def generate_launch_description():
                 {'min_range': float(min_range)},
                 {'max_range': float(max_range)},
                 {'max_feature_range': float(max_range)},
-                {'feature_voxel_size': 0.5},
+                {'feature_voxel_size': 0.3},
                 {'max_feature_dist': 1.5},
                 {'loss_function_scale': 0.5},
                 {"state_freq": 200.0},
                 {"max_associations_per_type": 1000},
+                {"planar_only": False},
+                {"minimum_intensity": 2.0},
+                {"mode": "imu"},  # State representation mode: imu (acc and gyr preint), gyr (gyr preint and const vel), no_imu (const linear and angular vel)
 
                 # Adapting IMU measurements for some weird IMUs
                 {"acc_in_m_per_s2": True},

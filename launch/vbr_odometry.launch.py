@@ -11,10 +11,7 @@ SetEnvironmentVariable(name='RCUTILS_COLORIZED_OUTPUT', value='1'),
 min_range = float(1.0)
 max_range = float(200.0)
 
-key_framing = True
-key_frame_dist_thr = float(10.0)
-key_frame_rot_thr = float(15.0 * 3.14 / 180.0)
-key_frame_time_thr = float(0.05)
+key_framing = False
 
 over_reject = False # If true, also reject the neighborhood points when performing the dynamic filtering and free space carving.
 
@@ -94,9 +91,6 @@ def generate_launch_description():
                 {"with_init_guess": True},
                 {"map_publish_period": 0.5},
                 {"key_framing": key_framing},
-                {"key_framing_dist_thr": key_frame_dist_thr},
-                {"key_framing_rot_thr": key_frame_rot_thr},
-                {"key_framing_time_thr": key_frame_time_thr},
 
                 # Free space carving (<= 0.0 to disable it)
                 {"min_range": min_range},
@@ -107,7 +101,7 @@ def generate_launch_description():
                 # Path to where the map will be saved
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
-                {"submap_length": 20.0},
+                {"submap_length": 50.0},
                 {"submap_overlap": 0.2},
 
                 {"write_scans": True}

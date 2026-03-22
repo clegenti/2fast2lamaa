@@ -43,7 +43,6 @@ def generate_launch_description():
                 {"max_associations_per_type": 1000},
                 {"planar_only": False},
                 {"minimum_intensity": 2.0},
-                {"broken_channels": "69"},
                 {"mode": "imu"},  # State representation mode: imu (acc and gyr preint), gyr (gyr preint and const vel), no_imu (const linear and angular vel)
 
                 # Adapting IMU measurements for some weird IMUs
