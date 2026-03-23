@@ -233,7 +233,6 @@ class LidarOdometry
 
         // Helper function to print the current state
         void printState();
-        void logState();
 
 
         // Prepare the state blocks for the next optimisation
@@ -265,13 +264,6 @@ class LidarOdometry
 
         void prepareSubmap(const State state, const std::vector<std::shared_ptr<std::vector<Pointd> > > pcs, const std::vector<double> pcs_t, std::vector<Vec3> state_blocks, Vec7 state_calib);
 
-
-        // For DEBUG
-        void visualiseDataAssociation(const std::vector<DataAssociation>& data_association);
-        void visualisePoints(const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts);
-
-        void visualiseRawSubmap();
-        void visualiseSubmap(const State& state);
 
 
 };

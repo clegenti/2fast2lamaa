@@ -507,7 +507,6 @@ void LidarOdometry::optimise()
     publishResults(state);
 
     //printState();
-    logState();
 
     prepareNextState(state);
 
@@ -987,43 +986,6 @@ void LidarOdometry::printState()
         std::cout << "    vel: " << state_blocks_[3].transpose() << std::endl;
     }
 }
-
-void LidarOdometry::logState()
-{
-    std::string log_path = "/home/ced/ros2_ws/install/ffastllamaa/share/ffastllamaa/maps/lidar_odometry_state.csv";
-
-    std::ofstream log_file;
-    if(first_optimisation_)
-    {
-        log_file.open(log_path, std::ios::out);
-    }
-    else
-    {
-        log_file.open(log_path, std::ios::app);
-    }
-    if(!log_file.is_open())
-    {
-        std::cerr << "LidarOdometry::logState: Unable to open log file: " << log_path << std::endl;
-        return;
-    }
-    if(first_optimisation_)
-    {
-        log_file << "time,x,y,z,rx,ry,rz,acc_bias_x,acc_bias_y,acc_bias_z,gyr_bias_x,gyr_bias_y,gyr_bias_z,gravity_x,gravity_y,gravity_z,vel_x,vel_y,vel_z,calib_qw,calib_qx,calib_qy,calib_qz,calib_tx,calib_ty,calib_tz\n";
-    }
-
-    log_file << std::fixed << current_time_ << ","
-                << current_pos_[0] << "," << current_pos_[1] << "," << current_pos_[2] << ","
-                << current_rot_[0] << "," << current_rot_[1] << "," << current_rot_[2] << ","
-                << state_blocks_[0][0] << "," << state_blocks_[0][1] << "," << state_blocks_[0][2] << ","
-                << state_blocks_[1][0] << "," << state_blocks_[1][1] << "," << state_blocks_[1][2] << ","
-                << state_blocks_[2][0] << "," << state_blocks_[2][1] << "," << state_blocks_[2][2] << ","
-                << state_blocks_[3][0] << "," << state_blocks_[3][1] << "," << state_blocks_[3][2] << ","
-                << state_calib_[0] << "," << state_calib_[1] << "," << state_calib_[2] << "," << state_calib_[3] << ","
-                << state_calib_[4] << "," << state_calib_[5] << "," << state_calib_[6] << "\n";
-    log_file.flush();
-    log_file.close();
-}
-
 
 
 

@@ -258,8 +258,6 @@ In that case, the parameter `using_submaps` can be set to `true` to enable topom
 |-----------|------|-------------|
 | __Parameter__ | __Type__ | __Description__ |
 | `voxel_size` | double | Voxel size for the distance field map (meters) |
-| `neighbourhood_size` | int | Number of neighboring cells to consider for distance field computation |
-| `with_init_guess` | bool | Whether to use time-synchronized pose input as initial guess for registration (should be `true` for normal 2fast2lamaa operation) |
 | `map_path` | string | Path to directory for saving/loading map data and trajectory |
 | `min_range` | double | Minimum range of points to consider from sensor (meters) |
 
@@ -271,15 +269,17 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | `localization_only` | bool | `false` | Enable localization-only mode (no map building, requires existing map) |
 | `register` | bool | `true` | Enable scan-to-map registration (if false, uses dead-reckoning from input poses) |
 | `use_temporal_weights` | bool | `false` | Apply temporal weighting to map points for registration (recent points weighted higher) |
-| `register_with_approximate_field` | bool | `false` | Use approximate distance field queries for faster registration (point-to-point, no GP distance field) |
+| `no_gp` | bool | `false` | Use approximate distance field queries for faster registration (point-to-point, no GP distance field) |
 | `loss_function_scale` | double | `0.5` | Scale parameter for robust loss function in registration optimization |
-| `voxel_size_factor_for_registration` | double | `5.0` | Multiplier for `voxel_size` to compute downsampling size for registration |
+| `voxel_size_factor_for_registration` | double | `2.0` | Multiplier for `voxel_size` to compute downsampling size for registration |
 | `max_num_pts_for_registration` | int | `4000` | Maximum number of points to use for scan-to-map registration |
 | `use_edge_field` | bool | `true` | Enable separate edge feature distance field (sometimes it seems to converge faster) |
 | `key_framing` | bool | `false` | Enable key-frame-based map updates (skip scans that don't meet criteria) |
 | `key_framing_dist_thr` | double | `1.0` | Distance threshold for creating new keyframe (meters) |
 | `key_framing_rot_thr` | double | `0.1` | Rotation threshold for creating new keyframe (radians) |
 | `key_framing_time_thr` | double | `1.0` | Time threshold for creating new keyframe (seconds) |
+| `neighbourhood_size` | int | `2` | Number of neighboring cells to consider for distance field computation |
+| `with_init_guess` | bool | `true` | Whether to use time-synchronized pose input as initial guess for registration (should be `true` for normal 2fast2lamaa operation) |
 
 | Mapping and free space carving parameters |  |  |  |
 |---------------------|--|--|--|
@@ -287,13 +287,12 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | `max_range` | double | `1000.0` | Maximum range of points to consider from sensor (meters) |
 | `free_space_carving_radius` | double | `-1.0` | Radius for free space carving (negative value disables carving) |
 | `over_reject` | bool | `false` | Enable aggressive dynamic object removal |
-| `last_scan_carving` | bool | `false` | Carve free space between the current and last scan |
 
 | Topometric mapping/odometry parameters |  |  |  |
 |-----------|------|---------|-------------|
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `submap_length` | double | `-1.0` | Length of each submap along trajectory (meters, negative disables submaps) |
-| `submap_overlap` | double | `0.1` | Overlap ratio between consecutive submaps |
+| `submap_overlap` | double | `0.2` | Overlap ratio between consecutive submaps |
 
 | Localization-specific parameters | | | |
 |-----------|------|---------|-------------|
@@ -315,7 +314,7 @@ The rotation is expressed as a rotation vector (axis-angle representation), same
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `map_publish_period` | double | `1.0` | Period for publishing map point cloud (seconds) |
 | `write_scans` | bool | `false` | Save individual scans to disk in `map_path/scans/` directory |
-| `point_cloud_internal_type` | bool | `false` | Use internal point cloud representation (optimization for specific format). Should be `true` for normal 2fast2lamaa operation. |
+| `point_cloud_internal_type` | bool | `true` | Use internal point cloud representation (optimization for specific format). Should be `true` for normal 2fast2lamaa operation. |
 
 
 
@@ -341,14 +340,6 @@ pip install -r requirements.txt
 
 The executable `map_cleaner` is documented in [doc/map_cleaning.md](doc/map_cleaning.md).
 
-### Offline loop closure and pose graph optimization
-
-The loop closure detection and pose graph optimization can be performed by running the `scripts/loop_closure.py` script as follows:
-```bash
-python loop_closure.py <data_folder>
-```
-The parameters are present at the top of the script and can be modified as needed.
-The pose graph optimization (in c++) is automatically called from the python script (the documentation is in [doc/offline_loop_closure.md](doc/offline_loop_closure.md) if you want to run it separately).
 
 ### Boreas dataset conversion to ROS2 bags
 
@@ -359,9 +350,9 @@ Note that you have the choice of IMU as the old sequences (before 2024) did not 
 
 ## TODOs
 
+- [ ] Document the `pose_graph` node
+- [ ] Add parameter to enforce real-time for the `pose_graph` node
 - [ ] Add script the demonstrate the querying of the distance field service
-- [ ] Clean the printouts
-- [ ] Improve the README/documentation
 - [ ] Implement full offline bundle adjustment after loop closures
 - [ ] Add pose estimation at the frequency of the IMU
 

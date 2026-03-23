@@ -257,7 +257,6 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
         void publishPc(const int64_t t, const std::vector<Pointd>& pc)
         {
             rclcpp::Time new_time(t);
-            RCLCPP_INFO(this->get_logger(), "Publishing point cloud with %zu points at time %f", pc.size(), new_time.seconds());
             sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "lidar", new_time);
             mutex_pc_.lock();
             pc_pub_->publish(pc_msg);
@@ -333,9 +332,6 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
 
         void pcCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc_msg)
         {
-            StopWatch sw;
-            sw.start();
-
             if( ((first_acc_ || first_gyr_) && (mode_ == LidarOdometryMode::IMU)) || (first_gyr_ && (mode_ == LidarOdometryMode::GYR)) )
             {
                 RCLCPP_WARN(this->get_logger(), "Received point cloud before IMU messages, ignoring the point cloud");
@@ -343,10 +339,8 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             }
             auto [incoming_pts, temp_has_intensity, temp_has_channel, is_2d] = pointCloud2MsgToPtsVec<double>(pc_msg, time_field_multiplier_, true, broken_channels_, absolute_time_);
             std::shared_ptr<std::vector<Pointd>> incoming_pts_ptr = std::make_shared<std::vector<Pointd>>(std::move(incoming_pts));
-            std::cout << "Point cloud with " << incoming_pts_ptr->size() << " points received." << std::endl;
             rclcpp::Time header_time(pc_msg->header.stamp);
-            std::cout << "At " << std::fixed << header_time.nanoseconds() << std::endl;
-            std::cout << std::fixed << "First point time: " << incoming_pts_ptr->at(0).t << ", last point time: " << incoming_pts_ptr->at(incoming_pts_ptr->size()-1).t << std::endl;
+            RCLCPP_INFO(this->get_logger(), "Received point cloud with %zu points at time %f", incoming_pts_ptr->size(), header_time.seconds());
 
             
             // Scale the point cloud if needed
@@ -361,9 +355,6 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             }
             lidar_odometry_->setIs2D(is_2d);
             lidar_odometry_->addPc(incoming_pts_ptr, header_time.nanoseconds());
-
-            sw.stop();
-            sw.print("++++++++++++   Lidar callback took: ");
         }
 
         void accCallback(const sensor_msgs::msg::Imu::SharedPtr msg)

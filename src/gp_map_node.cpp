@@ -56,19 +56,16 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             voxel_size_ = readRequiredFieldDouble(this, "voxel_size");
             MapDistFieldOptions options;
             options.cell_size = voxel_size_;
-            downsample_size_ = readFieldDouble(this, "voxel_size_factor_for_registration", 5.0) * voxel_size_;
-            options.neighborhood_size = readRequiredFieldInt(this, "neighbourhood_size");
+            downsample_size_ = readFieldDouble(this, "voxel_size_factor_for_registration", 2.0) * voxel_size_;
+            options.neighborhood_size = readFieldInt(this, "neighbourhood_size",2.0);
 
             register_ = readFieldBool(this, "register", true);
-            bool with_init_guess = readRequiredFieldBool(this, "with_init_guess");
+            bool with_init_guess = readFieldBool(this, "with_init_guess", true);
             with_init_guess_ = with_init_guess;
-            approximate_ = readFieldBool(this, "register_with_approximate_field", false);
-            options.edge_field = readFieldBool(this, "use_edge_field", true);
+            approximate_ = readFieldBool(this, "no_gp", false);
             use_edge_field_ = options.edge_field;
 
-            map_publish_period_ = readFieldDouble(this, "map_publish_period", 1.0);
-
-            options.use_temporal_weights = readFieldBool(this, "use_temporal_weights", false);
+            map_publish_period_ = readFieldDouble(this, "map_publish_period", 0.2);
 
             options.free_space_carving_radius = readFieldDouble(this, "free_space_carving_radius", -1.0);
 
@@ -148,12 +145,9 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
 
-            options.over_reject = readFieldBool(this, "over_reject", false);
-            options.last_scan_carving = readFieldBool(this, "last_scan_carving", false);
+            pc_type_internal_ = readFieldBool(this, "point_cloud_internal_type", true);
 
-            pc_type_internal_ = readFieldBool(this, "point_cloud_internal_type", false);
-
-            loss_scale_ = readFieldDouble(this, "loss_function_scale", 0.5);
+            loss_scale_ = readFieldDouble(this, "loss_function_scale", 5.0*voxel_size_/3.0);
             
             // Write the first line of the trajectory file
             traj_path_ = map_path + "/trajectory.csv";
@@ -190,12 +184,14 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
             // Create the map manager
             double submap_length = readFieldDouble(this, "submap_length", -1.0);
-            double submap_overlap = readFieldDouble(this, "submap_overlap", 0.1);
+            double submap_overlap = readFieldDouble(this, "submap_overlap", 0.2);
             if(!localization_)
             {
                 using_submaps = (submap_length > 0.0);
             }
             RCLCPP_INFO(this->get_logger(), "Using submaps: %s", using_submaps ? "true" : "false");
+
+            options.use_temporal_weights = submap_length <= 0.0; // If not using submaps, use temporal weights by default
             map_ = std::make_shared<SubmapManager>(this, options, localization_, using_submaps, submap_length, submap_overlap, map_path, reverse_path);
 
         }
@@ -244,10 +240,6 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         double key_framing_rot_thr_ = 0.1;
         double key_framing_time_thr_ = 1.0;
 
-        double time_process_pc_sum_ = 0.0;
-        double time_process_pc_square_sum_ = 0.0;
-        int time_process_pc_count_ = 0;
-        double time_process_pc_max_ = 0.0;
 
 
         size_t max_nb_pts_ = 4000;
@@ -310,13 +302,6 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         double key_framing_time_cumulated_ = 0.0;
         double key_framing_dist_cumulated_ = 0.0;
 
-        double DEBUG_query_time_sum_ = 0.0;
-        int DEBUG_query_time_count_ = 0;
-
-        double DEBUG_registration_time_sum_ = 0.0;
-        double DEBUG_registration_max_time_ = 0.0;
-        double DEBUG_registration_square_time_sum_ = 0.0;
-        int DEBUG_registration_time_count_ = 0;
 
         std::unique_ptr<std::thread> map_publish_thread_;
 
@@ -340,10 +325,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             sw.start();
             std::vector<double> dists = map_->queryDistField(query_pts);
             double temp_time = sw.stop();
-            DEBUG_query_time_sum_ += temp_time;
             map_mutex_.unlock();
-            DEBUG_query_time_count_ += request->num_pts;
-            RCLCPP_INFO(this->get_logger(), "Average query time per point (API): %f", DEBUG_query_time_sum_/DEBUG_query_time_count_);
             RCLCPP_INFO(this->get_logger(), "Query time (API) with %d points: %f ms", request->num_pts, temp_time);
             for(double dist: dists)
             {
@@ -390,12 +372,8 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             {
                 // First convert the point cloud message to a vector of points
                 auto [pts, is_2d] = getPcFromMsg(msg);
-                StopWatch sw;
-                sw.start();
                 int original_pts_size = pts.size();
                 pts = filterPointsDensity(pts, voxel_size_);
-                sw.stop();
-                sw.print("Time to filter points by density (pts before: " + std::to_string(original_pts_size) + ", pts after: " + std::to_string(pts.size()) + "): ");
 
                 if(is_2d)
                 {
@@ -447,18 +425,8 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     publishOdomMapCorrection(time, trans);
 
 
-                    ///// DEBUG LOGGING /////
                     double temp_time = sw2.stop();
-                    DEBUG_registration_time_sum_ += temp_time;
-                    DEBUG_registration_square_time_sum_ += temp_time * temp_time;
-                    DEBUG_registration_max_time_ = std::max(DEBUG_registration_max_time_, temp_time);
-                    DEBUG_registration_time_count_++;
-                    RCLCPP_INFO(this->get_logger(), "Registration time: %f ms, avg: %f ms, stddev: %f ms, max: %f ms",
-                                temp_time,
-                                DEBUG_registration_time_sum_ / DEBUG_registration_time_count_,
-                                std::sqrt((DEBUG_registration_square_time_sum_ / DEBUG_registration_time_count_) - std::pow(DEBUG_registration_time_sum_ / DEBUG_registration_time_count_, 2)),
-                                DEBUG_registration_max_time_);
-                    ///// END DEBUG LOGGING /////
+                    RCLCPP_INFO(this->get_logger(), "Registration time: %f ms", temp_time);
 
                 }
                 else
@@ -470,8 +438,6 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
                 map_mutex_.lock();
-                sw2.reset();
-                sw2.start();
                 if(!localization_ && add_to_map)
                 {
                     map_->addPts(pts, current_pose_, getTimeNs(time));
@@ -479,8 +445,6 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 map_mutex_.unlock();
 
 
-                double temp_time = sw2.stop();
-                RCLCPP_INFO(this->get_logger(), "Time to add points to map: %f ms", temp_time);
                 counter_++;
                 last_pc_epoch_time_ = std::chrono::high_resolution_clock::now();
             }
@@ -492,15 +456,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
             double time_ms = sw.stop();
-            time_process_pc_sum_ += time_ms;
-            time_process_pc_square_sum_ += time_ms * time_ms;
-            time_process_pc_count_++;
-            time_process_pc_max_ = std::max(time_process_pc_max_, time_ms);
-            RCLCPP_INFO(this->get_logger(), "Total time to process point cloud: %f ms, avg: %f ms, stddev: %f ms, max: %f ms",
-                        time_ms,
-                        time_process_pc_sum_ / time_process_pc_count_,
-                        std::sqrt((time_process_pc_square_sum_ / time_process_pc_count_) - std::pow(time_process_pc_sum_ / time_process_pc_count_, 2)),
-                        time_process_pc_max_);
+            RCLCPP_INFO(this->get_logger(), "Total time to process point cloud: %f ms", time_ms);
 
 
 
@@ -679,7 +635,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                                 << rot_vec(2)
                                 << std::endl; // Write the current pose to the trajectory file
                 trajectory_file.close();
-                RCLCPP_INFO(this->get_logger(), "Updated trajectory file: %s", path.c_str());
+                RCLCPP_INFO(this->get_logger(), "Updated traj file: %s", path.c_str());
             }
             else
             {

@@ -99,7 +99,6 @@ int main(int argc, char** argv)
         options.cell_size = result["voxel_size"].as<double>();
         options.free_space_carving = true;
         options.free_space_carving_radius = carving_radius;
-        options.last_scan_carving = false;
         options.min_range = 0.0;
         options.max_range = std::numeric_limits<double>::max();
 

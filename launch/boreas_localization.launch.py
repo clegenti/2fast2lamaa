@@ -75,27 +75,17 @@ def generate_launch_description():
                 {"init_pose_ry": 0.0},
                 {"init_pose_rz": 0.0},
 
-                {"point_cloud_internal_type": True},
                 {"voxel_size": float(voxel_size)},
-                {"neighbourhood_size": 2},
-                {"register": True},
-                {"register_with_approximate_field": False},
-                {"voxel_size_factor_for_registration": 2.0},
                 {"max_num_pts_for_registration": 8000},
-                {'loss_function_scale': 0.5},
-                {"use_temporal_weights": False}, # If true, registration weight are 10 times bigger for voxels associated to the older scans than for the newer ones
-                {"with_init_guess": True},
-                {"map_publish_period": 0.1},
+                
                 {"key_framing": key_framing},
                 {"key_framing_dist_thr": key_frame_dist_thr},
                 {"key_framing_rot_thr": key_frame_rot_thr},
                 {"key_framing_time_thr": key_frame_time_thr},
 
+                {"min_range": float(min_range)},
                 # Free space carving (<= 0.0 to disable it)
-                {"min_range": 0.0},
                 {"free_space_carving_radius": float(-50)},
-                {"over_reject": False},
-                {"last_scan_carving": False},
 
                 # Path to where the map will be saved
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},

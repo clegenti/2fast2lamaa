@@ -558,7 +558,7 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-    std::cout << summary.BriefReport() << std::endl;
+    //std::cout << summary.BriefReport() << std::endl;
 
 
     Mat3 R = expMap(pose_correction_state.segment<3>(3));
@@ -743,12 +743,6 @@ std::vector<Vec3> MapDistField::getNeighborPoints(const Vec3& pt, const double r
         neighbors.push_back(it->second->getPt());
     }
 
-    //PhNeighborQuery query;
-    //phtree_.for_each(query, improbable::phtree::FilterSphere({pt[0], pt[1], pt[2]}, radius, phtree_.converter()));
-    //for(auto& neighbor : query.neighbors)
-    //{
-    //    neighbors.push_back(neighbor.second->getPt());
-    //}
     return neighbors;
 }
 
@@ -770,7 +764,6 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     }
 
     scan_counter_++;
-    StopWatch sw;
 
     if(prev_scan_.size() > 0)
     {
@@ -783,12 +776,7 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     // Check if free space carving is enabled
     if(opt_.free_space_carving && count.size() == 0 && scan_counter_ > 0)
     {
-        sw.start();
-
         pts_to_add = freeSpaceCarving(pts, pose);
-
-        sw.stop();
-        sw.print("Time to remove points for carving");
 
     }
     else
@@ -799,9 +787,6 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     prev_scan_ = pts;
     prev_pose_ = pose;
 
-
-    sw.reset();
-    sw.start();
 
     // Project the points to the map frame
     double min_point_time = std::numeric_limits<double>::max();
@@ -866,9 +851,6 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
         {
             if (hash_map_edge_->count(cell_ptr) == 0)
             {
-                //PointPh edge_point = {temp_pt[0], temp_pt[1], temp_pt[2]};
-                //hash_map_edge_->insert({cell_ptr, edge_point});
-                //phtree_edge_.emplace(edge_point, cell_ptr);
                 hash_map_edge_->insert(cell_ptr);
 
                 PointSimple edge_octree_point = {temp_pt[0], temp_pt[1], temp_pt[2]};
@@ -901,11 +883,6 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
             ioctree_edge_.update(pts_to_add_octree_edge);
         }
     }
-
-
-
-    sw.stop();
-    sw.print("Time to transform and add points");
 }
 
 
@@ -918,7 +895,7 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
     auto [map_pts_to_remove, mask_map_remove] = getFreeSpaceCellsToRemove(pts, map_points, pose, Mat4::Identity());
 
     std::vector<bool> temp_mask_remove;
-    if((prev_scan_.size() > 0) && opt_.last_scan_carving)
+    if((prev_scan_.size() > 0))
     {
         int nb_points_to_remove = map_pts_to_remove.size();
         std::vector<Vec3> current_map_points;
@@ -943,8 +920,6 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
         {
             map_pts_to_remove.insert(pt);
         }
-
-        std::cout << "Number of points to remove from current scan: " << nb_points_to_remove << ", from last scan: " << map_pts_to_remove.size() - nb_points_to_remove << ", total map points: " << num_cells_ << std::endl; 
     }
 
     std::vector<Pointd> pts_to_add;
@@ -968,24 +943,20 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
     // Remove the points from the map
     for(auto& map_index : map_pts_to_remove)
     {
-        //free_space_cells_.insert(map_index);
         // For each cell to remove, also remove the cell from the neighbors
-        //PhNeighborQuery query_to_remove;
         Vec3 map_pt = getCenterPt(map_index);
-        std::vector<PointSimple> neighbors_octree_;
+        std::vector<PointSimple> neighbors_octree;
         std::vector<double> neighbor_dists;
 
-        ioctree_.radiusNeighbors(PointSimple{map_pt[0], map_pt[1], map_pt[2]}, 2*cell_size_, neighbors_octree_, neighbor_dists);
+        // Get the closest neighbor
+        ioctree_.knnNeighbors(PointSimple{map_pt[0], map_pt[1], map_pt[2]}, 1, neighbors_octree, neighbor_dists);
+
 
         bool one = false;
-        for(auto& neighbor_octree : neighbors_octree_)
+        GridIndex grid_index = getGridIndex(neighbors_octree[0]);
+        auto it = hash_map_->find(grid_index);
+        if(it != hash_map_->end())
         {
-            GridIndex grid_index = getGridIndex(neighbor_octree);
-            auto it = hash_map_->find(grid_index);
-            if(it == hash_map_->end())
-            {
-                continue;
-            }
             CellPtr neighbor_cell = it->second;
             if(opt_.edge_field && hash_map_edge_->count(neighbor_cell) > 0)
             {
@@ -993,17 +964,11 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
                 hash_map_edge_->erase(neighbor_cell);
             }
             ioctree_.boxWiseDelete(getCellBox(grid_index), true);
-            GridIndex neighbor_index = getGridIndex(neighbor_octree);
+            GridIndex neighbor_index = getGridIndex(neighbors_octree[0]);
             free_space_cells_.insert(neighbor_index);
             hash_map_->erase(neighbor_index);
             num_cells_--;
             delete neighbor_cell;
-
-            one = true;
-            if((!opt_.over_reject) && one)
-            {
-                break;
-            }
         }
     }
     return pts_to_add;
@@ -1049,7 +1014,6 @@ std::vector<Pointd> MapDistField::getPts()
         pts.push_back(Pointd(pt[0], pt[1], pt[2], count, intensity));
         pts.back().type = (hash_map_edge_ && (hash_map_edge_->count(pair.second) > 0)) ? 2 : 1;
     }
-    std::cout << "Number of cells: " << pts.size() << std::endl;
     return pts;
 }
 

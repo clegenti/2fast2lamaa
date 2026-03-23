@@ -145,10 +145,8 @@ struct MapDistFieldOptions {
     bool use_temporal_weights = false;
     bool free_space_carving = false;
     double free_space_carving_radius = -1.0;
-    bool over_reject = false;
     double min_range = 0.0001;
     double max_range = std::numeric_limits<double>::max();
-    bool last_scan_carving = false;
     bool edge_field = true;
     int num_threads = 8;
     std::string scan_folder = "";

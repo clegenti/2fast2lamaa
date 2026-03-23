@@ -277,7 +277,7 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
             int new_map_id = graph_nodes_[best_node_id].second;
             if(new_map_id != current_map_id_)
             {
-                std::cout << "Switching from submap " << current_map_id_ << " to submap " << new_map_id << "\n\n\n\n\n" << std::endl;
+                std::cout << "Switching from submap " << current_map_id_ << " to submap " << new_map_id << std::endl;
                 current_map_ = std::make_shared<MapDistField>(options_, publisher_);
                 current_map_->setGravity(gravity_);
                 current_map_->loadMap(submap_paths_[new_map_id]);
@@ -305,7 +305,6 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
         Mat3 R_diff = last_registered_pose_.block<3,3>(0,0).transpose() * updated_pose.block<3,3>(0,0);
         double angle_diff = logMap(R_diff).norm();
         path_angle_change_ += angle_diff;
-        std::cout << "Path length: " << path_length_ << ", Path angle change (deg): " << path_angle_change_ * 180.0 / M_PI << std::endl;
     }
     else
     {
@@ -324,23 +323,15 @@ void SubmapManager::addPts(const std::vector<Pointd>& pts, const Mat4& pose, con
     if((options_.scan_folder != "") && (!localization_))
     {
         // Create an anonymous function to save the scan in a separate thread
-        StopWatch sw;
-        sw.start();
         std::string scan_path = options_.scan_folder + "/" + std::to_string(time) + ".ply";
         auto save_scan = [](const std::vector<Pointd>& pts_in, const std::string& scan_path_in)
         {
-            StopWatch sw_in;
-            sw_in.start();
             // Save the scan to the folder
             savePointCloudToPly(scan_path_in, pts_in);
-            sw_in.stop();
-            sw_in.print("Time to save scan :");
         };
         // Launch the save_scan function in a separate thread
         std::thread scan_saving_thread(save_scan, pts, scan_path);
         scan_saving_thread.detach();
-        sw.stop();
-        sw.print("Time to launch scan saving thread: ");
     }
 
     if(localization_)
@@ -473,15 +464,11 @@ void SubmapManager::attemptGravityBiasInit()
         }
 
         ceres::Solver::Options options;
-        options.minimizer_progress_to_stdout = true;
+        options.minimizer_progress_to_stdout = false;
         options.max_num_iterations = 100;
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        std::cout << summary.FullReport() << std::endl;
-
-        std::cout << "\n\n\n\n\n\n\n\n\n\n\n\n\nOptimized gravity: " << gravity_.transpose() << std::endl;
-        std::cout << "Optimized bias acc: " << bias_acc_.transpose() << std::endl;
-        std::cout << "Optimized bias gyr: " << bias_gyr_.transpose() << std::endl;
+        //std::cout << summary.BriefReport() << std::endl;
 
         std::vector<double> gravity_residuals;
         for(size_t i = 1; i < num_poses; i++)
@@ -499,11 +486,9 @@ void SubmapManager::attemptGravityBiasInit()
             double diff_angle = std::acos(global_g.dot(gravity_) / (global_g.norm() * gravity_.norm()));
             gravity_residuals.push_back(diff_angle);
             
-            std::cout << "Local gravity diff: " << (local_g - gravity_).norm() << "  diff angle (deg): " << diff_angle * 180.0 / M_PI << std::endl;
         }
         double sq_sum = std::inner_product(gravity_residuals.begin(), gravity_residuals.end(), gravity_residuals.begin(), 0.0);
         gravity_angle_std_ = std::sqrt(sq_sum / gravity_residuals.size());
-        std::cout << "Zero-mean Gravity residuals stdev (deg): " << gravity_angle_std_ * 180.0 / M_PI << std::endl;
 
         // Clean the data used to initialize the gravity and biases
         cleanBodyVelocities();
@@ -611,7 +596,7 @@ void SubmapManager::writeCurrentSubmap()
         traj_path = map_path_ + "trajectory_map.csv";
     }
 
-    std::cout << "Writing trajectory to: " << traj_path << std::endl;            
+    std::cout << "Writing traj to: " << traj_path << std::endl;            
     std::ofstream traj_file(traj_path);
     if(!traj_file)
     {

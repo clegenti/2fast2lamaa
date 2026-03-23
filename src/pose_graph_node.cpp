@@ -148,7 +148,6 @@ class PoseGraphNode: public rclcpp::Node
             map_options_.cell_size = -1.0;
             map_options_.free_space_carving = free_space_carving_radius_ > 0.0;
             map_options_.free_space_carving_radius = free_space_carving_radius_;
-            map_options_.last_scan_carving = false;
             map_options_.min_range = 0.0;
             map_options_.max_range = std::numeric_limits<double>::max();
             map_options_.num_threads = num_threads_;

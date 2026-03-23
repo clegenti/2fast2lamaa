@@ -51,7 +51,6 @@ add_library(lice STATIC
   src/lib/lidar_odometry.cpp
   src/lib/state.cpp
   src/lib/map_distance_field.cpp
-  src/lib/submap_bundle_adjustment.cpp
   src/lib/submap_manager.cpp
 )
 
@@ -72,7 +71,6 @@ add_executable(lidar_scan_odometry src/lidar_odometry_node.cpp)
 add_executable(gp_map src/gp_map_node.cpp)
 
 add_executable(map_cleaner src/map_cleaning.cpp)
-add_executable(offline_loop_closure src/offline_loop_closure.cpp)
 
 add_executable(lidar_2d_conversion src/2d_lidar_conversion_node.cpp)
 
@@ -95,11 +93,6 @@ target_link_libraries(pose_graph
 )
 
 target_link_libraries(map_cleaner
-  Eigen3::Eigen
-  Ceres::ceres
-  lice
-)
-target_link_libraries(offline_loop_closure
   Eigen3::Eigen
   Ceres::ceres
   lice
@@ -149,9 +142,6 @@ ament_target_dependencies(map_cleaner
   Eigen3
   Ceres)
 
-ament_target_dependencies(offline_loop_closure
-  Eigen3
-  Ceres)
 
 ament_target_dependencies(lidar_2d_conversion
   rclcpp
@@ -174,7 +164,7 @@ install(
 
 install(TARGETS
   lice
-  lidar_scan_odometry gp_map map_cleaner offline_loop_closure lidar_2d_conversion pose_graph
+  lidar_scan_odometry gp_map map_cleaner lidar_2d_conversion pose_graph
   DESTINATION lib/${PROJECT_NAME})
 
 

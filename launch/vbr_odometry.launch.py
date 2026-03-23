@@ -14,8 +14,6 @@ voxel_size = float(0.3)
 
 key_framing = False
 
-over_reject = False # If true, also reject the neighborhood points when performing the dynamic filtering and free space carving.
-
 
 def generate_launch_description():
     rviz_file = PathJoinSubstitution(
@@ -69,30 +67,19 @@ def generate_launch_description():
                 ('/twist', '/start_of_scan_twist')
                 ],
             parameters=[
-                {"point_cloud_internal_type": True},
                 {"voxel_size": float(voxel_size)},
-                {"neighbourhood_size": 2},
-                {"register": True},
-                {"register_with_approximate_field": False},
-                {"voxel_size_factor_for_registration": 2.0},
                 {"max_num_pts_for_registration": 2000},
-                {"loss_function_scale": 0.5},
-                {"use_temporal_weights": False}, # If true, registration weight are 10 times bigger for voxels associated to the older scans than for the newer ones
-                {"with_init_guess": True},
-                {"map_publish_period": 0.5},
+
                 {"key_framing": key_framing},
 
-                # Free space carving (<= 0.0 to disable it)
                 {"min_range": float(min_range)},
+                # Free space carving (<= 0.0 to disable it)
                 {"free_space_carving_radius": float(50)},
-                {"over_reject": over_reject},
-                {"last_scan_carving": True},
 
                 # Path to where the map will be saved
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
                 {"submap_length": float(50.0)},
-                {"submap_overlap": float(0.2)},
 
                 {"write_scans": True}
 
