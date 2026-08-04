@@ -99,6 +99,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 {
                     options.scan_folder += "/";
                 }
+                // Create the map_path if it does not exist
+                if(!folderExists(map_path))
+                {
+                    if(!createFolder(map_path))
+                    {
+                        RCLCPP_ERROR(this->get_logger(), "Could not create folder: %s for map output", map_path.c_str());
+                        throw std::runtime_error("Could not create folder for map output");
+                        return;
+                    }
+                    RCLCPP_INFO(this->get_logger(), "Created folder: %s for map output", map_path.c_str());
+                }
                 options.scan_folder += "scans/";
                 // Create the folder if it does not exist
                 if(folderExists(options.scan_folder))
