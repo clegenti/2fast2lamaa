@@ -481,10 +481,12 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
         void publishPose(const rclcpp::Time& time, const Mat4& trans)
         {
+            // Map-corrected pose of the IMU/body frame (the input point clouds are expressed in
+            // that frame, not in the physical lidar one)
             geometry_msgs::msg::TransformStamped pose_msg;
             pose_msg.header.stamp = time;
             pose_msg.header.frame_id = "map";
-            pose_msg.child_frame_id = "lidar";
+            pose_msg.child_frame_id = "imu";
             pose_msg.transform = mat4ToTransform(trans);
             pose_pub_->publish(pose_msg);
         }
@@ -661,7 +663,8 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         }
         void twistCallback(const geometry_msgs::msg::TwistStamped::ConstSharedPtr msg)
         {
-            if(msg->header.frame_id != "lidar")
+            // Only accept the twist expressed in the IMU/body frame
+            if(msg->header.frame_id != "imu")
             {
                 return;
             }

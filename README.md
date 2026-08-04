@@ -147,15 +147,19 @@ The most important step to run 2Fast-2Lamaa is to provide the correct topic rema
 | `/undistortion_pose` | `geometry_msgs/msg/TransformStamped` | Current pose in odom frame |
 | `/end_of_scan_odom` | `nav_msgs/msg/Odometry` | Full odometry message with pose and twist at end of scan |
 | `/end_of_scan_odom_twist` | `geometry_msgs/msg/TwistStamped` | Velocity estimate at end of scan |
-| `/lidar_scan_undistorted` | `sensor_msgs/msg/PointCloud2` | Motion-compensated point cloud |
-| `/lidar_scan_undistorted_dense` | `sensor_msgs/msg/PointCloud2` | Dense motion-compensated point cloud (only if `dense_pc_output` is enabled) |
+| `/lidar_scan_undistorted` | `sensor_msgs/msg/PointCloud2` | Motion-compensated point cloud, expressed in the `imu` frame at the scan reference time (the extrinsic calibration is applied during the undistortion) |
+| `/lidar_scan_undistorted_dense` | `sensor_msgs/msg/PointCloud2` | Dense motion-compensated point cloud (only if `dense_pc_output` is enabled), same frame as above |
+
+Note that the estimated state is the pose of the IMU/body frame, not the pose of the physical LiDAR.
+The undistorted point clouds and every published pose are therefore expressed in the `imu` frame.
 
 | Published TF Frames | | |
 |--------------|-------------|-------------|
 | __Parent Frame__ | __Child Frame__ | __Description__ |
 | `map` | `odom` | Map to odom correction (if `/odom_map_correction` is received from the `gp_map` node) |
-| `odom` | `lidar` | Current LiDAR pose estimate |
-| `odom` | `lidar_head` | LiDAR head pose with velocity information |
+| `odom` | `imu` | Current IMU/body pose estimate |
+| `odom` | `imu_head` | IMU/body pose at the end of the scan, with velocity information |
+| `imu` | `lidar` | Extrinsic calibration, broadcast once as a static transform (locates the raw LiDAR point clouds) |
 
 
 #### Required Parameters
@@ -169,7 +173,7 @@ The most important step to run 2Fast-2Lamaa is to provide the correct topic rema
 | `calib_ry` | double | Y-component of rotation extrinsic calibration (radians) |
 | `calib_rz` | double | Z-component of rotation extrinsic calibration (radians) |
 
-The extrinsic calibration parameters define the rigid transform from the IMU frame to the LiDAR frame.
+The extrinsic calibration parameters define the pose of the LiDAR expressed in the IMU frame, i.e. the rigid transform that brings points from the LiDAR frame into the IMU frame.
 The rotation is expressed as a rotation vector (axis-angle representation).
 If you have the transform `T_imu_lidar`, that transforms points from the LiDAR frame to the IMU frame as `p_imu = T_imu_lidar * p_lidar`, then the parameters are defined as:
 - `calib_p = T_imu_lidar[0,:3]`

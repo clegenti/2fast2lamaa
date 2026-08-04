@@ -2,6 +2,7 @@
 #include "ros_utils.h"
 #include "lice/utils.h"
 #include "lice/types.h"
+#include "lice/math_utils.h"
 #include "lice/lidar_odometry.h"
 #include <memory>
 
@@ -10,6 +11,7 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/static_transform_broadcaster.h"
 #include "sensor_msgs/msg/imu.hpp"
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
@@ -114,6 +116,21 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             rclcpp::node_interfaces::NodeTopicsInterface::SharedPtr node_topics_handle = this->get_node_topics_interface();
             br_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this, tf2_ros::DynamicBroadcasterQoS(), rclcpp::PublisherOptions());
 
+            // The odometry publishes the pose of the IMU/body frame, broadcast the lidar extrinsic
+            // so that the raw point clouds (which are in the physical lidar frame) can be located
+            static_br_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+            {
+                Vec3 calib_pos, calib_rot;
+                calib_pos << params.calib_px, params.calib_py, params.calib_pz;
+                calib_rot << params.calib_rx, params.calib_ry, params.calib_rz;
+                geometry_msgs::msg::TransformStamped imu_to_lidar;
+                imu_to_lidar.header.stamp = this->now();
+                imu_to_lidar.header.frame_id = "imu";
+                imu_to_lidar.child_frame_id = "lidar";
+                imu_to_lidar.transform = mat4ToTransform(posRotToTransform(calib_pos, calib_rot));
+                static_br_->sendTransform(imu_to_lidar);
+            }
+
             thread_ = lidar_odometry_->runThread();
         }
 
@@ -124,6 +141,9 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
         }
 
 
+        // The estimated state is the pose of the IMU/body frame, the lidar extrinsic is never
+        // composed into it (the "imu" frame is related to the physical lidar by the static
+        // imu -> lidar transform broadcast in the constructor)
         void publishTransform(const int64_t t, const Vec3& pos, const Vec3& rot)
         {
             rclcpp::Time new_time(t);
@@ -132,7 +152,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             geometry_msgs::msg::TransformStamped transformStamped;
             transformStamped.header.stamp = new_time;
             transformStamped.header.frame_id = "odom";
-            transformStamped.child_frame_id = "lidar";
+            transformStamped.child_frame_id = "imu";
             transformStamped.transform.translation.x = pos[0];
             transformStamped.transform.translation.y = pos[1];
             transformStamped.transform.translation.z = pos[2];
@@ -163,6 +183,8 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             global_odom_pub_->publish(transformStamped);
             mutex_br_.unlock();
         }
+        // Pose and twist of the IMU/body frame at the end of the scan ("imu_head" is the same
+        // physical frame as "imu", only queried at a later timestamp)
         void publishGlobalOdom(const int64_t t, const Vec3& pos, const Vec3& rot, const Vec3& vel, const Vec3& ang_vel)
         {
             rclcpp::Time new_time(t);
@@ -170,7 +192,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             nav_msgs::msg::Odometry odom_msg;
             odom_msg.header.stamp = new_time;
             odom_msg.header.frame_id = "odom";
-            odom_msg.child_frame_id = "lidar_head";
+            odom_msg.child_frame_id = "imu_head";
             odom_msg.pose.pose.position.x = pos[0];
             odom_msg.pose.pose.position.y = pos[1];
             odom_msg.pose.pose.position.z = pos[2];
@@ -213,7 +235,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             twist_msg.twist.angular.z = ang_vel[2];
 
             twist_msg.header.stamp = new_time;
-            twist_msg.header.frame_id = "lidar_head";
+            twist_msg.header.frame_id = "imu_head";
 
             odom_twist_pub_->publish(odom_msg);
             odom_twist_only_pub_->publish(twist_msg);
@@ -222,7 +244,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             geometry_msgs::msg::TransformStamped global_transform;
             global_transform.header.stamp = new_time;
             global_transform.header.frame_id = "odom";
-            global_transform.child_frame_id = "lidar_head";
+            global_transform.child_frame_id = "imu_head";
             global_transform.transform.translation.x = pos[0];
             global_transform.transform.translation.y = pos[1];
             global_transform.transform.translation.z = pos[2];
@@ -238,12 +260,13 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             mutex_br_.unlock();
         }
 
+        // Twist of the IMU/body frame at the beginning of the scan
         void publishTwist(const int64_t t, const Vec3& linear, const Vec3& angular)
         {
             rclcpp::Time new_time(t);
             geometry_msgs::msg::TwistStamped twist_msg;
             twist_msg.header.stamp = new_time;
-            twist_msg.header.frame_id = "lidar";
+            twist_msg.header.frame_id = "imu";
             twist_msg.twist.linear.x = linear[0];
             twist_msg.twist.linear.y = linear[1];
             twist_msg.twist.linear.z = linear[2];
@@ -254,10 +277,12 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             odom_twist_start_pub_->publish(twist_msg);
         }
 
+        // The undistorted points are expressed in the IMU/body frame at the scan reference time:
+        // the lidar extrinsic has already been applied during the undistortion
         void publishPc(const int64_t t, const std::vector<Pointd>& pc)
         {
             rclcpp::Time new_time(t);
-            sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "lidar", new_time);
+            sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "imu", new_time);
             mutex_pc_.lock();
             pc_pub_->publish(pc_msg);
             mutex_pc_.unlock();
@@ -271,7 +296,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
                 return;
             }
             rclcpp::Time new_time(t);
-            sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "lidar", new_time);
+            sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "imu", new_time);
             mutex_pc_.lock();
             pc_dense_pub_->publish(pc_msg);
             mutex_pc_.unlock();
@@ -299,6 +324,7 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
         LidarOdometryMode mode_ = LidarOdometryMode::IMU;
 
         std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
+        std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_br_;
 
         std::mutex mutex_br_;
         std::mutex mutex_pc_;
