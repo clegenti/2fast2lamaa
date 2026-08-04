@@ -136,6 +136,8 @@ class PoseGraphNode: public rclcpp::Node
             loop_pos_std = readFieldDouble(this, "loop_closure_std_pos", 0.15);
             loop_rot_std = readFieldDouble(this, "loop_closure_std_rot", 0.50) * M_PI / 180.0;
 
+            dist_inlier_ratio_threshold_ = readFieldDouble(this, "dist_inlier_ratio_threshold", 0.85);
+
             se3_manifold_ = new ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>();
 
             
@@ -175,6 +177,7 @@ class PoseGraphNode: public rclcpp::Node
         double loop_rot_std = 0.50 * M_PI / 180.0;
         double min_dist_for_carving_ = 4.0;
         int num_threads_ = 4;
+        double dist_inlier_ratio_threshold_ = 0.85;
 
         ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>* se3_manifold_;
 
@@ -904,7 +907,7 @@ class PoseGraphNode: public rclcpp::Node
                 }
                 double inlier_ratio = static_cast<double>(inlier_count) / static_cast<double>(downsampled_scan_i.size());
 
-                if(inlier_ratio < 0.85)
+                if(inlier_ratio < dist_inlier_ratio_threshold_)
                 {
                     RCLCPP_WARN(this->get_logger(), "Low inlier ratio (%f) after fine registration between submap %d and scan at timestamp %ld. Skipping this match.", inlier_ratio, maps_.size() - 1, timestamp_i);
                     continue;

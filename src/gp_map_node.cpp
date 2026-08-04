@@ -109,6 +109,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 if(!createFolder(options.scan_folder))
                 {
                     RCLCPP_ERROR(this->get_logger(), "Could not create folder: %s for scan output", options.scan_folder.c_str());
+                    throw std::runtime_error("Could not create folder for scan output");
                     return;
                 }
                 RCLCPP_INFO(this->get_logger(), "Created folder: %s for scan output", options.scan_folder.c_str());
