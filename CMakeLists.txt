@@ -76,6 +76,8 @@ add_executable(lidar_2d_conversion src/2d_lidar_conversion_node.cpp)
 
 add_executable(pose_graph src/pose_graph_node.cpp)
 
+add_executable(wheel_gyro_odometry src/wheel_gyro_odometry_node.cpp)
+
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 target_link_libraries(lidar_scan_odometry
@@ -99,6 +101,10 @@ target_link_libraries(map_cleaner
 )
 target_link_libraries(lidar_2d_conversion
   Eigen3::Eigen
+)
+
+target_link_libraries(wheel_gyro_odometry
+  lice
 )
 
 
@@ -149,6 +155,16 @@ ament_target_dependencies(lidar_2d_conversion
   Eigen3
 ) 
 
+ament_target_dependencies(wheel_gyro_odometry
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  Eigen3
+)
+
 include_directories(
   include
   external_lib
@@ -164,7 +180,7 @@ install(
 
 install(TARGETS
   lice
-  lidar_scan_odometry gp_map map_cleaner lidar_2d_conversion pose_graph
+  lidar_scan_odometry gp_map map_cleaner lidar_2d_conversion pose_graph wheel_gyro_odometry
   DESTINATION lib/${PROJECT_NAME})
 
 

@@ -5,8 +5,10 @@ import numpy as np
 from sensor_msgs.msg import Imu
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
+from sensor_msgs.msg import JointState
 from rclpy.serialization import serialize_message
 from rclpy.serialization import deserialize_message
+from boreas_encoder_to_ros2bag import writeEncoderToBag, getLidarTimeSpan, kTimeMargin
 
 def main():
     path = "boreas-2024-12-03-12-54"
@@ -28,6 +30,7 @@ def processBags(path, imu):
     # Create the topics in the bag writer
     bag_writer.create_topic(rosbag2_py.TopicMetadata(id=0, name="/velodyne_points", type="sensor_msgs/msg/PointCloud2", serialization_format="cdr"))
     bag_writer.create_topic(rosbag2_py.TopicMetadata(id=1, name="/imu/data", type="sensor_msgs/msg/Imu", serialization_format="cdr"))
+    bag_writer.create_topic(rosbag2_py.TopicMetadata(id=2, name="/wheel_encoder", type="sensor_msgs/msg/JointState", serialization_format="cdr"))
 
 
     # Load the IMU data from the applanix/imu.txt file
@@ -132,6 +135,11 @@ def processBags(path, imu):
         msg.linear_acceleration.z = imu_data[i][5]
         # Write the message to the bag
         bag_writer.write("/imu/data", serialize_message(msg), imu_time[i])
+
+
+    # Write the wheel encoder data to the bag
+    lidar_start_time, lidar_end_time = getLidarTimeSpan(path)
+    writeEncoderToBag(bag_writer, path, lidar_start_time - kTimeMargin, lidar_end_time + kTimeMargin)
 
 
     for i, lidar_file in enumerate(lidar_files):
