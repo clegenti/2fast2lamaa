@@ -9,6 +9,7 @@
 #include "lice/state.h"
 #include "ankerl/unordered_dense.h"
 #include "lice/pointcloud_utils.h"
+#include "lice/lidar_feature_extraction.h"
 
 
 #include <ceres/ceres.h>
@@ -56,6 +57,21 @@ struct LidarOdometryParams
 
     LidarOdometryMode mode = LidarOdometryMode::IMU;
 };
+
+
+// Gather the subset of the parameters that the shared feature extraction needs
+inline FeatureExtractionParams toFeatureExtractionParams(const LidarOdometryParams& params, const bool is_2d)
+{
+    FeatureExtractionParams output;
+    output.min_range = params.min_range;
+    output.max_feature_range = params.max_feature_range;
+    output.feature_voxel_size = params.feature_voxel_size;
+    output.intensity_threshold = params.intensity_threshold;
+    output.planar_only = params.planar_only;
+    output.unsorted_pc = params.unsorted_pc;
+    output.is_2d = is_2d;
+    return output;
+}
 
 
 

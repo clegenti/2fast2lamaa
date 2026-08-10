@@ -2,8 +2,10 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch.substitutions import PathJoinSubstitution
+from ament_index_python.packages import get_package_prefix
 
 
+# Localization in a prebuilt map, using the wheel-gyro odometry instead of the lidar-based one.
 # Calibration of the boreas platform (2024 and later sequences, the IMU is the "dmu" one).
 # T_imu_lidar     = inv(T_applanix_dmu) @ T_applanix_lidar
 # T_imu_wheel     = inv(T_applanix_dmu) @ T_applanix_wheel
@@ -15,6 +17,11 @@ wheel_scale = float(0.00052209)
 min_range = float(5.0)
 max_range = float(200.0)
 voxel_size = float(0.3)
+
+key_framing = True
+key_frame_dist_thr = float(10.0)
+key_frame_rot_thr = float(5.0 * 3.14 / 180.0)
+key_frame_time_thr = float(0.5)
 
 
 def generate_launch_description():
@@ -83,13 +90,51 @@ def generate_launch_description():
             ],
             output='screen',
         ),
+        Node(
+            package='ffastllamaa',
+            executable='gp_map',
+            name='gp_map',
+            remappings=[
+                ('/points_input', '/lidar_scan_undistorted'),
+                ('/pose_input', '/undistortion_pose'),
+                ],
+            parameters=[
+                {"localization_only": True},
+                {"init_pose_x": 0.0},
+                {"init_pose_y": 0.0},
+                {"init_pose_z": 0.0},
+                {"init_pose_rx": 0.0},
+                {"init_pose_ry": 0.0},
+                {"init_pose_rz": 0.0},
 
-        Node(package = "tf2_ros", 
+                {"voxel_size": float(voxel_size)},
+                {"max_num_pts_for_registration": 8000},
+
+                {"key_framing": key_framing},
+                {"key_framing_dist_thr": key_frame_dist_thr},
+                {"key_framing_rot_thr": key_frame_rot_thr},
+                {"key_framing_time_thr": key_frame_time_thr},
+
+                {"min_range": float(min_range)},
+                # Free space carving (<= 0.0 to disable it)
+                {"free_space_carving_radius": float(-50)},
+
+                # Path to where the map is loaded from
+                {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
+                {"using_submaps": True},
+                {"reverse_path": False},
+
+                {"write_scans": False}
+            ],
+            output='screen',
+        ),
+
+        Node(package = "tf2_ros",
                        executable = "static_transform_publisher",
                        arguments = ["0", "0", "0", "0", "0", "3.14",  "map", "map_viz"]),
         Node(
-            package='rviz2', 
-            executable='rviz2', 
+            package='rviz2',
+            executable='rviz2',
             name='rviz2',
             output='screen',
             arguments=['-d' , rviz_file],

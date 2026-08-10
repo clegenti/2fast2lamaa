@@ -2,6 +2,7 @@
 #include "ros_utils.h"
 #include "lice/types.h"
 #include "lice/math_utils.h"
+#include "lice/lidar_feature_extraction.h"
 
 #include <memory>
 #include <thread>
@@ -154,9 +155,10 @@ class WheelGyroOdometryNode : public rclcpp::Node
                 T_imu_lidar_ = posRotToTransform(calib_pos, calib_rot);
             }
 
-            // Calibration between the IMU and the wheel encoder (T_wheel_imu, same convention as
-            // the calib_* parameters: pose of the wheel frame in the IMU frame). The wheel frame
-            // is the one the encoder measures the travelled distance along its y axis.
+            // Calibration between the IMU and the wheel encoder (T_wheel_imu: pose of the IMU
+            // frame in the wheel frame, the rotation being given as a rotation vector as for the
+            // calib_* parameters). The wheel frame is the one the encoder measures the travelled
+            // distance along its y axis.
             {
                 Vec3 calib_pos, calib_rot;
                 calib_pos << readRequiredFieldDouble(this, "wheel_calib_px"),
@@ -166,6 +168,7 @@ class WheelGyroOdometryNode : public rclcpp::Node
                              readRequiredFieldDouble(this, "wheel_calib_ry"),
                              readRequiredFieldDouble(this, "wheel_calib_rz");
                 T_wheel_imu_ = posRotToTransform(calib_pos, calib_rot);
+                T_imu_wheel_ = T_wheel_imu_.inverse();
             }
 
             // Initial gyroscope bias in the IMU frame (rad/s)
@@ -192,9 +195,12 @@ class WheelGyroOdometryNode : public rclcpp::Node
             // this prevents the gyroscope noise from being integrated while standing still
             zero_vel_rot_thr_ = readFieldDouble(this, "zero_vel_rot_threshold", 1e-3);
 
-            // The reference python implementation starts with the wheel frame's y axis (the
-            // direction the encoder measures) pointing towards the odom frame's x axis
-            init_yaw_ = readFieldDouble(this, "init_yaw", M_PI/2.0);
+            // Extra rotation of the odom frame around its z axis. It is 0 by default so that the
+            // odom frame is the IMU frame at the first integration step, as in the
+            // lidar_scan_odometry node. Set it to pi/2 to reproduce the reference python
+            // implementation, which started with the wheel frame's y axis (the direction the
+            // encoder measures) along the odom frame's x axis.
+            init_yaw_ = readFieldDouble(this, "init_yaw", 0.0);
 
             undistort_pc_ = readFieldBool(this, "undistort_pc", true);
             time_field_multiplier_ = readFieldDouble(this, "point_time_multiplier", 1e-9);
@@ -207,14 +213,34 @@ class WheelGyroOdometryNode : public rclcpp::Node
             sensor_buffer_time_ = readFieldDouble(this, "sensor_buffer_time", 2.0);
             max_pc_wait_time_ = readFieldDouble(this, "max_pc_wait_time", 2.0);
 
+            // Feature extraction / downsampling of the raw point clouds, applied before the
+            // undistortion so that the output of this node matches the one of the
+            // lidar_scan_odometry node (the parameter names are the ones of that node)
+            extract_features_ = readFieldBool(this, "extract_features", true);
+            feature_params_.min_range = readFieldDouble(this, "min_range", 1.0);
+            // As in the lidar_scan_odometry node, max_range is only used as the default of
+            // max_feature_range, the extraction itself does not use it
+            const double max_range = readFieldDouble(this, "max_range", 150.0);
+            feature_params_.max_feature_range = readFieldDouble(this, "max_feature_range", max_range);
+            feature_params_.feature_voxel_size = readFieldDouble(this, "feature_voxel_size", 0.3);
+            feature_params_.planar_only = readFieldBool(this, "planar_only", false);
+            feature_params_.intensity_threshold = readFieldDouble(this, "minimum_intensity", -1.0);
+            feature_params_.unsorted_pc = readFieldBool(this, "unsorted_pc", false);
+            dense_pc_output_ = readFieldBool(this, "dense_pc_output", false);
+
             odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/wheel_gyro_odom", 100);
             global_odom_pub_ = this->create_publisher<geometry_msgs::msg::TransformStamped>("/undistortion_pose", 10);
             odom_twist_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/end_of_scan_odom", 10);
             pc_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_scan_undistorted", 10);
+            if(dense_pc_output_)
+            {
+                pc_dense_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_scan_undistorted_dense", 10);
+            }
 
             encoder_sub_ = this->create_subscription<sensor_msgs::msg::JointState>("/wheel_encoder", 500, std::bind(&WheelGyroOdometryNode::encoderCallback, this, std::placeholders::_1));
             gyr_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/imu/gyr", 500, std::bind(&WheelGyroOdometryNode::gyrCallback, this, std::placeholders::_1));
             lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("/lidar_raw_points", 100, std::bind(&WheelGyroOdometryNode::pcCallback, this, std::placeholders::_1));
+            odom_map_correction_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>("/odom_map_correction", 10, std::bind(&WheelGyroOdometryNode::odomMapCorrectionCallback, this, std::placeholders::_1));
 
             br_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this, tf2_ros::DynamicBroadcasterQoS(), rclcpp::PublisherOptions());
 
@@ -311,10 +337,19 @@ class WheelGyroOdometryNode : public rclcpp::Node
             this->integrateOdometry();
         }
 
+        void odomMapCorrectionCallback(const geometry_msgs::msg::TransformStamped::SharedPtr msg)
+        {
+            br_mutex_.lock();
+            // Save the correction
+            odom_map_correction_msg_ = msg;
+            br_mutex_.unlock();
+        }
+
         void pcCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
         {
             if(!undistort_pc_)
             {
+                // Raw relay, neither undistortion nor feature extraction is applied
                 pc_pub_->publish(*msg);
                 return;
             }
@@ -348,8 +383,13 @@ class WheelGyroOdometryNode : public rclcpp::Node
                 }
                 odom_initialised_ = true;
                 current_time_ = t_start;
-                pos_ = Vec3::Zero();
-                rot_ = expMap(Vec3(0.0, 0.0, init_yaw_));
+                // The odom frame is the IMU frame at the first integration step, as in the
+                // lidar_scan_odometry node. The state being the pose of the wheel frame, it is
+                // initialised at T_imu_wheel so that the first published IMU pose is the identity.
+                // `init_yaw` rotates the odom frame on top of that.
+                const Mat4 T_odom_wheel_init = posRotToTransform(Vec3::Zero(), Vec3(0.0, 0.0, init_yaw_)) * T_imu_wheel_;
+                pos_ = T_odom_wheel_init.block<3, 1>(0, 3);
+                rot_ = T_odom_wheel_init.block<3, 3>(0, 0);
                 this->pushOdom(current_time_, Vec3::Zero(), Vec3::Zero());
             }
 
@@ -407,10 +447,6 @@ class WheelGyroOdometryNode : public rclcpp::Node
                 rot_ = rot_ * expMap(ang);
 
                 this->pushOdom(next_time, Vec3(0.0, dist/dt, 0.0), ang_vel_wheel);
-                if(dist != 0.0)
-                {
-                    RCLCPP_INFO(this->get_logger(), "Travelled distance from start: %.3f m", total_travelled_distance_);
-                }
                 current_time_ = next_time;
             }
 
@@ -585,8 +621,8 @@ class WheelGyroOdometryNode : public rclcpp::Node
                 }
 
                 std::vector<Pointd> pts;
-                bool rubish0, rubish1, is_2d;
-                std::tie(pts, rubish0, rubish1, is_2d) = pointCloud2MsgToPtsVec<double>(pc_msg, time_field_multiplier_, true, {}, absolute_time_);
+                bool rubish0, has_channel, is_2d;
+                std::tie(pts, rubish0, has_channel, is_2d) = pointCloud2MsgToPtsVec<double>(pc_msg, time_field_multiplier_, true, {}, absolute_time_);
                 if(pts.size() < 1)
                 {
                     continue;
@@ -600,6 +636,15 @@ class WheelGyroOdometryNode : public rclcpp::Node
                     t_max = std::max(t_max, pt.t);
                 }
 
+                // The scan is undistorted in the IMU frame at the timestamp of the message, which
+                // is the beginning of the scan. This is the same reference as the one used by the
+                // lidar_scan_odometry node (the header timestamp of the point cloud chunk).
+                const int64_t t_ref = rclcpp::Time(pc_msg->header.stamp).nanoseconds();
+                // The odometry has to cover the reference time as well as all the points (with
+                // `absolute_time`, the message timestamp is not necessarily in the points' span)
+                const int64_t t_cover_min = std::min(t_ref, t_min);
+                const int64_t t_cover_max = std::max(t_ref, t_max);
+
                 // Wait for the odometry (integrated in the subscription callbacks) to cover the scan
                 PcStatus status = PcStatus::WAITING;
                 std::vector<OdomSample> odom_window;
@@ -608,13 +653,13 @@ class WheelGyroOdometryNode : public rclcpp::Node
                     ++num_pc_waiting_;
                     odom_cv_.wait_for(lock, std::chrono::duration<double>(max_pc_wait_time_),
                         [&](){
-                            status = this->pcStatus(t_min, t_max);
+                            status = this->pcStatus(t_cover_min, t_cover_max);
                             return !running_.load() || (status != PcStatus::WAITING);
                         });
                     --num_pc_waiting_;
                     if(status == PcStatus::READY)
                     {
-                        this->getOdomWindow(t_min, t_max, odom_window);
+                        this->getOdomWindow(t_cover_min, t_cover_max, odom_window);
                     }
                 }
                 if(!running_.load())
@@ -628,50 +673,108 @@ class WheelGyroOdometryNode : public rclcpp::Node
                     continue;
                 }
 
-                // The points are undistorted in the IMU frame at the end of the scan, as done by
-                // the lidar_scan_odometry node
+                // Extract the features before the undistortion, the edge detection relies on the
+                // per-channel scanline ordering and on the ranges as measured by the sensor.
+                // The time span is left as computed on the raw cloud, the features are a subset of it.
+                std::vector<Pointd> features;
+                bool has_features = false;
+                if(extract_features_)
+                {
+                    if(!has_channel && !is_2d)
+                    {
+                        // Without channels the whole cloud would be considered as a single scanline
+                        if(!channel_warning_)
+                        {
+                            channel_warning_ = true;
+                            RCLCPP_WARN(this->get_logger(), "The point clouds do not have a channel/ring field, publishing them without feature extraction");
+                        }
+                    }
+                    else
+                    {
+                        FeatureExtractionParams feature_params = feature_params_;
+                        feature_params.is_2d = is_2d;
+                        try
+                        {
+                            has_features = extractLidarFeatures(pts, feature_params, median_dt_, features);
+                        }
+                        catch(const std::exception& e)
+                        {
+                            RCLCPP_ERROR(this->get_logger(), "Feature extraction failed, publishing the raw scan: %s", e.what());
+                            has_features = false;
+                        }
+                        if(!has_features)
+                        {
+                            RCLCPP_WARN(this->get_logger(), "Could not extract any feature from a point cloud, publishing the raw scan");
+                        }
+                    }
+                }
+
+                // Pose of the IMU frame at the reference time of the scan
                 Vec3 pos_ref = Vec3::Zero();
                 Mat3 rot_ref = Mat3::Identity();
-                if(!interpolateOdom(odom_window, t_max, pos_ref, rot_ref))
+                if(!interpolateOdom(odom_window, t_ref, pos_ref, rot_ref))
                 {
                     RCLCPP_WARN(this->get_logger(), "Dropping a point cloud: could not interpolate the reference pose");
                     continue;
                 }
-                const Mat3 rot_ref_inv = rot_ref.transpose();
-                const Mat3 R_imu_lidar = T_imu_lidar_.block<3, 3>(0, 0);
-                const Vec3 p_imu_lidar = T_imu_lidar_.block<3, 1>(0, 3);
-
-                std::vector<Pointd> pts_corrected;
-                pts_corrected.reserve(pts.size());
-                for(const auto& pt : pts)
+                this->publishPc(t_ref, this->undistortPc(has_features ? features : pts, odom_window, pos_ref, rot_ref));
+                this->publishPose(t_ref, pos_ref, logMap(rot_ref));
+                // The dense cloud is published last so that the second undistortion pass does not
+                // delay the pose (it would be a duplicate of the other topic without features)
+                if(dense_pc_output_ && has_features)
                 {
-                    Vec3 pos_t = Vec3::Zero();
-                    Mat3 rot_t = Mat3::Identity();
-                    if(!interpolateOdom(odom_window, pt.t, pos_t, rot_t))
-                    {
-                        continue;
-                    }
-                    const Vec3 p_imu = R_imu_lidar * pt.vec3() + p_imu_lidar;
-                    const Vec3 p_odom = rot_t * p_imu + pos_t;
-                    const Vec3 p_ref = rot_ref_inv * (p_odom - pos_ref);
-                    pts_corrected.push_back(Pointd(p_ref, pt.t, pt.i, pt.channel, pt.type));
+                    this->publishPcDense(t_ref, this->undistortPc(pts, odom_window, pos_ref, rot_ref));
                 }
-
-                this->publishPc(t_max, pts_corrected);
-                this->publishPose(t_max, pos_ref, logMap(rot_ref));
             }
         }
 
-        // The undistorted points are expressed in the IMU/body frame at the end of the scan: the
-        // lidar extrinsic has already been applied during the undistortion
+        // Bring the points of a scan, given in the lidar frame with their own timestamp, into the
+        // IMU frame at the reference time of the scan
+        std::vector<Pointd> undistortPc(
+                const std::vector<Pointd>& pc
+                , const std::vector<OdomSample>& odom_window
+                , const Vec3& pos_ref
+                , const Mat3& rot_ref) const
+        {
+            const Mat3 rot_ref_inv = rot_ref.transpose();
+            const Mat3 R_imu_lidar = T_imu_lidar_.block<3, 3>(0, 0);
+            const Vec3 p_imu_lidar = T_imu_lidar_.block<3, 1>(0, 3);
+
+            std::vector<Pointd> pts_corrected;
+            pts_corrected.reserve(pc.size());
+            for(const auto& pt : pc)
+            {
+                Vec3 pos_t = Vec3::Zero();
+                Mat3 rot_t = Mat3::Identity();
+                if(!interpolateOdom(odom_window, pt.t, pos_t, rot_t))
+                {
+                    continue;
+                }
+                const Vec3 p_imu = R_imu_lidar * pt.vec3() + p_imu_lidar;
+                const Vec3 p_odom = rot_t * p_imu + pos_t;
+                const Vec3 p_ref = rot_ref_inv * (p_odom - pos_ref);
+                pts_corrected.push_back(Pointd(p_ref, pt.t, pt.i, pt.channel, pt.type));
+            }
+            return pts_corrected;
+        }
+
+        // The undistorted points are expressed in the IMU/body frame at the reference time of the
+        // scan: the lidar extrinsic has already been applied during the undistortion
         void publishPc(const int64_t t, const std::vector<Pointd>& pc)
         {
             sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "imu", rclcpp::Time(t));
             pc_pub_->publish(pc_msg);
         }
 
-        // Pose of the IMU/body frame at the end of the scan ("imu_head" is the same physical frame
-        // as "imu", only taken at the scan reference time)
+        // Same as publishPc, but with all the points of the scan instead of the features only
+        void publishPcDense(const int64_t t, const std::vector<Pointd>& pc)
+        {
+            sensor_msgs::msg::PointCloud2 pc_msg = ptsVecToPointCloud2MsgInternal(pc, "imu", rclcpp::Time(t));
+            pc_dense_pub_->publish(pc_msg);
+        }
+
+        // Pose of the IMU/body frame at the reference time of the scan ("imu_head" is the same
+        // physical frame as "imu", it is only kept to mirror the lidar_scan_odometry node)
         void publishPose(const int64_t t, const Vec3& pos, const Vec3& rot)
         {
             const rclcpp::Time new_time(t);
@@ -693,13 +796,24 @@ class WheelGyroOdometryNode : public rclcpp::Node
 
             if(publish_tf_)
             {
+                // Relay the map to odom correction of the gp_map node (identity as long as none has
+                // been received, which is the case when running the odometry on its own)
+                br_mutex_.lock();
                 geometry_msgs::msg::TransformStamped map_to_odom;
+                if(odom_map_correction_msg_)
+                {
+                    map_to_odom = *odom_map_correction_msg_;
+                }
+                else
+                {
+                    map_to_odom.header.frame_id = "map";
+                    map_to_odom.child_frame_id = "odom";
+                    map_to_odom.transform = mat4ToTransform(Mat4::Identity());
+                }
                 map_to_odom.header.stamp = new_time;
-                map_to_odom.header.frame_id = "map";
-                map_to_odom.child_frame_id = "odom";
-                map_to_odom.transform = mat4ToTransform(Mat4::Identity());
                 br_->sendTransform(map_to_odom);
                 br_->sendTransform(transform_stamped);
+                br_mutex_.unlock();
             }
             global_odom_pub_->publish(transform_stamped);
             odom_twist_pub_->publish(odom_msg);
@@ -726,6 +840,15 @@ class WheelGyroOdometryNode : public rclcpp::Node
         double odom_buffer_time_ = 5.0;
         double sensor_buffer_time_ = 2.0;
         double max_pc_wait_time_ = 2.0;
+
+        // Feature extraction, only used by the undistortion thread (thus no mutex needed).
+        // `median_dt_` caches the median time between two points of a lidar channel, it is only
+        // estimated on the first usable scan (as in the lidar_scan_odometry node).
+        bool extract_features_ = true;
+        bool dense_pc_output_ = false;
+        FeatureExtractionParams feature_params_;
+        int64_t median_dt_ = -1;
+        bool channel_warning_ = false;
 
         // Encoder unwrapping state
         bool has_encoder_ = false;
@@ -758,14 +881,19 @@ class WheelGyroOdometryNode : public rclcpp::Node
         rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr encoder_sub_;
         rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gyr_sub_;
         rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
+        rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr odom_map_correction_sub_;
 
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
         rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr global_odom_pub_;
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_twist_pub_;
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
+        rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_dense_pub_;
 
         std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
         std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_br_;
+
+        std::mutex br_mutex_;
+        geometry_msgs::msg::TransformStamped::SharedPtr odom_map_correction_msg_;
 };
 
 
