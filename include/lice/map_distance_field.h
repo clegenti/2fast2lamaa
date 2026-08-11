@@ -55,7 +55,9 @@ class MapDistField;
 struct AlphaBlock
 {
     VecX alpha;
-    MatX neighbor_pts;
+    // Row-major so that the 3 coordinates of a neighbor are contiguous: they are always read one
+    // neighbor at a time when querying the field
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> neighbor_pts;
 };
 
 class Cell {
@@ -78,7 +80,13 @@ class Cell {
 
         MatX kernelRQ(const MatX& X1, const MatX& X2) const;
         std::tuple<MatX, MatX, MatX, MatX> kernelRQAndDiff(const MatX& X1, const MatX& X2);
-        
+
+        // Evaluate the GP occupancy (and its gradient) at a query point directly from the weights,
+        // without building the kernel matrices
+        double occupancy(const Vec3& pt) const;
+        std::pair<double, Vec3> occupancyAndGrad(const Vec3& pt) const;
+
+
 
         double revertingRQ(const double& x) const;
         std::pair<double, double> revertingRQAndDiff(const double& x) const;

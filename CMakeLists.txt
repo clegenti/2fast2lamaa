@@ -9,7 +9,7 @@ add_subdirectory(external_lib)
 
 # Add C++ 17 support
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mavx -mbmi2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mavx -mbmi2 -mfma -mavx2")
 
 # Set release mode
 set(CMAKE_BUILD_TYPE Release)

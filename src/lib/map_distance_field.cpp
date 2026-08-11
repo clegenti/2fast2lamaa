@@ -316,12 +316,58 @@ void Cell::testKernelAndRevert()
 
 
 
+// Evaluate the GP occupancy at `pt` directly from the weights. Going through kernelRQ would build
+// a 1xN kernel matrix and multiply it by alpha, allocating a temporary per intermediate result.
+double Cell::occupancy(const Vec3& pt) const
+{
+    const GPCellHyperparameters& hp = map_->cell_hyperparameters;
+    const auto& nb = alpha_block_->neighbor_pts;
+    const VecX& alpha = alpha_block_->alpha;
+
+    double occ = 0.0;
+    for(int j = 0; j < nb.rows(); ++j)
+    {
+        const double dx = nb(j,0) - pt[0];
+        const double dy = nb(j,1) - pt[1];
+        const double dz = nb(j,2) - pt[2];
+        const double temp = 1.0 + (dx*dx + dy*dy + dz*dz)*hp.inv_2_beta_l_2;
+        occ += alpha[j]/(temp*temp);
+    }
+    return occ;
+}
+
+// Same as above, also accumulating the gradient of the occupancy. The kernel value and its three
+// derivatives share the squared distance, so they only cost one extra division per neighbor.
+std::pair<double, Vec3> Cell::occupancyAndGrad(const Vec3& pt) const
+{
+    const GPCellHyperparameters& hp = map_->cell_hyperparameters;
+    const auto& nb = alpha_block_->neighbor_pts;
+    const VecX& alpha = alpha_block_->alpha;
+
+    double occ = 0.0;
+    Vec3 occ_grad = Vec3::Zero();
+    for(int j = 0; j < nb.rows(); ++j)
+    {
+        const double dx = nb(j,0) - pt[0];
+        const double dy = nb(j,1) - pt[1];
+        const double dz = nb(j,2) - pt[2];
+        const double temp = 1.0 + (dx*dx + dy*dy + dz*dz)*hp.inv_2_beta_l_2;
+        const double k = 1.0/(temp*temp);
+        const double a = alpha[j];
+        occ += k*a;
+        // d/dpt of the rational quadratic kernel, the sign follows (neighbor - query)
+        const double g = a*(k/temp)*hp.inv_lengthscale2;
+        occ_grad[0] += dx*g;
+        occ_grad[1] += dy*g;
+        occ_grad[2] += dz*g;
+    }
+    return {occ, occ_grad};
+}
+
 double Cell::getDist(const Vec3& pt)
 {
     computeAlpha();
-    MatX k = kernelRQ(pt.transpose(), alpha_block_->neighbor_pts);
-
-    double occ = (k*alpha_block_->alpha)[0];
+    double occ = occupancy(pt);
     if (occ < 0)
     {
         return (pt - getPt()).norm();
@@ -337,13 +383,7 @@ double Cell::getDist(const Vec3& pt)
 std::pair<double, Vec3> Cell::getDistAndGrad(const Vec3& pt)
 {
     computeAlpha();
-    auto [k, k_diff_1, k_diff_2, k_diff_3] = kernelRQAndDiff(pt.transpose(), alpha_block_->neighbor_pts);
-
-    double occ = (k*alpha_block_->alpha)[0];
-    Vec3 occ_grad;
-    occ_grad[0] = (k_diff_1*alpha_block_->alpha)[0];
-    occ_grad[1] = (k_diff_2*alpha_block_->alpha)[0];
-    occ_grad[2] = (k_diff_3*alpha_block_->alpha)[0];
+    auto [occ, occ_grad] = occupancyAndGrad(pt);
     if (occ <= 0)
     {
         Vec3 temp_vec = pt - getPt();
@@ -372,11 +412,7 @@ std::vector<Vec3> Cell::getNormals(const std::vector<Vec3>& pts, bool clean_behi
         Vec3 occ_grad;
         {
             computeAlpha(clean_behind);
-            auto [k, k_diff_1, k_diff_2, k_diff_3] = kernelRQAndDiff(pts[i].transpose(), alpha_block_->neighbor_pts);
-
-            occ_grad[0] = (k_diff_1*alpha_block_->alpha)[0];
-            occ_grad[1] = (k_diff_2*alpha_block_->alpha)[0];
-            occ_grad[2] = (k_diff_3*alpha_block_->alpha)[0];
+            occ_grad = occupancyAndGrad(pts[i]).second;
         }
 
         normals[i] = occ_grad.normalized();
@@ -1149,28 +1185,43 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
         return {dist, grad};
     }
     octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
-    for(size_t i = 0; i < neighbors.size(); i++)
+    if(field && (neighbors.size() == 1))
     {
-        GridIndex index = getGridIndex(neighbors[i]);
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
+        // With a single candidate there is nothing to select: the getDist call below would only
+        // serve to pick the cell that getDistAndGrad is called on anyway, and its result would be
+        // overwritten. This is the case during the registration (registerPts sets num_neighbors_
+        // to 1), where it saves one kernel evaluation per point per solver iteration.
+        auto it = hash_map_->find(getGridIndex(neighbors[0]));
+        if(it != hash_map_->end())
         {
-            continue;
+            best_cell = it->second;
         }
-        CellPtr cell = it->second;
-        double temp_dist;
-        if(field)
+    }
+    else
+    {
+        for(size_t i = 0; i < neighbors.size(); i++)
         {
-            temp_dist = cell->getDist(pt);
-        }
-        else
-        {
-            temp_dist = (pt - cell->getPt()).norm();
-        }
-        if(temp_dist < dist)
-        {
-            dist = temp_dist;
-            best_cell = cell;
+            GridIndex index = getGridIndex(neighbors[i]);
+            auto it = hash_map_->find(index);
+            if(it == hash_map_->end())
+            {
+                continue;
+            }
+            CellPtr cell = it->second;
+            double temp_dist;
+            if(field)
+            {
+                temp_dist = cell->getDist(pt);
+            }
+            else
+            {
+                temp_dist = (pt - cell->getPt()).norm();
+            }
+            if(temp_dist < dist)
+            {
+                dist = temp_dist;
+                best_cell = cell;
+            }
         }
     }
     if(best_cell)
