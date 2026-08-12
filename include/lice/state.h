@@ -17,10 +17,11 @@ class State
         double start_t_;
         LidarOdometryMode mode_ = LidarOdometryMode::IMU;
 
-        std::vector<std::pair<Vec3, Mat3> > cached_state_poses_;
+        std::vector<std::pair<Vec3, Vec3> > cached_state_poses_;
         std::vector<std::array<Mat3,4> > cached_state_jacobians_;
-        std::vector<std::array<Mat3,3> > cached_state_R_shift_bw_;
-        std::vector<std::array<Vec3,3> > cached_delta_r_shift_bw_;
+        std::vector<Mat3> cached_state_dr_dw_;
+        //std::vector<std::array<Mat3,3> > cached_state_R_shift_bw_;
+        //std::vector<std::array<Vec3,3> > cached_delta_r_shift_bw_;
 
         double eps_ = 1e-6;
 
@@ -72,3 +73,6 @@ class State
 
         void computeCache(const Vec3& acc_bias, const Vec3& gyr_bias, const Vec3& gravity, const Vec3& vel);
 };
+
+
+void testState();
