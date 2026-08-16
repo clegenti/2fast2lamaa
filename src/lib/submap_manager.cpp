@@ -344,10 +344,10 @@ void SubmapManager::addPts(const std::vector<Pointd>& pts, const Mat4& pose, con
         throw std::runtime_error("No current map available to add points");
     }
     current_map_->addPts(pts, pose);
-    if(last_registered_time_ >= 0 && time == last_registered_time_)
-    {
-        current_map_poses_.push_back({time, pose});
-    }
+    // The pose is recorded whether or not it comes from a registration: with `register` disabled
+    // the odometry pose is used as is, and gating this on `last_registered_time_` left the submap
+    // trajectories empty (that timestamp is only ever set by SubmapManager::registerPts)
+    current_map_poses_.push_back({time, pose});
     if(using_submaps_)
     {
         if((current_map_->getPathLength() > submap_length_ * (1.0 - submap_overlap_)) && (next_map_ == nullptr))
@@ -604,7 +604,8 @@ void SubmapManager::writeCurrentSubmap()
     }
     // Write the header
     traj_file << "timestamp, x, y, z, r0, r1, r2" << std::endl;
-    // Write the poses
+    // Write the poses after sorting them by timestamp
+    std::sort(current_map_poses_.begin(), current_map_poses_.end(), [](const std::pair<int64_t, Mat4>& a, const std::pair<int64_t, Mat4>& b) { return a.first < b.first; });
     for(const auto& pose : current_map_poses_)
     {
         Mat3 rot_mat = pose.second.block<3,3>(0,0);
