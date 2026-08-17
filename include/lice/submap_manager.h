@@ -13,13 +13,12 @@
 
 
 const double kMinNodeDist = 1.0;
-const int kNumAdjacentNodesToCheck = 20;
 
 
 class SubmapManager
 {
     public:
-        SubmapManager(GpMapPublisher* publisher, const MapDistFieldOptions& options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path=false);
+        SubmapManager(GpMapPublisher* publisher, const MapDistFieldOptions& options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path=false, const double node_search_dist=20.0);
         ~SubmapManager();
 
 
@@ -60,6 +59,9 @@ class SubmapManager
         std::string map_path_;
         bool reverse_path_ = false;
         bool is_2d_ = false;
+        // Distance (in meters, along the path) over which the graph nodes are searched when looking
+        // for the submap to switch to
+        double node_search_dist_ = 20.0;
 
         std::shared_ptr<MapDistField> current_map_ = nullptr;
         std::vector<std::pair<int64_t, Mat4>> current_map_poses_;

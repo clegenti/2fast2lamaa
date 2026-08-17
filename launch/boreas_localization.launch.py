@@ -91,6 +91,8 @@ def generate_launch_description():
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
                 {"using_submaps": True},
                 {"reverse_path": False},
+                # How far ahead along the topometric graph the current node can jump in one scan
+                {"submap_node_search_dist": 20.0},
 
                 {"write_scans": False}
             ],

@@ -303,6 +303,7 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `using_submaps` | bool | `false` | Enable submap-based localization (automatically enabled if `submap_length` > 0 in mapping mode) |
 | `reverse_path` | bool | REQUIRED | Only for topometric localization: whether to traverse submaps in reverse order during localization |
+| `submap_node_search_dist` | double | `20.0` | Only for topometric localization: maximum "jump" allowed in the topometric graph, in meters along the mapped path (see below) |
 | `init_pose_x` | double | `0.0` | Initial X position for localization (meters) |
 | `init_pose_y` | double | `0.0` | Initial Y position for localization (meters) |
 | `init_pose_z` | double | `0.0` | Initial Z position for localization (meters) |
@@ -312,6 +313,14 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 
 The initial pose parameters define the starting pose of the system in the map frame during localization.
 The rotation is expressed as a rotation vector (axis-angle representation), same as for the extrinsic calibration in the `lidar_odometry` node.
+
+During topometric localization, the map is represented as a graph of nodes placed along the mapped trajectory, each one pointing to the submap it belongs to.
+At every registration, the node closest to the current estimate is looked up, and the corresponding submap is loaded if it differs from the current one.
+That lookup does not scan the whole graph: it only walks along the path from the current node, in the direction of travel (or backwards if `reverse_path` is set), and stops after `submap_node_search_dist` meters.
+
+This parameter is therefore the __maximum "jump" the localization can make in the topometric graph in a single scan__.
+It has to be larger than the distance the platform can travel between two registrations, with enough margin to recover when the estimate temporarily drifts ahead of the map, but small enough that the graph cannot latch onto a distant node of a path that comes back close to itself (a loop, a roundabout, or the opposite lane of a divided road).
+The distance is accumulated between consecutive graph nodes, so it follows the mapped path rather than the straight line: a value of 20 meters means 20 meters of driving along the route, not a 20 meter radius.
 
 | Other parameters |  |  |  |
 |-----------|------|---------|-------------|
@@ -351,6 +360,12 @@ The `scripts/boreas_to_ros2bag.py` script can be used to convert the Boreas data
 You can run it as `python boreas_to_ros2bag.py`.
 You need to set the correct paths at the top of the script before running it.
 Note that you have the choice of IMU as the old sequences (before 2024) did not have an IMU independent from the ground truth system. For the newer sequences, you should use `dmu`, and for the older ones, you should use `applanix`.
+
+### Troubleshooting
+
+- If the odometry does not work, check the extrinsic calibration and the topic remapping for the lidar and IMU data. Also check the timestamps of the lidar data: there are multiple parameters to handle different timestamp formats: `point_time_multiplier` and `absolute_time`.
+- If the topometric localization (teach-and-repeat style) does not work, and that your repeat trajectory is not so close to the teach trajectory, you may need to increase the `submap_node_search_dist` parameter to allow the localization to jump further in the topometric graph (if you run into issues, don't hesitate to contact me).
+
 
 ## TODOs
 

@@ -66,7 +66,7 @@ struct GravityBiasCostFunctor
 
 
 
-SubmapManager::SubmapManager(GpMapPublisher* publisher, const MapDistFieldOptions& options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path)
+SubmapManager::SubmapManager(GpMapPublisher* publisher, const MapDistFieldOptions& options, const bool localization, const bool using_submaps, const double submap_length, const double submap_overlap, const std::string& map_path, const bool reverse_path, const double node_search_dist)
     : publisher_(publisher)
     , options_(options)
     , localization_(localization)
@@ -75,6 +75,7 @@ SubmapManager::SubmapManager(GpMapPublisher* publisher, const MapDistFieldOption
     , using_submaps_(using_submaps)
     , map_path_(map_path)
     , reverse_path_(reverse_path)
+    , node_search_dist_(node_search_dist)
 {
     if(submap_length_ > 0.0 && submap_overlap_ >= 1.0)
     {
@@ -259,11 +260,22 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
         Vec3 current_pos = updated_pose.block<3,1>(0,3);
         int best_node_id = current_node_id_;
         double best_dist = (current_pos - graph_nodes_[current_node_id_].first).norm();
-        // Check the next kNumAdjacentNodesToCheck nodes
-        int start = reverse_path_ ? std::max(0, current_node_id_ - kNumAdjacentNodesToCheck) : current_node_id_;
-        int end = reverse_path_ ? current_node_id_ : std::min((int)graph_nodes_.size(), current_node_id_ + kNumAdjacentNodesToCheck);
-        for(int node_id = start; node_id < end; node_id++)
+        // Walk along the path from the current node, in the direction of travel, and stop once
+        // `node_search_dist_` meters have been covered (the distance is accumulated between the
+        // consecutive nodes, so it follows the path rather than the straight line)
+        const int step = reverse_path_ ? -1 : 1;
+        int node_id = current_node_id_;
+        double travelled_dist = 0.0;
+        while(travelled_dist < node_search_dist_)
         {
+            const int next_node_id = node_id + step;
+            if((next_node_id < 0) || (next_node_id >= (int)graph_nodes_.size()))
+            {
+                break;
+            }
+            travelled_dist += (graph_nodes_[next_node_id].first - graph_nodes_[node_id].first).norm();
+            node_id = next_node_id;
+
             double dist = (current_pos - graph_nodes_[node_id].first).norm();
             if(dist < best_dist)
             {

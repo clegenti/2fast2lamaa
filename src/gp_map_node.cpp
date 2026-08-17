@@ -203,8 +203,12 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             }
             RCLCPP_INFO(this->get_logger(), "Using submaps: %s", using_submaps ? "true" : "false");
 
+            // Distance (in meters, along the path) over which the graph nodes are searched to decide
+            // which submap to switch to during localization
+            double submap_node_search_dist = readFieldDouble(this, "submap_node_search_dist", 20.0);
+
             options.use_temporal_weights = submap_length <= 0.0; // If not using submaps, use temporal weights by default
-            map_ = std::make_shared<SubmapManager>(this, options, localization_, using_submaps, submap_length, submap_overlap, map_path, reverse_path);
+            map_ = std::make_shared<SubmapManager>(this, options, localization_, using_submaps, submap_length, submap_overlap, map_path, reverse_path, submap_node_search_dist);
 
         }
 
