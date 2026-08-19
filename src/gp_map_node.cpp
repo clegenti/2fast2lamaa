@@ -460,6 +460,14 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 }
                 map_mutex_.unlock();
 
+                if(localization_)
+                {
+                    // The scans are not added to the map when localizing, but they are still written
+                    // if `write_scans` is set, to inspect their alignment with the map afterwards.
+                    // Outside of the mutex, writeScan only copies the points for the writing thread.
+                    map_->writeScan(pts, getTimeNs(time));
+                }
+
 
                 counter_++;
                 last_pc_epoch_time_ = std::chrono::high_resolution_clock::now();

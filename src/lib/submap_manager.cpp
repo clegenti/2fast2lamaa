@@ -329,22 +329,28 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
 }
 
 
+// Save a scan to disk, in the frame it is given in (the pose of that frame is in the trajectory
+// file). Only meant for inspecting the result afterwards, so it is written in a detached thread.
+void SubmapManager::writeScan(const std::vector<Pointd>& pts, const int64_t time)
+{
+    if(options_.scan_folder == "")
+    {
+        return;
+    }
+    std::string scan_path = options_.scan_folder + "/" + std::to_string(time) + ".ply";
+    auto save_scan = [](const std::vector<Pointd>& pts_in, const std::string& scan_path_in)
+    {
+        savePointCloudToPly(scan_path_in, pts_in);
+    };
+    std::thread scan_saving_thread(save_scan, pts, scan_path);
+    scan_saving_thread.detach();
+}
+
+
 // Add points to the current map (and next map if using submaps)
 void SubmapManager::addPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t time)
 {
-    if((options_.scan_folder != "") && (!localization_))
-    {
-        // Create an anonymous function to save the scan in a separate thread
-        std::string scan_path = options_.scan_folder + "/" + std::to_string(time) + ".ply";
-        auto save_scan = [](const std::vector<Pointd>& pts_in, const std::string& scan_path_in)
-        {
-            // Save the scan to the folder
-            savePointCloudToPly(scan_path_in, pts_in);
-        };
-        // Launch the save_scan function in a separate thread
-        std::thread scan_saving_thread(save_scan, pts, scan_path);
-        scan_saving_thread.detach();
-    }
+    writeScan(pts, time);
 
     if(localization_)
     {

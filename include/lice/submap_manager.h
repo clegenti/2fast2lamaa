@@ -28,6 +28,10 @@ class SubmapManager
         // Add points to the current map (and next map if using submaps)
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t time);
 
+        // Save a scan to the scan folder if one is configured. Called by addPts, and directly by the
+        // node when localizing (the scans are not added to the map in that case).
+        void writeScan(const std::vector<Pointd>& pts, const int64_t time);
+
 
         void addGyrMeasurement(const Vec3& gyr, const int64_t time_ns);
 
