@@ -546,6 +546,15 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
         problem.AddResidualBlock(gravity_factor_cost, nullptr, pose_correction_state.data());
     }
 
+    // Keep the solution close to the pose given as prior (the odometry), instead of only starting
+    // from it. The correction is what is optimised, so the prior is a zero-prior on it.
+    if(opt_.use_odom_prior)
+    {
+        ceres::CostFunction* odom_prior_cost = new ceres::AutoDiffCostFunction<OdomPriorFunctor, 6, 6>(
+                new OdomPriorFunctor(opt_.odom_prior_weight_pos, opt_.odom_prior_weight_rot));
+        problem.AddResidualBlock(odom_prior_cost, nullptr, pose_correction_state.data());
+    }
+
     std::vector<double> weights(pts.size(), 1.0);
     if(opt_.use_temporal_weights)
     {

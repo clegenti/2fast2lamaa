@@ -158,6 +158,12 @@ struct MapDistFieldOptions {
     bool edge_field = true;
     int num_threads = 8;
     std::string scan_folder = "";
+    // Use the odometry pose given to registerPts as a prior and not only as an initial guess: a
+    // residual pulls the pose correction back to zero, with one weight for the translation (1/m) and
+    // one for the rotation (1/rad). The larger the weight, the more the odometry is trusted.
+    bool use_odom_prior = false;
+    double odom_prior_weight_pos = 1.0;
+    double odom_prior_weight_rot = 1.0;
 };
 
 
@@ -295,6 +301,32 @@ class RegistrationCostFunction: public ceres::CostFunction
         std::unique_ptr<ceres::LossFunction> loss_function_;
 
 
+};
+
+// Anchors the registration to the pose given as prior (the odometry): registerPts optimises a
+// correction that is applied on top of that pose, so penalising the correction itself is a prior on
+// the odometry. The translation and the rotation get their own weight, as they are not in the same
+// units, and they are the inverse of the standard deviation the odometry is trusted with.
+struct OdomPriorFunctor {
+    OdomPriorFunctor(const double weight_pos, const double weight_rot)
+    : weight_pos_(weight_pos)
+    , weight_rot_(weight_rot)
+    {
+    }
+
+    template<typename T>
+    bool operator()(const T* const pose_correction, T* residuals) const
+    {
+        for(int i = 0; i < 3; ++i)
+        {
+            residuals[i] = T(weight_pos_) * pose_correction[i];
+            residuals[i+3] = T(weight_rot_) * pose_correction[i+3];
+        }
+        return true;
+    }
+
+    double weight_pos_;
+    double weight_rot_;
 };
 
 struct GravityFactorFunctor {

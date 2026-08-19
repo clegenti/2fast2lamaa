@@ -78,6 +78,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             {
                 options.free_space_carving = true;
             }
+            // Use the input odometry as a prior of the registration and not only as an initial
+            // guess. The weights are the inverse of the standard deviation the odometry is trusted
+            // with, separately for the translation (1/m) and the rotation (1/rad).
+            options.use_odom_prior = readFieldBool(this, "use_odom_prior", false);
+            options.odom_prior_weight_pos = readFieldDouble(this, "odom_prior_weight_pos", 1.0);
+            options.odom_prior_weight_rot = readFieldDouble(this, "odom_prior_weight_rot", 1.0);
+            if(options.use_odom_prior && !with_init_guess)
+            {
+                RCLCPP_WARN(this->get_logger(), "use_odom_prior is set but there is no odometry input (with_init_guess is false): the prior will anchor the registration to the previous pose instead");
+            }
+
             double min_range = readRequiredFieldDouble(this, "min_range");
             options.min_range = min_range;
             options.max_range = readFieldDouble(this, "max_range", 1000.0);
