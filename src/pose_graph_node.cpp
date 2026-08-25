@@ -15,6 +15,10 @@
 
 const float kCapHeight = 0.5; // Maximum height to consider for the submap images
 const double kNeighborRadius = 60.0;
+// Number of direct registration candidates attempted per submap that holds potential matches. Each
+// attempt costs a scan read and three registrations, so only that many are kept per submap, spread
+// over the poses of the submap rather than taken consecutively.
+const int kMaxDirectCandidatesPerSubmap = 5;
 
 
 struct RelativePoseCostFunctor
@@ -820,13 +824,16 @@ class PoseGraphNode: public rclcpp::Node
 
         std::vector<std::pair<int64_t, int64_t> > getDirectRegistrationCandidates()
         {
-            std::vector<std::pair<int64_t, int64_t> > candidates;
+            // The candidates are collected per submap, so that every submap holding potential matches
+            // gets its own attempts instead of them all sharing a single budget: a submap late in the
+            // trajectory would otherwise never be tested when an earlier one has many candidates
+            std::map<int, std::vector<std::pair<int64_t, int64_t> > > candidates_per_submap;
             int current_submap_id = pose_to_submap_id_.back();
             for(int i = 0; (i < pose_to_submap_id_.size()) && (pose_to_submap_id_[i] < (current_submap_id-1)); i++)
             {
                 double min_distance = std::numeric_limits<double>::max();
                 double min_j = -1;
-                for(int j = pose_to_submap_id_.size() - 1; (j > i) && (pose_to_submap_id_[j] == current_submap_id); j--) 
+                for(int j = pose_to_submap_id_.size() - 1; (j > i) && (pose_to_submap_id_[j] == current_submap_id); j--)
                 {
                     // Check if the distance between poses is less than kNeighborRadius/2
                     Vec7 pose_i = *time_and_pose_[times_in_order_[i]];
@@ -840,21 +847,34 @@ class PoseGraphNode: public rclcpp::Node
                 }
                 if(min_j >= 0)
                 {
-                    candidates.emplace_back(times_in_order_[i], times_in_order_[min_j]);
+                    candidates_per_submap[pose_to_submap_id_[i]].emplace_back(times_in_order_[i], times_in_order_[min_j]);
                 }
             }
-            std::cout << "Found " << candidates.size() << " direct registration candidates." << std::endl;
+
+            // Keep kMaxDirectCandidatesPerSubmap candidates per submap, spread over the poses of that
+            // submap so that they cover it rather than clustering at its beginning
+            std::vector<std::pair<int64_t, int64_t> > candidates;
+            for(const auto& [submap_id, submap_candidates] : candidates_per_submap)
+            {
+                size_t num_attempts = std::min(submap_candidates.size(), (size_t)kMaxDirectCandidatesPerSubmap);
+                for(size_t i = 0; i < num_attempts; i++)
+                {
+                    candidates.push_back(submap_candidates[(i*submap_candidates.size())/num_attempts]);
+                }
+                std::cout << "Submap " << submap_id << ": keeping " << num_attempts << " of its " << submap_candidates.size() << " direct registration candidates." << std::endl;
+            }
+            std::cout << "Found " << candidates.size() << " direct registration candidates over " << candidates_per_submap.size() << " submap(s)." << std::endl;
             return candidates;
         }
 
         std::vector<std::tuple<int64_t, int64_t, Mat4> > attemptDirectRegistration(const std::vector<std::pair<int64_t, int64_t> >& candidates)
         {
-            // Attempt only for 5 candidates to save time
-            double num_attempts = std::min((double)candidates.size(), 5.0);
+            // All the candidates are attempted: getDirectRegistrationCandidates already limited them
+            // to kMaxDirectCandidatesPerSubmap per submap
             std::vector<std::tuple<int64_t, int64_t, Mat4> > successful_registrations;
-            for(size_t i = 0; i < num_attempts; i++)
+            for(size_t i = 0; i < candidates.size(); i++)
             {
-                auto [timestamp_i, timestamp_j] = candidates[int(i*candidates.size()/num_attempts)];
+                auto [timestamp_i, timestamp_j] = candidates[i];
                 // Sanity check
                 if(timestamp_i == timestamp_j || time_and_pose_.find(timestamp_i) == time_and_pose_.end() || time_and_pose_.find(timestamp_j) == time_and_pose_.end())
                 {
