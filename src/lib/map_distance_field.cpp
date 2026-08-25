@@ -516,7 +516,59 @@ void MapDistField::calibrateUncertaintyProxy()
     opt_.min_range = save_min_range;
 }
 
-Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor)
+// Numerical floor on the standard deviation of a distance residual (meters). Not a model of the map
+// uncertainty, which is taken as exact: it only keeps the Mahalanobis distance of a point with a
+// vanishing covariance finite.
+const double kMinPointStd = 1e-6;
+// Below that gradient norm the distance field has no usable direction to project the covariance onto
+const double kMinGradNorm = 1e-9;
+
+// Inverse of the standard deviation of the distance residual of each point, obtained by propagating
+// the position covariance of the point through the distance field query.
+//
+// The residual of a point is the scalar distance d(p) to the surface, so a position covariance
+// propagates to first order as var(d) = grad_d^T Sigma_w grad_d, with Sigma_w = R Sigma R^T the
+// covariance in the map frame. The distance field being eikonal, grad_d/||grad_d|| is the surface
+// normal, so this is the covariance projected onto the normal: only the component of the position
+// uncertainty along the normal moves the residual, the component tangent to the surface does not.
+// That is exactly the behaviour wanted for triangulated landmarks, whose uncertainty is large along
+// the viewing ray: a surface seen head-on down-weights the point, a surface seen at grazing incidence
+// barely does.
+//
+// The projection is evaluated once, at the pose given as prior, and held constant over the solve.
+// Ceres scores its steps with a residual-only evaluation of the cost function, which has no gradient
+// available and could not recompute the projection; a scaling that differed between the two kinds of
+// evaluation would make them evaluate different functions and corrupt the trust region.
+std::vector<double> MapDistField::computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field)
+{
+    const Mat3 rot = pose.block<3,3>(0,0);
+    const Vec3 pos = pose.block<3,1>(0,3);
+    std::vector<double> inv_std(pts.size(), 1.0);
+    #pragma omp parallel for num_threads(num_threads_)
+    for(size_t i = 0; i < pts.size(); i++)
+    {
+        const Vec3 grad = queryDistFieldAndGrad(rot*pts[i].vec3() + pos, use_field, pts[i].type).second;
+        const double grad_norm = grad.norm();
+        double variance;
+        if(grad_norm > kMinGradNorm)
+        {
+            // The normal is brought back in the frame of the points, so that the covariance does not
+            // have to be rotated: n^T (R Sigma R^T) n = (R^T n)^T Sigma (R^T n)
+            const Vec3 normal = rot.transpose()*(grad/grad_norm);
+            variance = normal.dot(pts_cov[i]*normal);
+        }
+        else
+        {
+            // No direction to project onto (no cell anywhere near the point): fall back on the
+            // direction agnostic mean variance
+            variance = pts_cov[i].trace()/3.0;
+        }
+        inv_std[i] = 1.0/std::max(std::sqrt(std::max(variance, 0.0)), kMinPointStd);
+    }
+    return inv_std;
+}
+
+Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov)
 {
     if(current_time != last_time_register_)
     {
@@ -586,6 +638,20 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
         }
     }
 
+    // Per-point Mahalanobis scaling of the distance residuals, empty when the covariances are not used
+    std::vector<double> inv_std;
+    if(opt_.use_point_covariances)
+    {
+        if(pts_cov.size() != pts.size())
+        {
+            std::cout << "MapDistField::registerPts: Warning: use_point_covariances is set but the scan carries " << pts_cov.size() << " covariances for " << pts.size() << " points. Registering without them." << std::endl;
+        }
+        else
+        {
+            inv_std = computePointInvStd(pts, pts_cov, pose, !approximate);
+        }
+    }
+
     auto temp_pose = pose;
 
     ceres::Solver::Options options;
@@ -597,7 +663,7 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     // Optimization with openMP in the cost function
     bool use_loss = (loss_scale > 0.0);
-    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_);
+    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_, inv_std);
     problem.AddResidualBlock(cost_function, NULL, pose_correction_state.data());
 
 
@@ -1515,10 +1581,12 @@ void MapDistField::loadMap(const std::string& filename)
 
 
 
-RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads)
+RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads, const std::vector<double>& inv_std)
     : prior_(prior)
     , map_(map)
     , weights_(weights)
+    , inv_std_(inv_std)
+    , use_mahalanobis_(!inv_std.empty() && (inv_std.size() == pts.size()))
     , use_field_(use_field)
     , num_threads_(num_threads)
 {
@@ -1582,13 +1650,19 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
             {
                 Vec3 temp_pt = pts_w.col(i);
                 auto [dist, grad] = map_->queryDistFieldAndGrad(temp_pt, use_field_, type_[i]);
+                // The loss is applied to the mahalanobis distance when the point covariances are
+                // used, and to the euclidean distance otherwise (the scale is then exactly 1.0)
+                const double scale = use_mahalanobis_ ? inv_std_[i] : 1.0;
                 // Apply the loss function
                 std::array<double, 3> temp;
-                loss_function_->Evaluate(dist, temp.data());
+                loss_function_->Evaluate(dist*scale, temp.data());
                 residuals[i] = temp[0] * weights_[i];
 
-                Row3 d_dist_d_rot = -temp[1]*grad.transpose()*R_prior*(toSkewSymMat(pts_corr.col(i)-pos))*J_rot;
-                Row3 d_dist_d_pos = temp[1]*grad.transpose()*R_prior;
+                // The derivative of the loss is taken with respect to the distance, hence the chain
+                // rule through the scaling
+                const double d_loss_d_dist = temp[1]*scale;
+                Row3 d_dist_d_rot = -d_loss_d_dist*grad.transpose()*R_prior*(toSkewSymMat(pts_corr.col(i)-pos))*J_rot;
+                Row3 d_dist_d_pos = d_loss_d_dist*grad.transpose()*R_prior;
 
                 jacobian.block<1,3>(i, 0) = weights_[i] * d_dist_d_pos;
                 jacobian.block<1,3>(i, 3) = weights_[i] * d_dist_d_rot;
@@ -1603,10 +1677,11 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
         #pragma omp parallel for num_threads(num_threads_)
         for(size_t i = 0; i < pts_.size(); i++)
         {
-            residuals[i] = map_->queryDistField(pts_w.col(i), use_field_, type_[i]);
+            const double dist = map_->queryDistField(pts_w.col(i), use_field_, type_[i]);
+            const double scale = use_mahalanobis_ ? inv_std_[i] : 1.0;
             // Apply the loss function
             std::array<double, 3> temp;
-            loss_function_->Evaluate(residuals[i], temp.data());
+            loss_function_->Evaluate(dist*scale, temp.data());
             residuals[i] = temp[0] * weights_[i];
         }
 

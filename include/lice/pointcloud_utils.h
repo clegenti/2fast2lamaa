@@ -18,27 +18,23 @@ inline GridIndex getGridIndex(const PointTemplated<T>& pt, T cell_size)
         static_cast<int>(std::floor(pt.z / cell_size)));
 }
 
+// Indexes of the points kept by the density filter. Split out of filterPointsDensity so that a
+// parallel per-point array (the covariances) can be permuted exactly like the points: the filter both
+// drops points and reorders them.
 template<typename T>
-inline std::vector<PointTemplated<T> > filterPointsDensity(const std::vector<PointTemplated<T> >& input, T cell_size)
+inline std::vector<size_t> filterPointsDensityIndexes(const std::vector<PointTemplated<T> >& input, T cell_size)
 {
-    ankerl::unordered_dense::map<GridIndex, std::vector<PointTemplated<T>>> occupied_cells;
+    ankerl::unordered_dense::map<GridIndex, std::vector<size_t> > occupied_cells;
     occupied_cells.reserve(input.size());
-    for(const auto& pt : input)
+    for(size_t i = 0; i < input.size(); ++i)
     {
-        GridIndex index = getGridIndex(pt, cell_size);
-        if(occupied_cells.find(index) == occupied_cells.end())
-        {
-            occupied_cells[index] = std::vector<PointTemplated<T>>{pt};
-        }
-        else
-        {
-            occupied_cells[index].push_back(pt);
-        }
+        occupied_cells[getGridIndex(input[i], cell_size)].push_back(i);
     }
-    std::vector<PointTemplated<T>> output;
+    std::vector<size_t> output;
+    output.reserve(input.size());
 
     // If the 8 neighboring cells are all occupied, ignore the point in the cell
-    for(const auto& [index, pts] : occupied_cells)
+    for(const auto& [index, indexes] : occupied_cells)
     {
         int num_neighbors = 0;
         for(int dx = -1; dx <= 1; ++dx)
@@ -61,20 +57,60 @@ inline std::vector<PointTemplated<T> > filterPointsDensity(const std::vector<Poi
         }
         if(num_neighbors <= 12)
         {
-            output.insert(output.end(), pts.begin(), pts.end());
+            output.insert(output.end(), indexes.begin(), indexes.end());
         }
     }
     return output;
 }
 
-
 template<typename T>
-inline std::vector<PointTemplated<T>> downsamplePointCloud(const std::vector<PointTemplated<T> >& input, T cell_size, int max_points = -1, bool quadrant_balanced = false)
+inline std::vector<PointTemplated<T> > filterPointsDensity(const std::vector<PointTemplated<T> >& input, T cell_size)
 {
-    std::vector<PointTemplated<T>> output;
-    ankerl::unordered_dense::map<GridIndex, std::pair<Vec3, int>, ankerl::unordered_dense::hash<GridIndex>> grid_map;
-    for(const auto& pt : input)
+    std::vector<size_t> indexes = filterPointsDensityIndexes(input, cell_size);
+    std::vector<PointTemplated<T> > output;
+    output.reserve(indexes.size());
+    for(const size_t index : indexes)
     {
+        output.push_back(input[index]);
+    }
+    return output;
+}
+
+// Same filter, keeping the per-point covariances aligned with the points that are kept
+template<typename T>
+inline std::pair<std::vector<PointTemplated<T> >, std::vector<Mat3> > filterPointsDensity(const std::vector<PointTemplated<T> >& input, const std::vector<Mat3>& covariances, T cell_size)
+{
+    std::vector<size_t> indexes = filterPointsDensityIndexes(input, cell_size);
+    std::vector<PointTemplated<T> > output;
+    std::vector<Mat3> output_covariances;
+    output.reserve(indexes.size());
+    output_covariances.reserve(indexes.size());
+    for(const size_t index : indexes)
+    {
+        output.push_back(input[index]);
+        output_covariances.push_back(covariances[index]);
+    }
+    return {output, output_covariances};
+}
+
+
+// Voxel downsampling of a point cloud, one centroid per occupied voxel.
+// `covariances_in`/`covariances_out`, when given, carry a per-point position covariance through the
+// downsampling. The covariance of a centroid of n independent points is sum(Sigma_i)/n^2, and the
+// covariances follow the points through the point count capping. Both default to nullptr, in which
+// case not a single extra operation is performed.
+template<typename T>
+inline std::vector<PointTemplated<T>> downsamplePointCloud(const std::vector<PointTemplated<T> >& input, T cell_size, int max_points = -1, bool quadrant_balanced = false, const std::vector<Mat3>* covariances_in = nullptr, std::vector<Mat3>* covariances_out = nullptr)
+{
+    const bool with_covariances = (covariances_in != nullptr) && (covariances_out != nullptr);
+    std::vector<PointTemplated<T>> output;
+    std::vector<Mat3> output_covariances;
+    ankerl::unordered_dense::map<GridIndex, std::pair<Vec3, int>, ankerl::unordered_dense::hash<GridIndex>> grid_map;
+    // Kept in its own map so that the voxel accumulator is untouched when no covariance is carried
+    ankerl::unordered_dense::map<GridIndex, Mat3, ankerl::unordered_dense::hash<GridIndex>> covariance_map;
+    for(size_t i = 0; i < input.size(); ++i)
+    {
+        const auto& pt = input[i];
         if(pt.type == kInvalidPoint)
         {
             continue;
@@ -83,110 +119,157 @@ inline std::vector<PointTemplated<T>> downsamplePointCloud(const std::vector<Poi
         if(grid_map.find(index) == grid_map.end())
         {
             grid_map[index] = std::make_pair(pt.vec3d(), 1);
+            if(with_covariances)
+            {
+                covariance_map[index] = (*covariances_in)[i];
+            }
         }
         else
         {
             auto& [sum, count] = grid_map[index];
             sum += pt.vec3d();
             count++;
+            if(with_covariances)
+            {
+                covariance_map[index] += (*covariances_in)[i];
+            }
         }
     }
     output.reserve(grid_map.size());
+    output_covariances.reserve(with_covariances ? grid_map.size() : 0);
     for(const auto& [index, pair] : grid_map)
     {
         const auto& [centroid, count] = pair;
         output.push_back(Pointd(centroid / static_cast<T>(count),0));
+        if(with_covariances)
+        {
+            output_covariances.push_back(covariance_map[index] / (static_cast<double>(count)*static_cast<double>(count)));
+        }
     }
 
     if(max_points > 0 && output.size() > static_cast<size_t>(max_points))
     {
-        
+        // The points are capped through their indexes, so that the covariances can be permuted the
+        // very same way
+        std::vector<size_t> kept_indexes;
         if(quadrant_balanced)
         {
-            std::vector<std::vector<Pointd>> quadrants(4);
-            for(const auto& ptd : output)
+            std::vector<std::vector<size_t>> quadrants(4);
+            for(size_t i = 0; i < output.size(); ++i)
             {
-                Vec3 pt = ptd.vec3();
+                Vec3 pt = output[i].vec3();
                 if(pt[0] >= 0 && pt[1] >= 0)
                 {
-                    quadrants[0].push_back(ptd);
+                    quadrants[0].push_back(i);
                 }
                 else if(pt[0] < 0 && pt[1] >= 0)
                 {
-                    quadrants[1].push_back(ptd);
+                    quadrants[1].push_back(i);
                 }
                 else if(pt[0] < 0 && pt[1] < 0)
                 {
-                    quadrants[2].push_back(ptd);
+                    quadrants[2].push_back(i);
                 }
                 else
                 {
-                    quadrants[3].push_back(ptd);
+                    quadrants[3].push_back(i);
                 }
             }
             // Sort the quadrants by size
-            std::sort(quadrants.begin(), quadrants.end(), [](const std::vector<Pointd>& a, const std::vector<Pointd>& b) {
+            std::sort(quadrants.begin(), quadrants.end(), [](const std::vector<size_t>& a, const std::vector<size_t>& b) {
                 return a.size() < b.size();
             });
-            std::vector<Pointd> temp_pts;
             for(int i = 0; i < 4; ++i)
             {
-                int num_pts_available = (max_points - temp_pts.size()) / (4 - i);
+                int num_pts_available = (max_points - kept_indexes.size()) / (4 - i);
                 if(quadrants[i].size() <= static_cast<size_t>(num_pts_available))
                 {
-                    temp_pts.insert(temp_pts.end(), quadrants[i].begin(), quadrants[i].end());
+                    kept_indexes.insert(kept_indexes.end(), quadrants[i].begin(), quadrants[i].end());
                 }
                 else
                 {
                     std::vector<int> indexes = generateRandomIndexes(0, quadrants[i].size(), num_pts_available);
                     for(int idx: indexes)
                     {
-                        temp_pts.push_back(quadrants[i][idx]);
+                        kept_indexes.push_back(quadrants[i][idx]);
                     }
                 }
             }
-            output = temp_pts;
         }
         else
         {
             std::vector<int> indexes = generateRandomIndexes(0, output.size(), max_points);
-            std::vector<Pointd> temp_pts;
             for(int idx: indexes)
             {
-                temp_pts.push_back(output[idx]);
+                kept_indexes.push_back(idx);
             }
-            output = temp_pts;
         }
+
+        std::vector<PointTemplated<T>> temp_pts;
+        std::vector<Mat3> temp_covariances;
+        temp_pts.reserve(kept_indexes.size());
+        temp_covariances.reserve(with_covariances ? kept_indexes.size() : 0);
+        for(const size_t index : kept_indexes)
+        {
+            temp_pts.push_back(output[index]);
+            if(with_covariances)
+            {
+                temp_covariances.push_back(output_covariances[index]);
+            }
+        }
+        output = temp_pts;
+        output_covariances = temp_covariances;
     }
 
-
+    if(with_covariances)
+    {
+        *covariances_out = output_covariances;
+    }
 
     return output;
 }
 
+// Same as above, downsampling each point type separately so that the rarer types are not swallowed by
+// the dominant one. The optional per-point covariances are carried through, as in downsamplePointCloud.
 template<typename T>
 inline std::vector<PointTemplated<T>> downsamplePointCloudPerType(
-    const std::vector<PointTemplated<T>>& input, double cell_size, int max_points = -1)
+    const std::vector<PointTemplated<T>>& input, double cell_size, int max_points = -1, const std::vector<Mat3>* covariances_in = nullptr, std::vector<Mat3>* covariances_out = nullptr)
 {
+    const bool with_covariances = (covariances_in != nullptr) && (covariances_out != nullptr);
     std::map<int, std::vector<PointTemplated<T>>> type_to_points;
-    for(const auto& pt : input)
+    std::map<int, std::vector<Mat3> > type_to_covariances;
+    for(size_t i = 0; i < input.size(); ++i)
     {
+        const auto& pt = input[i];
         if(type_to_points.find(pt.type) == type_to_points.end())
         {
             type_to_points[pt.type] = std::vector<PointTemplated<T>>();
             type_to_points[pt.type].reserve(input.size());
         }
         type_to_points[pt.type].push_back(pt);
+        if(with_covariances)
+        {
+            type_to_covariances[pt.type].push_back((*covariances_in)[i]);
+        }
     }
     std::vector<PointTemplated<T>> output;
+    std::vector<Mat3> output_covariances;
     for(const auto& [type, pts] : type_to_points)
     {
-        std::vector<PointTemplated<T>> downsampled_pts = downsamplePointCloud<T>(pts, cell_size, max_points*((double)pts.size())/input.size());
+        std::vector<Mat3> downsampled_covariances;
+        std::vector<PointTemplated<T>> downsampled_pts = downsamplePointCloud<T>(pts, cell_size, max_points*((double)pts.size())/input.size(), false,
+                with_covariances ? &type_to_covariances[type] : nullptr,
+                with_covariances ? &downsampled_covariances : nullptr);
         for(auto& pt : downsampled_pts)
         {
             pt.type = type;
         }
         output.insert(output.end(), downsampled_pts.begin(), downsampled_pts.end());
+        output_covariances.insert(output_covariances.end(), downsampled_covariances.begin(), downsampled_covariances.end());
+    }
+    if(with_covariances)
+    {
+        *covariances_out = output_covariances;
     }
     return output;
 }

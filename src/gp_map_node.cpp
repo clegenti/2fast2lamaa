@@ -89,6 +89,12 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 RCLCPP_WARN(this->get_logger(), "use_odom_prior is set but there is no odometry input (with_init_guess is false): the prior will anchor the registration to the previous pose instead");
             }
 
+            // Weight the registration with the per-point position covariance of the input cloud (the
+            // 6 cov_xx..cov_zz fields), propagated through the distance field query. The robust loss
+            // is then applied to the mahalanobis distance instead of the euclidean one.
+            options.use_point_covariances = readFieldBool(this, "use_point_covariances", false);
+            use_point_covariances_ = options.use_point_covariances;
+
             double min_range = readRequiredFieldDouble(this, "min_range");
             options.min_range = min_range;
             options.max_range = readFieldDouble(this, "max_range", 1000.0);
@@ -170,7 +176,9 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
             pc_type_internal_ = readFieldBool(this, "point_cloud_internal_type", true);
 
-            loss_scale_ = readFieldDouble(this, "loss_function_scale", 5.0*voxel_size_/3.0);
+            // With the point covariances the residuals are mahalanobis distances, so the loss scale is
+            // a number of standard deviations and not a distance in meters
+            loss_scale_ = readFieldDouble(this, "loss_function_scale", use_point_covariances_ ? 1.0 : 5.0*voxel_size_/3.0);
             
             // Write the first line of the trajectory file
             traj_path_ = map_path + "/trajectory.csv";
@@ -276,6 +284,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
         bool localization_ = false;
         bool use_edge_field_ = true;
+        bool use_point_covariances_ = false;
 
         std::mutex map_mutex_;
 
@@ -397,10 +406,16 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
             if(add_to_map)
             {
-                // First convert the point cloud message to a vector of points
-                auto [pts, is_2d] = getPcFromMsg(msg);
+                // First convert the point cloud message to a vector of points, with the per-point
+                // covariances when the registration is set to use them
+                std::vector<Mat3> covs;
+                auto [pts, is_2d] = getPcFromMsg(msg, use_point_covariances_ ? &covs : nullptr);
+                if(use_point_covariances_ && covs.empty() && (pts.size() > 0))
+                {
+                    RCLCPP_WARN_ONCE(this->get_logger(), "use_point_covariances is set but the incoming clouds carry no cov_xx..cov_zz fields: registering without them");
+                }
                 int original_pts_size = pts.size();
-                pts = filterPointsDensity(pts, voxel_size_);
+                filterScan(pts, covs);
 
                 if(is_2d)
                 {
@@ -412,13 +427,14 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 if(localization_ && first_)
                 {
                     // Downsample the points
-                    std::vector<Pointd> downsampled_pts = downsamplePointCloud<double>(pts, downsample_size_, max_nb_pts_, true);
+                    std::vector<Mat3> downsampled_covs;
+                    std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, false, true);
 
                     map_mutex_.lock();
-                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 10.0, 10.0);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 5.0, 10.0);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 2.0, 10.0);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), approximate_, loss_scale_);
+                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 10.0, 10.0, downsampled_covs);
+                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 5.0, 10.0, downsampled_covs);
+                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 2.0, 10.0, downsampled_covs);
+                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), approximate_, loss_scale_, kDefaultRegistrationIterations, downsampled_covs);
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
                 }
@@ -427,25 +443,18 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     sw2.start();
 
                     // Downsample the points
-                    std::vector<Pointd> downsampled_pts;
-                    if(use_edge_field_)
-                    {
-                        downsampled_pts = downsamplePointCloudPerType<double>(pts, downsample_size_, max_nb_pts_);
-                    }
-                    else
-                    {
-                        downsampled_pts = downsamplePointCloud<double>(pts, downsample_size_, max_nb_pts_, false);
-                    }
+                    std::vector<Mat3> downsampled_covs;
+                    std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, use_edge_field_, false);
 
 
                     map_mutex_.lock();
                     if(!with_init_guess_)
                     {
-                        current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 10.0*loss_scale_);
+                        current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 10.0*loss_scale_, kDefaultRegistrationIterations, downsampled_covs);
                         init_guess_ = current_pose_;
                     }
                     //current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 2*loss_scale_, 7);
-                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), approximate_, loss_scale_, 25);
+                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), approximate_, loss_scale_, 25, downsampled_covs);
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
 
@@ -567,10 +576,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             return need_update;
         }
 
-        std::pair<std::vector<Pointd>, bool> getPcFromMsg(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
+        // Read the incoming cloud. `covariances`, when given, comes back with one position covariance
+        // per point if the cloud carries them, and empty otherwise. The internal layout addresses its
+        // fields by fixed offset and has no covariance, so only the named-field reader provides them.
+        std::pair<std::vector<Pointd>, bool> getPcFromMsg(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, std::vector<Mat3>* covariances = nullptr)
         {
             std::vector<Pointd> pts;
             bool is_2d = false;
+            if(covariances != nullptr)
+            {
+                covariances->clear();
+            }
             if(pc_type_internal_)
             {
                 std::tie(pts, is_2d) = pointCloud2MsgToPtsVecInternal(msg);
@@ -578,9 +594,39 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             else
             {
                 bool rubish0, rubish1;
-                std::tie(pts, rubish0, rubish1, is_2d) = pointCloud2MsgToPtsVec<double>(msg, 1e-9, false);
+                std::tie(pts, rubish0, rubish1, is_2d) = pointCloud2MsgToPtsVec<double>(msg, 1e-9, false, std::set<int>(), false, covariances);
             }
             return {pts, is_2d};
+        }
+
+        // Density filter of the incoming scan, carrying the per-point covariances when they are in use
+        void filterScan(std::vector<Pointd>& pts, std::vector<Mat3>& covs)
+        {
+            if(!covs.empty() && (covs.size() == pts.size()))
+            {
+                std::tie(pts, covs) = filterPointsDensity(pts, covs, voxel_size_);
+            }
+            else
+            {
+                covs.clear();
+                pts = filterPointsDensity(pts, voxel_size_);
+            }
+        }
+
+        // Downsample the scan for the registration, carrying the per-point covariances when they are
+        // in use. `downsampled_covs` comes back empty otherwise, which is what registerPts expects to
+        // register without them.
+        std::vector<Pointd> downsampleScan(const std::vector<Pointd>& pts, const std::vector<Mat3>& covs, std::vector<Mat3>& downsampled_covs, const bool per_type, const bool quadrant_balanced)
+        {
+            downsampled_covs.clear();
+            const bool with_covs = !covs.empty() && (covs.size() == pts.size());
+            const std::vector<Mat3>* covs_in = with_covs ? &covs : nullptr;
+            std::vector<Mat3>* covs_out = with_covs ? &downsampled_covs : nullptr;
+            if(per_type)
+            {
+                return downsamplePointCloudPerType<double>(pts, downsample_size_, max_nb_pts_, covs_in, covs_out);
+            }
+            return downsamplePointCloud<double>(pts, downsample_size_, max_nb_pts_, quadrant_balanced, covs_in, covs_out);
         }
 
         void pcPriorCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc_msg, const geometry_msgs::msg::TransformStamped::ConstSharedPtr odom_msg)

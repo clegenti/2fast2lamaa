@@ -117,8 +117,22 @@ enum PointFieldTypes
     Y = 5,
     Z = 6,
     RGB = 7,
-    NUM_TYPES = 8
+    // The 6 unique entries of the symmetric 3x3 position covariance of the point. They are kept
+    // contiguous and in that order: the covariance reader below addresses them as COV_XX + k
+    COV_XX = 8,
+    COV_XY = 9,
+    COV_XZ = 10,
+    COV_YY = 11,
+    COV_YZ = 12,
+    COV_ZZ = 13,
+    NUM_COVARIANCE_TYPES = 6,
+    NUM_TYPES = 14
 };
+
+// Variance given to a point whose covariance is missing or unusable. Large enough (1e3 m of standard
+// deviation) for the point to weigh next to nothing in a covariance-weighted registration, while
+// keeping its geometry in the map.
+const double kInvalidPointVariance = 1e6;
 
 inline std::vector<std::pair<int, int>> getPointFields(const std::vector<sensor_msgs::msg::PointField>& fields, bool need_time=false)
 {
@@ -157,6 +171,30 @@ inline std::vector<std::pair<int, int>> getPointFields(const std::vector<sensor_
         {
             output[PointFieldTypes::RGB] = {fields[i].offset , fields[i].datatype};
         }
+        else if(fields[i].name == "cov_xx")
+        {
+            output[PointFieldTypes::COV_XX] = {fields[i].offset , fields[i].datatype};
+        }
+        else if(fields[i].name == "cov_xy")
+        {
+            output[PointFieldTypes::COV_XY] = {fields[i].offset , fields[i].datatype};
+        }
+        else if(fields[i].name == "cov_xz")
+        {
+            output[PointFieldTypes::COV_XZ] = {fields[i].offset , fields[i].datatype};
+        }
+        else if(fields[i].name == "cov_yy")
+        {
+            output[PointFieldTypes::COV_YY] = {fields[i].offset , fields[i].datatype};
+        }
+        else if(fields[i].name == "cov_yz")
+        {
+            output[PointFieldTypes::COV_YZ] = {fields[i].offset , fields[i].datatype};
+        }
+        else if(fields[i].name == "cov_zz")
+        {
+            output[PointFieldTypes::COV_ZZ] = {fields[i].offset , fields[i].datatype};
+        }
     }
     if(need_time&&(output[PointFieldTypes::TIME].first == -1))
     {
@@ -190,6 +228,54 @@ inline void reportNonFinitePoints(const size_t num_dropped, const size_t num_poi
     already_reported = true;
     std::cout << "Dropped " << num_dropped << " of the " << num_points << " points of the point cloud"
               << " (non-finite coordinates). Only reported once." << std::endl;
+}
+
+// True when the cloud carries the 6 entries of the per-point position covariance
+inline bool hasPointCovariance(const std::vector<std::pair<int, int> >& fields)
+{
+    for(int k = 0; k < PointFieldTypes::NUM_COVARIANCE_TYPES; ++k)
+    {
+        if(fields[PointFieldTypes::COV_XX + k].first == -1)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Read one float32 or float64 field of a point as a double
+inline double readPointFieldAsDouble(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const size_t point_index, const std::pair<int, int>& field)
+{
+    if(field.second == sensor_msgs::msg::PointField::FLOAT64)
+    {
+        double value;
+        memcpy(&value, &(msg->data[(msg->point_step*point_index) + field.first]), sizeof(double));
+        return value;
+    }
+    float value;
+    memcpy(&value, &(msg->data[(msg->point_step*point_index) + field.first]), sizeof(float));
+    return (double)value;
+}
+
+// Rebuild the symmetric position covariance of one point from its 6 unique entries. A non-finite or
+// obviously invalid covariance (a negative variance) is replaced by a very large isotropic one: the
+// point keeps its geometry, and a covariance-weighted registration gives it no say.
+inline Mat3 readPointCovariance(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const size_t point_index, const std::vector<std::pair<int, int> >& fields)
+{
+    double entries[PointFieldTypes::NUM_COVARIANCE_TYPES];
+    for(int k = 0; k < PointFieldTypes::NUM_COVARIANCE_TYPES; ++k)
+    {
+        entries[k] = readPointFieldAsDouble(msg, point_index, fields[PointFieldTypes::COV_XX + k]);
+    }
+    Mat3 covariance;
+    covariance << entries[0], entries[1], entries[2],
+                  entries[1], entries[3], entries[4],
+                  entries[2], entries[4], entries[5];
+    if(!covariance.allFinite() || (covariance.diagonal().minCoeff() < 0.0))
+    {
+        return Mat3::Identity()*kInvalidPointVariance;
+    }
+    return covariance;
 }
 
 template <typename T>
@@ -319,7 +405,11 @@ inline std::pair<std::vector<Pointd>, bool> pointCloud2MsgToPtsVecInternal(const
     size_t num_points = msg->width*msg->height;
     std::vector<Pointd> output;
     output.resize(num_points);
-    bool has_color = (msg->fields.size() > 8);
+    // The colour is the 8th field of the internal layout, but it is not the only thing that can be
+    // appended to it (the per-point covariance is 6 more fields), so the field count alone would read
+    // the first of those as a colour. The name is checked as well, and the count is kept so that no
+    // existing producer changes behaviour.
+    bool has_color = (msg->fields.size() > 8) && (getPointFields(msg->fields)[PointFieldTypes::RGB].first != -1);
     int64_t time_offset = rclcpp::Time(msg->header.stamp).nanoseconds();
     bool is_2d = true;
     // The non-finite points are dropped, so the points are written at their own index and the output
@@ -363,9 +453,13 @@ inline std::pair<std::vector<Pointd>, bool> pointCloud2MsgToPtsVecInternal(const
     return {output, is_2d};
 }
 
-// Function to read a PointCloud2 message and convert it to a vector of points
+// Function to read a PointCloud2 message and convert it to a vector of points.
+// `covariances`, when given, is filled with the per-point position covariance if the cloud carries
+// the 6 cov_* fields, and left empty otherwise. It is an out-parameter rather than part of the return
+// value so that the callers that do not care about it are unaffected. It stays aligned with the
+// returned points, the skipped ones (dead channel, non-finite coordinates) being skipped in both.
 template <typename T>
-inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2MsgToPtsVec(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const double time_scale = 1e-9, bool need_time = true, const std::set<int>& dead_channels = std::set<int>(), bool absolute_time = false)
+inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2MsgToPtsVec(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const double time_scale = 1e-9, bool need_time = true, const std::set<int>& dead_channels = std::set<int>(), bool absolute_time = false, std::vector<Mat3>* covariances = nullptr)
 {
     std::vector<PointTemplated<T>> output;
     rclcpp::Time time = rclcpp::Time(msg->header.stamp);
@@ -386,6 +480,17 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
     if(has_channel && !dead_channels.empty())
     {
         has_dead_channel = true;
+    }
+
+    bool fill_covariance = false;
+    if(covariances != nullptr)
+    {
+        covariances->clear();
+        fill_covariance = hasPointCovariance(fields);
+        if(fill_covariance)
+        {
+            covariances->reserve(num_points);
+        }
     }
 
     for(size_t i = 0; i < num_points; ++i)
@@ -524,6 +629,10 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
             memcpy(&(pt.g),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::RGB].first + 1]), sizeof(uint8_t));
             memcpy(&(pt.b),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::RGB].first + 0]), sizeof(uint8_t));
             pt.has_color = true;
+        }
+        if(fill_covariance)
+        {
+            covariances->push_back(readPointCovariance(msg, i, fields));
         }
         output.push_back(pt);
     }

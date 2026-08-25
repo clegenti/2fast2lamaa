@@ -164,6 +164,12 @@ struct MapDistFieldOptions {
     bool use_odom_prior = false;
     double odom_prior_weight_pos = 1.0;
     double odom_prior_weight_rot = 1.0;
+    // Weight the registration residuals with the per-point position covariance, which the scan has to
+    // carry. The covariance is propagated through the distance field query, and the robust loss is
+    // then applied to the resulting Mahalanobis distance instead of the euclidean one. The loss scale
+    // is therefore a number of standard deviations, not a distance in meters. The map itself is taken
+    // as deterministic: the points to register are the only source of uncertainty.
+    bool use_point_covariances = false;
 };
 
 
@@ -224,6 +230,8 @@ class MapDistField {
 
         void calibrateUncertaintyProxy();
 
+        std::vector<double> computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field);
+
 
     public:
         GPCellHyperparameters cell_hyperparameters;
@@ -235,7 +243,10 @@ class MapDistField {
 
         void set2D(const bool is_2d){ is_2d_ = is_2d;}
 
-        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr);
+        // `pts_cov` holds the position covariance of each point of `pts`, in the frame of the points.
+        // It is only read when the `use_point_covariances` option is set, and the registration falls
+        // back on unit weights if it does not have one covariance per point.
+        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr, const std::vector<Mat3>& pts_cov = std::vector<Mat3>());
 
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const std::vector<double>& count=std::vector<double>());
         std::vector<Pointd> getPts();
@@ -283,8 +294,13 @@ class MapDistField {
 class RegistrationCostFunction: public ceres::CostFunction
 {
     public:
-        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8);
-        
+        // `inv_std` is the inverse of the standard deviation of the distance residual of each point,
+        // obtained by propagating its position covariance through the distance field query. When it is
+        // given, the loss function is applied to the Mahalanobis distance `dist*inv_std` instead of
+        // the euclidean distance. An empty vector disables it, and the residuals are then bit for bit
+        // what they were before the covariances existed.
+        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8, const std::vector<double>& inv_std=std::vector<double>());
+
         virtual bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const;
 
         void setUseField(const bool use_field);
@@ -295,6 +311,9 @@ class RegistrationCostFunction: public ceres::CostFunction
         const Mat4 prior_;
         MapDistField* map_;
         const std::vector<double>& weights_;
+        // Owned, unlike the weights: it is built by registerPts for this cost function only
+        std::vector<double> inv_std_;
+        bool use_mahalanobis_ = false;
         bool use_field_;
         int num_threads_ = 8;
 

@@ -14,6 +14,10 @@
 
 const double kMinNodeDist = 1.0;
 
+// Default number of solver iterations of a registration, named so that a caller that only wants to
+// pass the arguments after it does not have to repeat the value
+const int kDefaultRegistrationIterations = 12;
+
 
 class SubmapManager
 {
@@ -22,8 +26,9 @@ class SubmapManager
         ~SubmapManager();
 
 
-        // Use the current map to register the points
-        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12);
+        // Use the current map to register the points. `pts_cov` holds the position covariance of each
+        // point, and is only read when the `use_point_covariances` option is set.
+        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=kDefaultRegistrationIterations, const std::vector<Mat3>& pts_cov=std::vector<Mat3>());
 
         // Add points to the current map (and next map if using submaps)
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t time);

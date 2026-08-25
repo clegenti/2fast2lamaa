@@ -274,7 +274,8 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | `register` | bool | `true` | Enable scan-to-map registration (if false, uses dead-reckoning from input poses) |
 | `use_temporal_weights` | bool | `false` | Apply temporal weighting to map points for registration (recent points weighted higher) |
 | `no_gp` | bool | `false` | Use approximate distance field queries for faster registration (point-to-point, no GP distance field) |
-| `loss_function_scale` | double | `0.5` | Scale parameter for robust loss function in registration optimization |
+| `loss_function_scale` | double | `5/3*voxel_size` (`1.0` with `use_point_covariances`) | Scale parameter for robust loss function in registration optimization |
+| `use_point_covariances` | bool | `false` | Weight the registration with the per-point position covariance of the input cloud, and apply the robust loss to the Mahalanobis distance instead of the euclidean one (see below) |
 | `voxel_size_factor_for_registration` | double | `2.0` | Multiplier for `voxel_size` to compute downsampling size for registration |
 | `max_num_pts_for_registration` | int | `4000` | Maximum number of points to use for scan-to-map registration |
 | `use_edge_field` | bool | `true` | Enable separate edge feature distance field (sometimes it seems to converge faster) |
@@ -321,6 +322,40 @@ That lookup does not scan the whole graph: it only walks along the path from the
 This parameter is therefore the __maximum "jump" the localization can make in the topometric graph in a single scan__.
 It has to be larger than the distance the platform can travel between two registrations, with enough margin to recover when the estimate temporarily drifts ahead of the map, but small enough that the graph cannot latch onto a distant node of a path that comes back close to itself (a loop, a roundabout, or the opposite lane of a divided road).
 The distance is accumulated between consecutive graph nodes, so it follows the mapped path rather than the straight line: a value of 20 meters means 20 meters of driving along the route, not a 20 meter radius.
+
+### Registration with per-point covariances
+
+Points do not always deserve the same say in the registration. Triangulated landmarks coming out of a
+visual or visual-inertial front-end are the extreme case: their uncertainty is strongly anisotropic,
+being large along the viewing ray and small across it.
+
+Setting `use_point_covariances` makes the registration account for it. The input cloud then has to
+carry the 6 unique entries of the symmetric position covariance of each point, as the `cov_xx`,
+`cov_xy`, `cov_xz`, `cov_yy`, `cov_yz` and `cov_zz` fields of the `PointCloud2` message (`float32` or
+`float64`). The registration residual of a point is the scalar distance `d(p)` to the surface, so the
+covariance of the point propagates to the residual as
+
+```
+sigma^2 = n^T (R Sigma R^T) n,      n = grad(d)/||grad(d)||
+```
+
+and the robust loss is applied to the Mahalanobis distance `d/sigma` instead of `d`. Because the
+distance field is eikonal, `n` is the surface normal: __only the component of the position uncertainty
+along the normal is observable in the residual__, the component tangent to the surface does not move it
+at all. A landmark facing a wall head-on is therefore heavily down-weighted, while the same landmark
+seen at grazing incidence keeps its weight. The map itself is taken as exact.
+
+Two consequences to keep in mind:
+
+- `loss_function_scale` becomes a __number of standard deviations__ rather than a distance in meters,
+  which is why its default changes from `5/3*voxel_size` to `1.0`.
+- The projection is evaluated once per registration, at the pose given as the initial guess, and held
+  constant over the solve. This is deliberate: the solver evaluates the cost function both with and
+  without its jacobian, and only the jacobian evaluation has the gradient of the field available.
+
+Points whose covariance is missing, non-finite or invalid are given a very large variance, so they keep
+their geometry in the map but have no say in the registration. If the cloud carries no covariance at
+all, the node warns once and registers with uniform weights.
 
 | Other parameters |  |  |  |
 |-----------|------|---------|-------------|
