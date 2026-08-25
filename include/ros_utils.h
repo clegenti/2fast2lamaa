@@ -6,6 +6,7 @@
 
 #include "lice/types.h"
 #include <Eigen/Dense>
+#include <cmath>
 
 
 
@@ -168,6 +169,29 @@ inline std::vector<std::pair<int, int>> getPointFields(const std::vector<sensor_
     return output;
 }
 
+// Non-finite coordinates do happen in the wild, most lidar drivers use them for the points without
+// return. They are filtered when adding points to the map, but nothing protects the registration,
+// which would hand them over to the solver as nan residuals and jacobians. They are therefore
+// dropped as soon as the message is read.
+inline bool isFinitePoint(const float x, const float y, const float z)
+{
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+// Report the points dropped by the barrier above. Only the first occurrence is printed: a cloud with
+// no-return points has them in every single scan, and the message would drown everything else.
+inline void reportNonFinitePoints(const size_t num_dropped, const size_t num_points)
+{
+    static bool already_reported = false;
+    if((num_dropped == 0) || already_reported)
+    {
+        return;
+    }
+    already_reported = true;
+    std::cout << "Dropped " << num_dropped << " of the " << num_points << " points of the point cloud"
+              << " (non-finite coordinates). Only reported once." << std::endl;
+}
+
 template <typename T>
 inline void preparePointCloud2Msg(sensor_msgs::msg::PointCloud2& output, const std::vector<PointTemplated<T>>& pts, const std::string& frame_id, const rclcpp::Time& time)
 {
@@ -292,38 +316,50 @@ inline sensor_msgs::msg::PointCloud2 ptsVecToPointCloud2MsgInternal(const std::v
 
 inline std::pair<std::vector<Pointd>, bool> pointCloud2MsgToPtsVecInternal(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
 {
+    size_t num_points = msg->width*msg->height;
     std::vector<Pointd> output;
-    output.resize(msg->width*msg->height);
+    output.resize(num_points);
     bool has_color = (msg->fields.size() > 8);
     int64_t time_offset = rclcpp::Time(msg->header.stamp).nanoseconds();
     bool is_2d = true;
-    for(size_t i=0; i < output.size(); ++i)
+    // The non-finite points are dropped, so the points are written at their own index and the output
+    // is shrunk to the number of points that made it through
+    size_t num_valid = 0;
+    for(size_t i=0; i < num_points; ++i)
     {
         float temp_x, temp_y, temp_z;
         memcpy(&(temp_x), &(msg->data[(msg->point_step*i) + 0]), sizeof(float));
         memcpy(&(temp_y), &(msg->data[(msg->point_step*i) + 4]), sizeof(float));
         memcpy(&(temp_z), &(msg->data[(msg->point_step*i) + 8]), sizeof(float));
-        output[i].x = (double)temp_x;
-        output[i].y = (double)temp_y;
-        output[i].z = (double)temp_z;
+        if(!isFinitePoint(temp_x, temp_y, temp_z))
+        {
+            continue;
+        }
+        Pointd& pt = output[num_valid];
+        num_valid++;
+        pt.x = (double)temp_x;
+        pt.y = (double)temp_y;
+        pt.z = (double)temp_z;
         if(temp_z != 0.0f)
         {
             is_2d = false;
         }
         uint32_t t;
-        memcpy(&(output[i].i), &(msg->data[(msg->point_step*i) + 12]), sizeof(float));
+        memcpy(&(pt.i), &(msg->data[(msg->point_step*i) + 12]), sizeof(float));
         memcpy(&t, &(msg->data[(msg->point_step*i) + 16]), sizeof(uint32_t));
-        output[i].t = (int64_t)(t) + time_offset;
-        memcpy(&(output[i].channel), &(msg->data[(msg->point_step*i) + 20]), sizeof(int));
-        memcpy(&(output[i].type), &(msg->data[(msg->point_step*i) + 24]), sizeof(int));
+        pt.t = (int64_t)(t) + time_offset;
+        memcpy(&(pt.channel), &(msg->data[(msg->point_step*i) + 20]), sizeof(int));
+        memcpy(&(pt.type), &(msg->data[(msg->point_step*i) + 24]), sizeof(int));
         if(has_color)
         {
-            output[i].r = msg->data[(msg->point_step*i) + 30];
-            output[i].g = msg->data[(msg->point_step*i) + 29];
-            output[i].b = msg->data[(msg->point_step*i) + 28];
-            output[i].has_color = true;
+            pt.r = msg->data[(msg->point_step*i) + 30];
+            pt.g = msg->data[(msg->point_step*i) + 29];
+            pt.b = msg->data[(msg->point_step*i) + 28];
+            pt.has_color = true;
         }
     }
+    reportNonFinitePoints(num_points - num_valid, num_points);
+    output.resize(num_valid);
     return {output, is_2d};
 }
 
@@ -346,6 +382,7 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
 
     bool has_dead_channel = false;
     bool is_2d = true;
+    size_t num_non_finite = 0;
     if(has_channel && !dead_channels.empty())
     {
         has_dead_channel = true;
@@ -407,6 +444,11 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
         memcpy(&(temp_x), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::X].first]), sizeof(float));
         memcpy(&(temp_y), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::Y].first]), sizeof(float));
         memcpy(&(temp_z), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::Z].first]), sizeof(float));
+        if(!isFinitePoint(temp_x, temp_y, temp_z))
+        {
+            num_non_finite++;
+            continue;
+        }
         pt.x = (T)temp_x;
         pt.y = (T)temp_y;
         pt.z = (T)temp_z;
@@ -485,6 +527,7 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
         }
         output.push_back(pt);
     }
+    reportNonFinitePoints(num_non_finite, num_points);
     return {output, has_intensity, has_channel, is_2d};
 }
 /////// End helper functions to subscribe and publish PointCloud2 messages
