@@ -276,7 +276,8 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | `no_gp` | bool | `false` | Use approximate distance field queries for faster registration (point-to-point, no GP distance field) |
 | `loss_function_scale` | double | `5/3*voxel_size` (`1.0` with `use_point_covariances`) | Scale parameter for robust loss function in registration optimization |
 | `use_point_covariances` | bool | `false` | Weight the registration with the per-point position covariance of the input cloud, and apply the robust loss to the Mahalanobis distance instead of the euclidean one (see below) |
-| `voxel_size_factor_for_registration` | double | `2.0` | Multiplier for `voxel_size` to compute downsampling size for registration |
+| `point_covariances_per_iteration` | bool | `true` | Only with `use_point_covariances`: refresh the covariance projection at every evaluation point of the solver, instead of freezing it at the initial guess |
+| `voxel_size_factor_for_registration` | double | `2.0` | Multiplier for `voxel_size` to compute downsampling size for registration. A non-positive value disables the downsampling: the scans are registered as they come, and `max_num_pts_for_registration` no longer applies (useful for an already sparse input, such as the landmarks of a visual front-end) |
 | `max_num_pts_for_registration` | int | `4000` | Maximum number of points to use for scan-to-map registration |
 | `use_edge_field` | bool | `true` | Enable separate edge feature distance field (sometimes it seems to converge faster) |
 | `key_framing` | bool | `false` | Enable key-frame-based map updates (skip scans that don't meet criteria) |
@@ -349,9 +350,15 @@ Two consequences to keep in mind:
 
 - `loss_function_scale` becomes a __number of standard deviations__ rather than a distance in meters,
   which is why its default changes from `5/3*voxel_size` to `1.0`.
-- The projection is evaluated once per registration, at the pose given as the initial guess, and held
-  constant over the solve. This is deliberate: the solver evaluates the cost function both with and
-  without its jacobian, and only the jacobian evaluation has the gradient of the field available.
+- `sigma` depends on the pose, both through the rotation of the covariance and through the normal
+  itself, and is therefore refreshed at every evaluation point of the solver (an iteratively reweighted
+  least squares scheme). This is done in a `ceres::EvaluationCallback` rather than inside the cost
+  function: the solver evaluates the cost function both with and without its jacobian, only the latter
+  has the gradient of the field at hand, and a weighting that differed between the two would make them
+  evaluate different functions and corrupt the trust region. The jacobian still ignores the derivative
+  of `sigma` itself, which would need the hessian of the distance field.
+  Setting `point_covariances_per_iteration` to `false` freezes the weighting at the initial guess
+  instead, which is worth trying if the solver struggles to converge.
 
 Points whose covariance is missing, non-finite or invalid are given a very large variance, so they keep
 their geometry in the map but have no say in the registration. If the cloud carries no covariance at

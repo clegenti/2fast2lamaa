@@ -535,15 +535,14 @@ const double kMinGradNorm = 1e-9;
 // the viewing ray: a surface seen head-on down-weights the point, a surface seen at grazing incidence
 // barely does.
 //
-// The projection is evaluated once, at the pose given as prior, and held constant over the solve.
-// Ceres scores its steps with a residual-only evaluation of the cost function, which has no gradient
-// available and could not recompute the projection; a scaling that differed between the two kinds of
-// evaluation would make them evaluate different functions and corrupt the trust region.
-std::vector<double> MapDistField::computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field)
+// The projection depends on the pose, through the rotation of the covariance and through the normal
+// itself. It is refreshed at every evaluation point of the solver by PointCovarianceCallback, or held
+// at the pose given as prior when `point_covariances_per_iteration` is off.
+void MapDistField::computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field, std::vector<double>& inv_std)
 {
     const Mat3 rot = pose.block<3,3>(0,0);
     const Vec3 pos = pose.block<3,1>(0,3);
-    std::vector<double> inv_std(pts.size(), 1.0);
+    inv_std.assign(pts.size(), 1.0);
     #pragma omp parallel for num_threads(num_threads_)
     for(size_t i = 0; i < pts.size(); i++)
     {
@@ -565,7 +564,22 @@ std::vector<double> MapDistField::computePointInvStd(const std::vector<Pointd>& 
         }
         inv_std[i] = 1.0/std::max(std::sqrt(std::max(variance, 0.0)), kMinPointStd);
     }
-    return inv_std;
+}
+
+void PointCovarianceCallback::PrepareForEvaluation(bool evaluate_jacobians, bool new_evaluation_point)
+{
+    (void)evaluate_jacobians;
+    if(!new_evaluation_point)
+    {
+        // Same point as the previous evaluation, the scaling still holds
+        return;
+    }
+    // The optimised variable is a correction applied on top of the prior, the same composition as the
+    // pose registerPts returns
+    Mat4 correction = Mat4::Identity();
+    correction.block<3,3>(0,0) = expMap(pose_correction_.segment<3>(3));
+    correction.block<3,1>(0,3) = pose_correction_.segment<3>(0);
+    map_->computePointInvStd(pts_, pts_cov_, prior_*correction, use_field_, inv_std_);
 }
 
 Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov)
@@ -579,7 +593,30 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     int num_neighbors_save = num_neighbors_;
     num_neighbors_ = 1;
 
-    ceres::Problem problem;
+    // Per-point Mahalanobis scaling of the distance residuals, empty when the covariances are not
+    // used. It is filled here so that the very first evaluation has it, and refreshed at every
+    // evaluation point of the solver by the callback below.
+    std::vector<double> inv_std;
+    std::unique_ptr<PointCovarianceCallback> point_covariance_callback;
+    if(opt_.use_point_covariances)
+    {
+        if(pts_cov.size() != pts.size())
+        {
+            std::cout << "MapDistField::registerPts: Warning: use_point_covariances is set but the scan carries " << pts_cov.size() << " covariances for " << pts.size() << " points. Registering without them." << std::endl;
+        }
+        else
+        {
+            computePointInvStd(pts, pts_cov, pose, !approximate, inv_std);
+            if(opt_.point_covariances_per_iteration)
+            {
+                point_covariance_callback = std::make_unique<PointCovarianceCallback>(this, pts, pts_cov, pose, pose_correction_state, !approximate, inv_std);
+            }
+        }
+    }
+
+    ceres::Problem::Options pb_options;
+    pb_options.evaluation_callback = point_covariance_callback.get();
+    ceres::Problem problem(pb_options);
     if(is_2d_)
     {
         ceres::SubsetManifold* manifold = new ceres::SubsetManifold(6, {2, 3, 4});
@@ -638,20 +675,6 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
         }
     }
 
-    // Per-point Mahalanobis scaling of the distance residuals, empty when the covariances are not used
-    std::vector<double> inv_std;
-    if(opt_.use_point_covariances)
-    {
-        if(pts_cov.size() != pts.size())
-        {
-            std::cout << "MapDistField::registerPts: Warning: use_point_covariances is set but the scan carries " << pts_cov.size() << " covariances for " << pts.size() << " points. Registering without them." << std::endl;
-        }
-        else
-        {
-            inv_std = computePointInvStd(pts, pts_cov, pose, !approximate);
-        }
-    }
-
     auto temp_pose = pose;
 
     ceres::Solver::Options options;
@@ -663,7 +686,7 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     // Optimization with openMP in the cost function
     bool use_loss = (loss_scale > 0.0);
-    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_, inv_std);
+    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_, inv_std.empty() ? nullptr : &inv_std);
     problem.AddResidualBlock(cost_function, NULL, pose_correction_state.data());
 
 
@@ -1581,12 +1604,12 @@ void MapDistField::loadMap(const std::string& filename)
 
 
 
-RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads, const std::vector<double>& inv_std)
+RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads, const std::vector<double>* inv_std)
     : prior_(prior)
     , map_(map)
     , weights_(weights)
     , inv_std_(inv_std)
-    , use_mahalanobis_(!inv_std.empty() && (inv_std.size() == pts.size()))
+    , use_mahalanobis_((inv_std != nullptr) && (inv_std->size() == pts.size()))
     , use_field_(use_field)
     , num_threads_(num_threads)
 {
@@ -1652,7 +1675,7 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
                 auto [dist, grad] = map_->queryDistFieldAndGrad(temp_pt, use_field_, type_[i]);
                 // The loss is applied to the mahalanobis distance when the point covariances are
                 // used, and to the euclidean distance otherwise (the scale is then exactly 1.0)
-                const double scale = use_mahalanobis_ ? inv_std_[i] : 1.0;
+                const double scale = use_mahalanobis_ ? (*inv_std_)[i] : 1.0;
                 // Apply the loss function
                 std::array<double, 3> temp;
                 loss_function_->Evaluate(dist*scale, temp.data());
@@ -1678,7 +1701,7 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
         for(size_t i = 0; i < pts_.size(); i++)
         {
             const double dist = map_->queryDistField(pts_w.col(i), use_field_, type_[i]);
-            const double scale = use_mahalanobis_ ? inv_std_[i] : 1.0;
+            const double scale = use_mahalanobis_ ? (*inv_std_)[i] : 1.0;
             // Apply the loss function
             std::array<double, 3> temp;
             loss_function_->Evaluate(dist*scale, temp.data());

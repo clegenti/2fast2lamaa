@@ -56,7 +56,12 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             voxel_size_ = readRequiredFieldDouble(this, "voxel_size");
             MapDistFieldOptions options;
             options.cell_size = voxel_size_;
+            // A non-positive factor disables the downsampling of the scans used for the registration
             downsample_size_ = readFieldDouble(this, "voxel_size_factor_for_registration", 2.0) * voxel_size_;
+            if(downsample_size_ <= 0.0)
+            {
+                RCLCPP_INFO(this->get_logger(), "Registration downsampling disabled (voxel_size_factor_for_registration <= 0): the scans are registered as they come, and max_num_pts_for_registration does not apply");
+            }
             options.neighborhood_size = readFieldInt(this, "neighbourhood_size",2.0);
 
             register_ = readFieldBool(this, "register", true);
@@ -94,6 +99,10 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // is then applied to the mahalanobis distance instead of the euclidean one.
             options.use_point_covariances = readFieldBool(this, "use_point_covariances", false);
             use_point_covariances_ = options.use_point_covariances;
+            // The surface normal the covariance is projected onto moves with the pose, so the
+            // weighting is refreshed at every evaluation point of the solver. Set to false to freeze
+            // it at the initial guess instead.
+            options.point_covariances_per_iteration = readFieldBool(this, "point_covariances_per_iteration", true);
 
             double min_range = readRequiredFieldDouble(this, "min_range");
             options.min_range = min_range;
@@ -616,10 +625,32 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         // Downsample the scan for the registration, carrying the per-point covariances when they are
         // in use. `downsampled_covs` comes back empty otherwise, which is what registerPts expects to
         // register without them.
+        // A non-positive `voxel_size_factor_for_registration` disables the downsampling altogether and
+        // the scan is registered as it comes: useful for an already sparse input (the landmarks of a
+        // visual front-end for instance), where merging points into voxel centroids only blurs them.
         std::vector<Pointd> downsampleScan(const std::vector<Pointd>& pts, const std::vector<Mat3>& covs, std::vector<Mat3>& downsampled_covs, const bool per_type, const bool quadrant_balanced)
         {
             downsampled_covs.clear();
             const bool with_covs = !covs.empty() && (covs.size() == pts.size());
+            if(downsample_size_ <= 0.0)
+            {
+                // The invalid points are still dropped, as the downsampling does
+                std::vector<Pointd> kept_pts;
+                kept_pts.reserve(pts.size());
+                for(size_t i = 0; i < pts.size(); ++i)
+                {
+                    if(pts[i].type == kInvalidPoint)
+                    {
+                        continue;
+                    }
+                    kept_pts.push_back(pts[i]);
+                    if(with_covs)
+                    {
+                        downsampled_covs.push_back(covs[i]);
+                    }
+                }
+                return kept_pts;
+            }
             const std::vector<Mat3>* covs_in = with_covs ? &covs : nullptr;
             std::vector<Mat3>* covs_out = with_covs ? &downsampled_covs : nullptr;
             if(per_type)

@@ -170,6 +170,10 @@ struct MapDistFieldOptions {
     // is therefore a number of standard deviations, not a distance in meters. The map itself is taken
     // as deterministic: the points to register are the only source of uncertainty.
     bool use_point_covariances = false;
+    // Recompute that propagation at every evaluation point of the solver (the surface normal the
+    // covariance is projected onto changes as the pose moves), instead of freezing it at the pose
+    // given as initial guess. Set it to false to get the frozen behaviour back.
+    bool point_covariances_per_iteration = true;
 };
 
 
@@ -230,8 +234,6 @@ class MapDistField {
 
         void calibrateUncertaintyProxy();
 
-        std::vector<double> computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field);
-
 
     public:
         GPCellHyperparameters cell_hyperparameters;
@@ -285,6 +287,11 @@ class MapDistField {
 
         std::vector<Pointd> freeSpaceCarving(const std::vector<Pointd>& pts, const Mat4& pose);
 
+        // Inverse of the standard deviation of the distance residual of each point, obtained by
+        // propagating the position covariance of the point through the distance field query. `pose`
+        // is the transformation bringing the points, and their covariances, into the map frame.
+        void computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field, std::vector<double>& inv_std);
+
         void setGravity(const Vec3& gravity) { gravity_ = gravity; }
 
 };
@@ -294,12 +301,14 @@ class MapDistField {
 class RegistrationCostFunction: public ceres::CostFunction
 {
     public:
-        // `inv_std` is the inverse of the standard deviation of the distance residual of each point,
-        // obtained by propagating its position covariance through the distance field query. When it is
-        // given, the loss function is applied to the Mahalanobis distance `dist*inv_std` instead of
-        // the euclidean distance. An empty vector disables it, and the residuals are then bit for bit
-        // what they were before the covariances existed.
-        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8, const std::vector<double>& inv_std=std::vector<double>());
+        // `inv_std` points at the inverse of the standard deviation of the distance residual of each
+        // point, obtained by propagating its position covariance through the distance field query.
+        // When it is given, the loss function is applied to the Mahalanobis distance `dist*inv_std`
+        // instead of the euclidean distance. A null pointer disables it, and the residuals are then
+        // bit for bit what they were before the covariances existed.
+        // It is a pointer and not a copy so that PointCovarianceCallback can refresh it between two
+        // evaluations of the cost function; it has to outlive the cost function.
+        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8, const std::vector<double>* inv_std=nullptr);
 
         virtual bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const;
 
@@ -311,8 +320,7 @@ class RegistrationCostFunction: public ceres::CostFunction
         const Mat4 prior_;
         MapDistField* map_;
         const std::vector<double>& weights_;
-        // Owned, unlike the weights: it is built by registerPts for this cost function only
-        std::vector<double> inv_std_;
+        const std::vector<double>* inv_std_ = nullptr;
         bool use_mahalanobis_ = false;
         bool use_field_;
         int num_threads_ = 8;
@@ -320,6 +328,44 @@ class RegistrationCostFunction: public ceres::CostFunction
         std::unique_ptr<ceres::LossFunction> loss_function_;
 
 
+};
+
+// Refreshes the Mahalanobis scaling of the registration residuals at every evaluation point of the
+// solver. The covariance of a point is projected onto the surface normal, which changes as the pose
+// moves, so the scaling is a function of the pose being evaluated.
+//
+// Doing it here rather than inside RegistrationCostFunction::Evaluate is what makes it consistent:
+// ceres evaluates the cost function either with or without its jacobian, and only the latter has the
+// gradient of the field at hand. This callback runs before either kind of evaluation, with the
+// parameter block already set to the point about to be evaluated, so both see the same scaling.
+//
+// Note that the jacobian still ignores the derivative of the scaling itself (it would need the
+// hessian of the distance field): the scaling is constant *within* an evaluation, which makes this an
+// iteratively reweighted least squares scheme.
+class PointCovarianceCallback: public ceres::EvaluationCallback
+{
+    public:
+        PointCovarianceCallback(MapDistField* map, const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& prior, const Vec6& pose_correction, const bool use_field, std::vector<double>& inv_std)
+        : map_(map)
+        , pts_(pts)
+        , pts_cov_(pts_cov)
+        , prior_(prior)
+        , pose_correction_(pose_correction)
+        , use_field_(use_field)
+        , inv_std_(inv_std)
+        {
+        }
+
+        virtual void PrepareForEvaluation(bool evaluate_jacobians, bool new_evaluation_point) override;
+
+    private:
+        MapDistField* map_;
+        const std::vector<Pointd>& pts_;
+        const std::vector<Mat3>& pts_cov_;
+        const Mat4 prior_;
+        const Vec6& pose_correction_;
+        const bool use_field_;
+        std::vector<double>& inv_std_;
 };
 
 // Anchors the registration to the pose given as prior (the odometry): registerPts optimises a
