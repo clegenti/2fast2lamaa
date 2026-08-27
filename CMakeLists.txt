@@ -136,6 +136,7 @@ ament_target_dependencies(pose_graph
   rclcpp
   sensor_msgs
   geometry_msgs
+  nav_msgs
   message_filters
   std_msgs
   tf2
