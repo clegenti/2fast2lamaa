@@ -290,7 +290,11 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
             if(new_map_id != current_map_id_)
             {
                 std::cout << "Switching from submap " << current_map_id_ << " to submap " << new_map_id << std::endl;
+                // The scale of the scans belongs to the sensor, not to the submap: it is carried over
+                // so that the estimate is not thrown away at every switch
+                const double scan_scale = current_map_->getScale();
                 current_map_ = std::make_shared<MapDistField>(options_, publisher_);
+                current_map_->setScale(scan_scale);
                 current_map_->setGravity(gravity_);
                 current_map_->loadMap(submap_paths_[new_map_id]);
                 current_map_->set2D(is_2d_);
@@ -355,6 +359,14 @@ void SubmapManager::addPts(const std::vector<Pointd>& pts, const Mat4& pose, con
     if(localization_)
     {
         throw std::runtime_error("So far we cannot add point in localization mode");
+    }
+
+    if(options_.use_scale_optimization)
+    {
+        // The registration estimates a scale of the scans but nothing applies it outside of it: the
+        // points would go into the map at their original scale, and the map would end up mixing scales
+        throw std::runtime_error("So far we cannot add point with use_scale_optimization enabled "
+                                 "(the estimated scale is not applied to the points added to the map)");
     }
 
     if(current_map_ == nullptr)

@@ -174,6 +174,15 @@ struct MapDistFieldOptions {
     // covariance is projected onto changes as the pose moves), instead of freezing it at the pose
     // given as initial guess. Set it to false to get the frozen behaviour back.
     bool point_covariances_per_iteration = true;
+    // Estimate a scale of the scan alongside the pose: the points are scaled around the origin of the
+    // sensor before being registered. For a front-end whose reconstruction is not exactly metric, or
+    // whose scale drifts. The estimate carries over from one scan to the next.
+    bool use_scale_optimization = false;
+    // Inverse of the standard deviation of the change of scale between two consecutive scans. The
+    // larger it is, the more the scale is held at the value estimated for the previous scan. Nothing
+    // else pins the scale down, so this is what makes it a slowly drifting quantity rather than a free
+    // parameter of every registration.
+    double scale_prior_weight = 100.0;
 };
 
 
@@ -221,6 +230,12 @@ class MapDistField {
         bool is_2d_ = false;
 
         Vec3 gravity_ = Vec3::Zero();
+
+        // Scale of the scans, estimated by the registration when `use_scale_optimization` is set. It
+        // carries over from one registration to the next, which is what the scale prior is relative
+        // to. Deliberately not reset by `clear()`: the scale belongs to the front-end producing the
+        // scans, not to the map, and a submap switch should not throw the estimate away.
+        double scale_ = 1.0;
 
         void cleanCells();
 
@@ -285,12 +300,17 @@ class MapDistField {
 
         double getPathLength() const { return path_length_; }
 
+        // Scale of the scans as last estimated by the registration, 1.0 when the estimation is off
+        double getScale() const { return scale_; }
+        // Carry an estimate over to another map, so that a submap switch does not throw it away
+        void setScale(const double scale) { scale_ = scale; }
+
         std::vector<Pointd> freeSpaceCarving(const std::vector<Pointd>& pts, const Mat4& pose);
 
         // Inverse of the standard deviation of the distance residual of each point, obtained by
         // propagating the position covariance of the point through the distance field query. `pose`
         // is the transformation bringing the points, and their covariances, into the map frame.
-        void computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field, std::vector<double>& inv_std);
+        void computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field, std::vector<double>& inv_std, const double scan_scale = 1.0);
 
         void setGravity(const Vec3& gravity) { gravity_ = gravity; }
 
@@ -308,7 +328,10 @@ class RegistrationCostFunction: public ceres::CostFunction
         // bit for bit what they were before the covariances existed.
         // It is a pointer and not a copy so that PointCovarianceCallback can refresh it between two
         // evaluations of the cost function; it has to outlive the cost function.
-        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8, const std::vector<double>* inv_std=nullptr);
+        // `use_scale` adds a second parameter block of size 1, the scale the points are multiplied by
+        // before being registered. When it is false the cost function declares the pose block only,
+        // exactly as it did before the scale existed.
+        RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale=0.2, const bool use_field=true, const bool use_loss=true, const int num_threads=8, const std::vector<double>* inv_std=nullptr, const bool use_scale=false);
 
         virtual bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const;
 
@@ -322,6 +345,7 @@ class RegistrationCostFunction: public ceres::CostFunction
         const std::vector<double>& weights_;
         const std::vector<double>* inv_std_ = nullptr;
         bool use_mahalanobis_ = false;
+        bool use_scale_ = false;
         bool use_field_;
         int num_threads_ = 8;
 
@@ -345,7 +369,9 @@ class RegistrationCostFunction: public ceres::CostFunction
 class PointCovarianceCallback: public ceres::EvaluationCallback
 {
     public:
-        PointCovarianceCallback(MapDistField* map, const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& prior, const Vec6& pose_correction, const bool use_field, std::vector<double>& inv_std)
+        // `scan_scale` points at the scale parameter block when it is optimised, so that the field is
+        // queried where the scaled points actually are; null when the scale is not estimated.
+        PointCovarianceCallback(MapDistField* map, const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& prior, const Vec6& pose_correction, const bool use_field, std::vector<double>& inv_std, const double* scan_scale = nullptr)
         : map_(map)
         , pts_(pts)
         , pts_cov_(pts_cov)
@@ -353,6 +379,7 @@ class PointCovarianceCallback: public ceres::EvaluationCallback
         , pose_correction_(pose_correction)
         , use_field_(use_field)
         , inv_std_(inv_std)
+        , scan_scale_(scan_scale)
         {
         }
 
@@ -366,6 +393,29 @@ class PointCovarianceCallback: public ceres::EvaluationCallback
         const Vec6& pose_correction_;
         const bool use_field_;
         std::vector<double>& inv_std_;
+        const double* scan_scale_ = nullptr;
+};
+
+// Keeps the scale estimated for the current scan close to the one estimated for the previous scan.
+// Nothing else pins the scale down: without this prior it would be a free multiplicative parameter of
+// every registration, and it would happily absorb whatever the pose cannot explain. The weight is the
+// inverse of the standard deviation of the scale change between two consecutive scans.
+struct ScalePriorFunctor {
+    ScalePriorFunctor(const double previous_scale, const double weight)
+    : previous_scale_(previous_scale)
+    , weight_(weight)
+    {
+    }
+
+    template<typename T>
+    bool operator()(const T* const scale, T* residuals) const
+    {
+        residuals[0] = T(weight_)*(scale[0] - T(previous_scale_));
+        return true;
+    }
+
+    double previous_scale_;
+    double weight_;
 };
 
 // Anchors the registration to the pose given as prior (the odometry): registerPts optimises a

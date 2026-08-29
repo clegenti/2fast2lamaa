@@ -104,6 +104,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // it at the initial guess instead.
             options.point_covariances_per_iteration = readFieldBool(this, "point_covariances_per_iteration", true);
 
+            // Estimate a scale of the scans alongside the pose, for a front-end whose reconstruction
+            // is not exactly metric. A prior keeps it from moving much between two consecutive scans.
+            options.use_scale_optimization = readFieldBool(this, "use_scale_optimization", false);
+            options.scale_prior_weight = readFieldDouble(this, "scale_prior_weight", 100.0);
+            use_scale_optimization_ = options.use_scale_optimization;
+            if(options.use_scale_optimization && !localization_)
+            {
+                // SubmapManager::addPts throws in that case, better to say so before the first scan
+                RCLCPP_WARN(this->get_logger(), "use_scale_optimization is set outside of localization_only mode: adding points to the map is not implemented with an estimated scale and will throw on the first scan");
+            }
+
             double min_range = readRequiredFieldDouble(this, "min_range");
             options.min_range = min_range;
             options.max_range = readFieldDouble(this, "max_range", 1000.0);
@@ -294,6 +305,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         bool localization_ = false;
         bool use_edge_field_ = true;
         bool use_point_covariances_ = false;
+        bool use_scale_optimization_ = false;
 
         std::mutex map_mutex_;
 
@@ -472,6 +484,10 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
                     double temp_time = sw2.stop();
                     RCLCPP_INFO(this->get_logger(), "Registration time: %f ms", temp_time);
+                    if(use_scale_optimization_)
+                    {
+                        RCLCPP_INFO(this->get_logger(), "Estimated scan scale: %f", map_->getScale());
+                    }
 
                 }
                 else

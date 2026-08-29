@@ -538,15 +538,18 @@ const double kMinGradNorm = 1e-9;
 // The projection depends on the pose, through the rotation of the covariance and through the normal
 // itself. It is refreshed at every evaluation point of the solver by PointCovarianceCallback, or held
 // at the pose given as prior when `point_covariances_per_iteration` is off.
-void MapDistField::computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field, std::vector<double>& inv_std)
+void MapDistField::computePointInvStd(const std::vector<Pointd>& pts, const std::vector<Mat3>& pts_cov, const Mat4& pose, const bool use_field, std::vector<double>& inv_std, const double scan_scale)
 {
     const Mat3 rot = pose.block<3,3>(0,0);
     const Vec3 pos = pose.block<3,1>(0,3);
+    // Scaling a point by s scales its covariance by s^2, and the field has to be queried where the
+    // scaled point actually is
+    const double variance_scale = scan_scale*scan_scale;
     inv_std.assign(pts.size(), 1.0);
     #pragma omp parallel for num_threads(num_threads_)
     for(size_t i = 0; i < pts.size(); i++)
     {
-        const Vec3 grad = queryDistFieldAndGrad(rot*pts[i].vec3() + pos, use_field, pts[i].type).second;
+        const Vec3 grad = queryDistFieldAndGrad(rot*(scan_scale*pts[i].vec3()) + pos, use_field, pts[i].type).second;
         const double grad_norm = grad.norm();
         double variance;
         if(grad_norm > kMinGradNorm)
@@ -562,7 +565,7 @@ void MapDistField::computePointInvStd(const std::vector<Pointd>& pts, const std:
             // direction agnostic mean variance
             variance = pts_cov[i].trace()/3.0;
         }
-        inv_std[i] = 1.0/std::max(std::sqrt(std::max(variance, 0.0)), kMinPointStd);
+        inv_std[i] = 1.0/std::max(std::sqrt(std::max(variance_scale*variance, 0.0)), kMinPointStd);
     }
 }
 
@@ -579,7 +582,8 @@ void PointCovarianceCallback::PrepareForEvaluation(bool evaluate_jacobians, bool
     Mat4 correction = Mat4::Identity();
     correction.block<3,3>(0,0) = expMap(pose_correction_.segment<3>(3));
     correction.block<3,1>(0,3) = pose_correction_.segment<3>(0);
-    map_->computePointInvStd(pts_, pts_cov_, prior_*correction, use_field_, inv_std_);
+    const double scan_scale = (scan_scale_ != nullptr) ? *scan_scale_ : 1.0;
+    map_->computePointInvStd(pts_, pts_cov_, prior_*correction, use_field_, inv_std_, scan_scale);
 }
 
 Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov)
@@ -589,7 +593,13 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
         cleanCells();
     }
     Vec6 pose_correction_state = Vec6::Zero();
-    
+
+    // Scale of the scan, its own parameter block so that the pose block, its manifold and the priors
+    // acting on it are left untouched. It starts from the estimate of the previous registration, which
+    // is also what the prior below holds it to.
+    const bool use_scale = opt_.use_scale_optimization;
+    double scale_state = scale_;
+
     int num_neighbors_save = num_neighbors_;
     num_neighbors_ = 1;
 
@@ -606,10 +616,10 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
         }
         else
         {
-            computePointInvStd(pts, pts_cov, pose, !approximate, inv_std);
+            computePointInvStd(pts, pts_cov, pose, !approximate, inv_std, scale_state);
             if(opt_.point_covariances_per_iteration)
             {
-                point_covariance_callback = std::make_unique<PointCovarianceCallback>(this, pts, pts_cov, pose, pose_correction_state, !approximate, inv_std);
+                point_covariance_callback = std::make_unique<PointCovarianceCallback>(this, pts, pts_cov, pose, pose_correction_state, !approximate, inv_std, use_scale ? &scale_state : nullptr);
             }
         }
     }
@@ -621,11 +631,19 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     {
         ceres::SubsetManifold* manifold = new ceres::SubsetManifold(6, {2, 3, 4});
         problem.AddParameterBlock(pose_correction_state.data(), 6, manifold);
-        
+
     }
     else
     {
         problem.AddParameterBlock(pose_correction_state.data(), 6);
+    }
+
+    if(use_scale)
+    {
+        problem.AddParameterBlock(&scale_state, 1);
+        ceres::CostFunction* scale_prior_cost = new ceres::AutoDiffCostFunction<ScalePriorFunctor, 1, 1>(
+                new ScalePriorFunctor(scale_, opt_.scale_prior_weight));
+        problem.AddResidualBlock(scale_prior_cost, nullptr, &scale_state);
     }
 
     if(gravity_factor)
@@ -686,8 +704,16 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     // Optimization with openMP in the cost function
     bool use_loss = (loss_scale > 0.0);
-    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_, inv_std.empty() ? nullptr : &inv_std);
-    problem.AddResidualBlock(cost_function, NULL, pose_correction_state.data());
+    RegistrationCostFunction* cost_function = new RegistrationCostFunction(pts, temp_pose, this, weights, loss_scale, !approximate, use_loss, num_threads_, inv_std.empty() ? nullptr : &inv_std, use_scale);
+    if(use_scale)
+    {
+        // The order has to match the parameter block sizes the cost function declares
+        problem.AddResidualBlock(cost_function, NULL, pose_correction_state.data(), &scale_state);
+    }
+    else
+    {
+        problem.AddResidualBlock(cost_function, NULL, pose_correction_state.data());
+    }
 
 
     ceres::Solver::Summary summary;
@@ -705,6 +731,10 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     num_neighbors_ = num_neighbors_save;
     last_time_register_ = current_time;
+    if(use_scale)
+    {
+        scale_ = scale_state;
+    }
 
     return temp_pose*pose_correction;
 }
@@ -1604,12 +1634,13 @@ void MapDistField::loadMap(const std::string& filename)
 
 
 
-RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads, const std::vector<double>* inv_std)
+RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pts, const Mat4& prior, MapDistField* map, const std::vector<double>& weights, const double cauchy_loss_scale, const bool use_field, const bool use_loss, const int num_threads, const std::vector<double>* inv_std, const bool use_scale)
     : prior_(prior)
     , map_(map)
     , weights_(weights)
     , inv_std_(inv_std)
     , use_mahalanobis_((inv_std != nullptr) && (inv_std->size() == pts.size()))
+    , use_scale_(use_scale)
     , use_field_(use_field)
     , num_threads_(num_threads)
 {
@@ -1632,6 +1663,10 @@ RegistrationCostFunction::RegistrationCostFunction(const std::vector<Pointd>& pt
     set_num_residuals(pts.size());
     std::vector<int>* parameter_block_sizes = mutable_parameter_block_sizes();
     parameter_block_sizes->push_back(6);
+    if(use_scale_)
+    {
+        parameter_block_sizes->push_back(1);
+    }
 }
 
 void RegistrationCostFunction::setUseField(const bool use_field)
@@ -1649,6 +1684,10 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
 
     Mat3 R = expMap(rot);
 
+    // Scale of the scan, the second parameter block when it is estimated. The points are scaled around
+    // the origin of the sensor: p_world = R_prior*(exp(rot)*(s*p) + t) + t_prior
+    const double scan_scale = use_scale_ ? parameters[1][0] : 1.0;
+
     Mat3 R_w = R_prior*R;
     Vec3 p_w = R_prior*pos + pos_prior;
 
@@ -1658,15 +1697,16 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
     {
         if( jacobians[0] != NULL)
         {
-            MatX pts_corr = R*pts;
+            MatX pts_corr = (scan_scale*R)*pts;
             pts_corr.colwise() += pos;
-            
+
             MatX pts_w = R_prior*pts_corr;
             pts_w.colwise() += pos_prior;
 
             Mat3 J_rot = jacobianLefthandSO3(rot);
 
             Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> jacobian(jacobians[0], pts_.size(), 6);
+            const bool with_scale_jacobian = use_scale_ && (jacobians[1] != NULL);
 
             #pragma omp parallel for num_threads(num_threads_)
             for(size_t i = 0; i < pts_.size(); i++)
@@ -1674,37 +1714,45 @@ bool RegistrationCostFunction::Evaluate(double const* const* parameters, double*
                 Vec3 temp_pt = pts_w.col(i);
                 auto [dist, grad] = map_->queryDistFieldAndGrad(temp_pt, use_field_, type_[i]);
                 // The loss is applied to the mahalanobis distance when the point covariances are
-                // used, and to the euclidean distance otherwise (the scale is then exactly 1.0)
-                const double scale = use_mahalanobis_ ? (*inv_std_)[i] : 1.0;
+                // used, and to the euclidean distance otherwise (the factor is then exactly 1.0)
+                const double maha_scale = use_mahalanobis_ ? (*inv_std_)[i] : 1.0;
                 // Apply the loss function
                 std::array<double, 3> temp;
-                loss_function_->Evaluate(dist*scale, temp.data());
+                loss_function_->Evaluate(dist*maha_scale, temp.data());
                 residuals[i] = temp[0] * weights_[i];
 
                 // The derivative of the loss is taken with respect to the distance, hence the chain
                 // rule through the scaling
-                const double d_loss_d_dist = temp[1]*scale;
-                Row3 d_dist_d_rot = -d_loss_d_dist*grad.transpose()*R_prior*(toSkewSymMat(pts_corr.col(i)-pos))*J_rot;
+                const double d_loss_d_dist = temp[1]*maha_scale;
+                // exp(rot)*(s*p), the lever arm of the rotation
+                const Vec3 rotated_scaled_pt = pts_corr.col(i) - pos;
+                Row3 d_dist_d_rot = -d_loss_d_dist*grad.transpose()*R_prior*(toSkewSymMat(rotated_scaled_pt))*J_rot;
                 Row3 d_dist_d_pos = d_loss_d_dist*grad.transpose()*R_prior;
 
                 jacobian.block<1,3>(i, 0) = weights_[i] * d_dist_d_pos;
                 jacobian.block<1,3>(i, 3) = weights_[i] * d_dist_d_rot;
+                if(with_scale_jacobian)
+                {
+                    // d p_world / d s = R_prior * exp(rot) * p. Recomputed rather than taken as
+                    // rotated_scaled_pt/s, which would blow up if the scale ever collapsed
+                    jacobians[1][i] = weights_[i] * d_loss_d_dist * grad.dot(R_prior*(R*pts.col(i)));
+                }
             }
         }
     }
     else
     {
-        MatX pts_w = R_w*pts;
+        MatX pts_w = (scan_scale*R_w)*pts;
         pts_w.colwise() += p_w;
 
         #pragma omp parallel for num_threads(num_threads_)
         for(size_t i = 0; i < pts_.size(); i++)
         {
             const double dist = map_->queryDistField(pts_w.col(i), use_field_, type_[i]);
-            const double scale = use_mahalanobis_ ? (*inv_std_)[i] : 1.0;
+            const double maha_scale = use_mahalanobis_ ? (*inv_std_)[i] : 1.0;
             // Apply the loss function
             std::array<double, 3> temp;
-            loss_function_->Evaluate(dist*scale, temp.data());
+            loss_function_->Evaluate(dist*maha_scale, temp.data());
             residuals[i] = temp[0] * weights_[i];
         }
 

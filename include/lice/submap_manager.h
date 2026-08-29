@@ -37,6 +37,9 @@ class SubmapManager
         // node when localizing (the scans are not added to the map in that case).
         void writeScan(const std::vector<Pointd>& pts, const int64_t time);
 
+        // Scale of the scans as last estimated by the registration, 1.0 when the estimation is off
+        double getScale() const { return (current_map_ != nullptr) ? current_map_->getScale() : 1.0; }
+
 
         void addGyrMeasurement(const Vec3& gyr, const int64_t time_ns);
 
