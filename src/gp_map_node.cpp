@@ -75,6 +75,11 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             options.free_space_carving_radius = readFieldDouble(this, "free_space_carving_radius", -1.0);
 
             localization_ = readFieldBool(this, "localization_only", false);
+            // The first scan of a localization is registered with a coarse to fine schedule, to pull
+            // an initial guess that may be far off onto the map. Set this when the guess is known to
+            // be good: the first scan is then registered like any other one, which is both faster and
+            // keeps the wide losses from dragging it away from a guess that was already right.
+            can_trust_init_ = readFieldBool(this, "can_trust_init", false);
 
             max_nb_pts_ = readFieldInt(this, "max_num_pts_for_registration", 4000);
 
@@ -306,6 +311,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         bool use_edge_field_ = true;
         bool use_point_covariances_ = false;
         bool use_scale_optimization_ = false;
+        bool can_trust_init_ = false;
 
         std::mutex map_mutex_;
 
@@ -452,10 +458,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, false, true);
 
                     map_mutex_.lock();
-                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 10.0, 10.0, downsampled_covs);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 5.0, 10.0, downsampled_covs);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 2.0, 10.0, downsampled_covs);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), approximate_, loss_scale_, kDefaultRegistrationIterations, downsampled_covs);
+                    if(!can_trust_init_)
+                    {
+                        // Coarse to fine, to pull an initial guess that can be far off onto the map.
+                        // The wide losses let the registration travel a long way, which is only worth
+                        // its cost when the guess is not to be trusted.
+                        current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 10.0, 10.0, downsampled_covs);
+                        current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 5.0, 10.0, downsampled_covs);
+                        current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 2.0, 10.0, downsampled_covs);
+                        init_guess_ = current_pose_;
+                    }
+                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), approximate_, loss_scale_, kDefaultRegistrationIterations, downsampled_covs);
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
                 }
@@ -479,9 +492,6 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
 
-                    publishOdomMapCorrection(time, trans);
-
-
                     double temp_time = sw2.stop();
                     RCLCPP_INFO(this->get_logger(), "Registration time: %f ms", temp_time);
                     if(use_scale_optimization_)
@@ -492,9 +502,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 }
                 else
                 {
-                    current_pose_ = trans;
+                    // Without registration the pose is dead reckoned from the input odometry. When
+                    // localizing, that odometry lives in its own frame, which is not the map frame:
+                    // `init_guess_` is the same motion composed on top of the initial map pose, so it
+                    // is the one expressed in the map. In mapping mode the two frames are the same and
+                    // the input pose is used as it always was.
+                    current_pose_ = localization_ ? init_guess_ : trans;
                 }
                 publishPose(time, current_pose_);
+                // Published whatever produced `current_pose_`, so that the map to odom transform is
+                // available to the rest of the system even when the registration is disabled
+                publishOdomMapCorrection(time, trans);
 
 
 

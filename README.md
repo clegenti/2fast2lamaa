@@ -306,6 +306,7 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 |-----------|------|---------|-------------|
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `using_submaps` | bool | `false` | Enable submap-based localization (automatically enabled if `submap_length` > 0 in mapping mode) |
+| `can_trust_init` | bool | `false` | Skip the coarse-to-fine registrations of the first scan and register it like any other one. The first scan is otherwise registered four times with decreasing loss scales (10, 5, 2, then `loss_function_scale`) to pull a rough initial guess onto the map, which is wasted work — and a risk of being dragged off — when the initial pose is already good |
 | `reverse_path` | bool | REQUIRED | Only for topometric localization: whether to traverse submaps in reverse order during localization |
 | `submap_node_search_dist` | double | `20.0` | Only for topometric localization: maximum "jump" allowed in the topometric graph, in meters along the mapped path (see below) |
 | `init_pose_x` | double | `0.0` | Initial X position for localization (meters) |
