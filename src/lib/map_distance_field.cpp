@@ -516,7 +516,7 @@ void MapDistField::calibrateUncertaintyProxy()
     opt_.min_range = save_min_range;
 }
 
-Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor)
+Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const bool disable_odom_prior)
 {
     if(current_time != last_time_register_)
     {
@@ -548,7 +548,9 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     // Keep the solution close to the pose given as prior (the odometry), instead of only starting
     // from it. The correction is what is optimised, so the prior is a zero-prior on it.
-    if(opt_.use_odom_prior)
+    // Skipped when the caller is recovering from a prior pose it does not trust: the prior is a
+    // zero-prior on the correction, so it would pull the solution back onto that very pose.
+    if(opt_.use_odom_prior && !disable_odom_prior)
     {
         ceres::CostFunction* odom_prior_cost = new ceres::AutoDiffCostFunction<OdomPriorFunctor, 6, 6>(
                 new OdomPriorFunctor(opt_.odom_prior_weight_pos, opt_.odom_prior_weight_rot));

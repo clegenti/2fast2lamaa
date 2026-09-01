@@ -8,6 +8,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <deque>
 
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -44,6 +45,20 @@ bool createFolder(const std::string& folderPath) {
         return true; // Folder created successfully
     return false; // Failed to create folder
 }
+
+// A gap between two consecutive scans longer than mean + kDropoutSigmaFactor*stdev is taken as a
+// dropped frame. The statistics need a few samples before that test means anything, hence the minimum.
+constexpr double kDropoutSigmaFactor = 2.0;
+constexpr double kMinDropoutSamples = 10.0;
+
+// How many of the latest scan-to-scan motions the velocity used to bridge a dropped frame is averaged
+// over
+constexpr size_t kScanVelMean = 4;
+
+// Loss scales of the coarse-to-fine registration cascade, from the widest to the narrowest, and the
+// number of iterations each of the coarse steps gets
+const std::vector<double> kCoarseToFineLossScales = {10.0, 5.0, 2.0};
+constexpr int kCoarseToFineIterations = 10;
 
 class GpMapNode: public rclcpp::Node, public GpMapPublisher
 {
@@ -82,12 +97,19 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // guess. The weights are the inverse of the standard deviation the odometry is trusted
             // with, separately for the translation (1/m) and the rotation (1/rad).
             options.use_odom_prior = readFieldBool(this, "use_odom_prior", false);
+            use_odom_prior_ = options.use_odom_prior;
             options.odom_prior_weight_pos = readFieldDouble(this, "odom_prior_weight_pos", 1.0);
             options.odom_prior_weight_rot = readFieldDouble(this, "odom_prior_weight_rot", 1.0);
             if(options.use_odom_prior && !with_init_guess)
             {
                 RCLCPP_WARN(this->get_logger(), "use_odom_prior is set but there is no odometry input (with_init_guess is false): the prior will anchor the registration to the previous pose instead");
             }
+
+            // Spotting a dropped frame from the gap between two scans only means something for an
+            // input with a regular rate. An asynchronous one, such as the keyframes of a camera
+            // front-end, has no meaningful scan interval and every longer gap would look like a
+            // dropout, so the detection is turned off for those.
+            use_frame_dropout_detection_ = readFieldBool(this, "use_frame_dropout_detection", true);
 
             double min_range = readRequiredFieldDouble(this, "min_range");
             options.min_range = min_range;
@@ -329,6 +351,28 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         double key_framing_time_cumulated_ = 0.0;
         double key_framing_dist_cumulated_ = 0.0;
 
+        // Running mean and variance (Welford) of the delta time between two consecutive incoming
+        // scans, used to spot a dropped frame. The flag is kept until it has actually triggered a
+        // registration: a dropout noticed on a scan that is not a keyframe still leaves the next
+        // registered scan with a longer gap than usual to cover.
+        double scan_dt_count_ = 0.0;
+        double scan_dt_mean_ = 0.0;
+        double scan_dt_m2_ = 0.0;
+        bool pending_frame_dropout_ = false;
+        bool use_frame_dropout_detection_ = true;
+        bool use_odom_prior_ = false;
+
+        // The last kScanVelMean trusted odometry increments, each with the interval it spanned. Their
+        // moving average is the velocity the motion over a dropped frame is extrapolated at, so that one
+        // noisy increment does not decide the prediction on its own.
+        struct MotionSample
+        {
+            Vec3 translation;
+            Vec3 rotation;
+            double dt;
+        };
+        std::deque<MotionSample> recent_motions_;
+
 
         std::unique_ptr<std::thread> map_publish_thread_;
 
@@ -362,6 +406,54 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
 
+        // Standard deviation of the delta time between consecutive scans, from the accumulator
+        double scanIntervalStdev() const
+        {
+            return (scan_dt_count_ > 1.0) ? std::sqrt(scan_dt_m2_/(scan_dt_count_ - 1.0)) : 0.0;
+        }
+
+        // Fold one delta time into the running mean and variance. The outliers are folded in as well,
+        // so that a genuine change of scan rate is eventually followed instead of being reported as a
+        // dropout forever; with enough samples one long gap barely moves the mean.
+        void updateScanIntervalStats(const double scan_dt)
+        {
+            scan_dt_count_ += 1.0;
+            const double delta = scan_dt - scan_dt_mean_;
+            scan_dt_mean_ += delta/scan_dt_count_;
+            scan_dt_m2_ += delta*(scan_dt - scan_dt_mean_);
+        }
+
+        // Is the gap since the previous scan long enough to call it a dropped frame? Tested against the
+        // statistics of the scans before this one, which are then updated with it.
+        bool detectFrameDropout(const double scan_dt)
+        {
+            const double threshold = scan_dt_mean_ + kDropoutSigmaFactor*scanIntervalStdev();
+            const bool dropout = (scan_dt_count_ >= kMinDropoutSamples) && (scan_dt > threshold);
+            if(dropout)
+            {
+                RCLCPP_WARN(this->get_logger(), "Dropped frame: %.1f ms since the last scan, over the %.1f ms threshold (mean %.1f ms, stdev %.1f ms): registering coarse-to-fine",
+                        scan_dt*1e3, threshold*1e3, scan_dt_mean_*1e3, scanIntervalStdev()*1e3);
+            }
+            updateScanIntervalStats(scan_dt);
+            return dropout;
+        }
+
+        // Coarse-to-fine cascade: registrations with a shrinking loss scale, each starting from the
+        // result of the previous one. The wide loss of the early steps pulls in from further away than
+        // the single fine registration can, which is what a bad initial guess needs. The caller holds
+        // map_mutex_, and the fine registration is left to it.
+        Mat4 registerCoarseToFine(const std::vector<Pointd>& pts, const Mat4& prior,
+                                  const int64_t time_ns, const bool disable_odom_prior = false)
+        {
+            Mat4 pose = prior;
+            for(const double coarse_loss_scale : kCoarseToFineLossScales)
+            {
+                pose = map_->registerPts(pts, pose, time_ns, true, coarse_loss_scale,
+                                         kCoarseToFineIterations, disable_odom_prior);
+            }
+            return pose;
+        }
+
         void updateMap(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, const Mat4 trans)
         {
             StopWatch sw;
@@ -387,12 +479,40 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             }
 
             // Check if the map need to be updated
+            bool dropout_now = false;
+            const double scan_dt = first_ ? 0.0 : (time - last_pc_time_).seconds();
             if(!first_)
             {
+                // A dropped frame leaves more motion than usual between two scans, so the initial
+                // guess is further from the solution than the fine registration alone can recover
+                if(use_frame_dropout_detection_)
+                {
+                    dropout_now = detectFrameDropout(scan_dt);
+                    pending_frame_dropout_ = pending_frame_dropout_ || dropout_now;
+                }
+
                 // Check if we need to update the map
                 add_to_map = needMapUpdate(time, trans);
             }
-            updateInitGuess(trans);
+
+            if(dropout_now)
+            {
+                // The odometry increment spanning the gap is the one that is likely wrong, so the motion
+                // is predicted at the average velocity of the last few scans instead. Only this
+                // increment is replaced: the ones that follow span no gap and are kept as they are.
+                // `last_input_pose_` is advanced at the end of this function either way, so the discarded
+                // increment is not composed in later.
+                const Mat4 predicted_delta = predictConstantVelocity(scan_dt);
+                init_guess_ = init_guess_*predicted_delta;
+                RCLCPP_WARN(this->get_logger(), "Dropped frame: replacing the odometry increment by a constant-velocity prediction over %.1f ms, from the mean velocity of the last %zu scan(s): %.3f m, %.2f deg",
+                        scan_dt*1e3, recent_motions_.size(),
+                        predicted_delta.block<3,1>(0,3).norm(),
+                        logMap(Mat3(predicted_delta.block<3,3>(0,0))).norm()*180.0/M_PI);
+            }
+            else
+            {
+                updateInitGuess(trans, scan_dt);
+            }
 
 
             if(add_to_map)
@@ -415,9 +535,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     std::vector<Pointd> downsampled_pts = downsamplePointCloud<double>(pts, downsample_size_, max_nb_pts_, true);
 
                     map_mutex_.lock();
-                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 10.0, 10.0);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 5.0, 10.0);
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 2.0, 10.0);
+                    current_pose_ = registerCoarseToFine(downsampled_pts, init_guess_, getTimeNs(time));
                     current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), approximate_, loss_scale_);
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
@@ -443,6 +561,20 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     {
                         current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 10.0*loss_scale_);
                         init_guess_ = current_pose_;
+                    }
+                    // After a dropped frame, walk the loss scale down before the fine registration, the
+                    // same way the very first scan is registered, rather than trusting an initial guess
+                    // that has a longer gap than usual to cover
+                    if(pending_frame_dropout_)
+                    {
+                        // The guess is deliberately stale here, so the odometry prior would anchor the
+                        // solution to the very pose the cascade is trying to move away from
+                        if(use_odom_prior_)
+                        {
+                            RCLCPP_WARN(this->get_logger(), "Recovering from a dropped frame: the odometry prior is disabled for the coarse-to-fine registration, as the guess it would anchor to is the pose before the gap");
+                        }
+                        init_guess_ = registerCoarseToFine(downsampled_pts, init_guess_, getTimeNs(time), true);
+                        pending_frame_dropout_ = false;
                     }
                     //current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 2*loss_scale_, 7);
                     current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), approximate_, loss_scale_, 25);
@@ -525,10 +657,55 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             pose_pub_->publish(pose_msg);
         }
 
-        void updateInitGuess(const Mat4& trans)
+        void updateInitGuess(const Mat4& trans, const double scan_dt)
         {
             Mat4 delta_trans = last_input_pose_.inverse() * trans;
             init_guess_ = init_guess_*delta_trans;
+
+            // Keep it among the trusted motions, to extrapolate from should the next scan arrive after
+            // a gap
+            if(scan_dt > 0.0)
+            {
+                const Mat3 delta_rot = delta_trans.block<3,3>(0,0);
+                recent_motions_.push_back({delta_trans.block<3,1>(0,3), logMap(delta_rot), scan_dt});
+                while(recent_motions_.size() > kScanVelMean)
+                {
+                    recent_motions_.pop_front();
+                }
+            }
+        }
+
+        // Motion over `scan_dt` at the average velocity of the last trusted increments: their total
+        // rotation and translation over their total time, integrated over the gap. Used in place of the
+        // odometry increment spanning a dropped frame, which is the one not to be trusted. Identity
+        // while there is nothing to extrapolate from yet, which leaves the guess where it was.
+        //
+        // The increments are each expressed in their own body frame, so averaging them assumes the
+        // orientation does not change much over the window, which holds for the few scans it spans.
+        Mat4 predictConstantVelocity(const double scan_dt) const
+        {
+            Mat4 delta = Mat4::Identity();
+            if(recent_motions_.empty() || (scan_dt <= 0.0))
+            {
+                return delta;
+            }
+            Vec3 total_translation = Vec3::Zero();
+            Vec3 total_rotation = Vec3::Zero();
+            double total_dt = 0.0;
+            for(const MotionSample& motion : recent_motions_)
+            {
+                total_translation += motion.translation;
+                total_rotation += motion.rotation;
+                total_dt += motion.dt;
+            }
+            if(total_dt <= 0.0)
+            {
+                return delta;
+            }
+            const double ratio = scan_dt/total_dt;
+            delta.block<3,3>(0,0) = expMap(Vec3(total_rotation*ratio));
+            delta.block<3,1>(0,3) = total_translation*ratio;
+            return delta;
         }
         
 

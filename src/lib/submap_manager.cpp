@@ -230,7 +230,7 @@ SubmapManager::~SubmapManager() {}
 
 
 // Use the current map to register the points
-Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations)
+Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, const bool disable_odom_prior)
 {
     GravityFactorFunctor* gravity_factor = nullptr;
     if(!localization_)
@@ -252,7 +252,7 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
         throw std::runtime_error("No current map available for registration");
     }
 
-    Mat4 updated_pose = current_map_->registerPts(pts, prior, current_time, approximate, loss_scale, max_iterations, gravity_factor);
+    Mat4 updated_pose = current_map_->registerPts(pts, prior, current_time, approximate, loss_scale, max_iterations, gravity_factor, disable_odom_prior);
     last_registered_time_ = current_time;
     if(localization_ && using_submaps_ && graph_nodes_.size() > 0)
     {

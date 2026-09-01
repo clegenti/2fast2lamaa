@@ -235,7 +235,10 @@ class MapDistField {
 
         void set2D(const bool is_2d){ is_2d_ = is_2d;}
 
-        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr);
+        // `disable_odom_prior` overrides the `use_odom_prior` option for this one call. It is meant for
+        // a registration that is recovering from a bad prior pose, where anchoring the solution to that
+        // pose is exactly the wrong thing to do.
+        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr, const bool disable_odom_prior = false);
 
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const std::vector<double>& count=std::vector<double>());
         std::vector<Pointd> getPts();
