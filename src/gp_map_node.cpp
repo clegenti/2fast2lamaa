@@ -580,6 +580,15 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         void updateInitGuess(const Mat4& trans)
         {
             Mat4 delta_trans = last_input_pose_.inverse() * trans;
+            // The estimated scale is the scale of the reconstruction the odometry itself comes from:
+            // the landmark depths and the trajectory translation share it. Scaling the points but not
+            // the motion would leave the guess short by (s-1)*|delta| every scan, along the direction
+            // of travel, and the odometry prior (a zero-prior on the correction) would fight the
+            // registration correcting it. The rotation is scale-invariant.
+            if(use_scale_optimization_)
+            {
+                delta_trans.block<3,1>(0,3) *= map_->getScale();
+            }
             init_guess_ = init_guess_*delta_trans;
         }
         
