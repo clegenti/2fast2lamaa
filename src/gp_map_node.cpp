@@ -427,7 +427,8 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         // statistics of the scans before this one, which are then updated with it.
         bool detectFrameDropout(const double scan_dt)
         {
-            const double threshold = scan_dt_mean_ + kDropoutSigmaFactor*scanIntervalStdev();
+            //const double threshold = scan_dt_mean_ + kDropoutSigmaFactor*scanIntervalStdev();
+            const double threshold = 1.4*scan_dt_mean_;
             const bool dropout = (scan_dt_count_ >= kMinDropoutSamples) && (scan_dt > threshold);
             if(dropout)
             {
