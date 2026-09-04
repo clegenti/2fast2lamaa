@@ -4,9 +4,14 @@
 #include "happly/happly.h"
 
 #include <iostream>
+#include <algorithm>
 #include <eigen3/Eigen/Dense>
 
 
+// Largest number of points handed to addPts in one go when loading a map from a file. It bounds the
+// memory held on top of the points read from the file, which matters for the maps of tens of millions
+// of points a localization run is given.
+constexpr size_t kMaxPointsPerLoadChunk = 10000000;
 
 
 
@@ -1484,8 +1489,20 @@ void MapDistField::loadMap(const std::string& filename)
 
     sw.reset();
     sw.start();
+
+    // A map of tens of millions of points is added in chunks: only one chunk of Pointd is held next to
+    // what was read from the file, instead of a second copy of the whole map plus whatever addPts
+    // allocates for it. A map smaller than one chunk goes in with a single call, exactly as before.
+    //
+    // Free space carving has to be off while doing so. addPts only carves from its second call on
+    // (`scan_counter_ > 0`), so a single-call load never triggered it; chunking would, and with a pose
+    // of identity it would carve the points of the previous chunks straight back out of the map.
+    const bool free_space_carving_backup = opt_.free_space_carving;
+    opt_.free_space_carving = false;
+
     std::vector<Pointd> pts_to_add;
-    pts_to_add.reserve(pts.size());
+    pts_to_add.reserve(std::min(pts.size(), kMaxPointsPerLoadChunk));
+    size_t nb_pts_added = 0;
     for(size_t i = 0; i < pts.size(); i++)
     {
         const auto& pt = pts[i];
@@ -1502,9 +1519,33 @@ void MapDistField::loadMap(const std::string& filename)
                 pts_to_add.back().type = 1;
             }
         }
+
+        if(pts_to_add.size() >= kMaxPointsPerLoadChunk)
+        {
+            addPts(pts_to_add, Mat4::Identity());
+            nb_pts_added += pts_to_add.size();
+            std::cout << "  added " << nb_pts_added << " / " << pts.size() << " points of the map"
+                      << std::endl;
+            // The capacity is kept, so the next chunk reuses the same allocation
+            pts_to_add.clear();
+        }
     }
 
-    addPts(pts_to_add, Mat4::Identity());
+    // The last chunk, and the whole map when it is smaller than one chunk. addPts dereferences its
+    // first point before checking the size, so an empty one is never handed to it.
+    if(pts_to_add.size() > 0)
+    {
+        addPts(pts_to_add, Mat4::Identity());
+        nb_pts_added += pts_to_add.size();
+    }
+
+    opt_.free_space_carving = free_space_carving_backup;
+
+    if(nb_pts_added != pts.size())
+    {
+        std::cout << "  " << (pts.size() - nb_pts_added)
+                  << " point(s) of the file were left out as non-finite" << std::endl;
+    }
 
     sw.stop();
     sw.print("Time to load map");
