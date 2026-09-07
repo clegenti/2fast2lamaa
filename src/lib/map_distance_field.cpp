@@ -4,9 +4,14 @@
 #include "happly/happly.h"
 
 #include <iostream>
+#include <algorithm>
 #include <eigen3/Eigen/Dense>
 
 
+// Largest number of points handed to addPts in one go when loading a map from a file. It bounds the
+// memory held on top of the points read from the file, which matters for the maps of tens of millions
+// of points a localization run is given.
+constexpr size_t kMaxPointsPerLoadChunk = 10000000;
 
 
 
@@ -586,7 +591,7 @@ void PointCovarianceCallback::PrepareForEvaluation(bool evaluate_jacobians, bool
     map_->computePointInvStd(pts_, pts_cov_, prior_*correction, use_field_, inv_std_, scan_scale);
 }
 
-Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov)
+Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov, const bool disable_odom_prior)
 {
     if(current_time != last_time_register_)
     {
@@ -655,7 +660,9 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
     // Keep the solution close to the pose given as prior (the odometry), instead of only starting
     // from it. The correction is what is optimised, so the prior is a zero-prior on it.
-    if(opt_.use_odom_prior)
+    // Skipped when the caller is recovering from a prior pose it does not trust: the prior is a
+    // zero-prior on the correction, so it would pull the solution back onto that very pose.
+    if(opt_.use_odom_prior && !disable_odom_prior)
     {
         ceres::CostFunction* odom_prior_cost = new ceres::AutoDiffCostFunction<OdomPriorFunctor, 6, 6>(
                 new OdomPriorFunctor(opt_.odom_prior_weight_pos, opt_.odom_prior_weight_rot));
@@ -1601,8 +1608,20 @@ void MapDistField::loadMap(const std::string& filename)
 
     sw.reset();
     sw.start();
+
+    // A map of tens of millions of points is added in chunks: only one chunk of Pointd is held next to
+    // what was read from the file, instead of a second copy of the whole map plus whatever addPts
+    // allocates for it. A map smaller than one chunk goes in with a single call, exactly as before.
+    //
+    // Free space carving has to be off while doing so. addPts only carves from its second call on
+    // (`scan_counter_ > 0`), so a single-call load never triggered it; chunking would, and with a pose
+    // of identity it would carve the points of the previous chunks straight back out of the map.
+    const bool free_space_carving_backup = opt_.free_space_carving;
+    opt_.free_space_carving = false;
+
     std::vector<Pointd> pts_to_add;
-    pts_to_add.reserve(pts.size());
+    pts_to_add.reserve(std::min(pts.size(), kMaxPointsPerLoadChunk));
+    size_t nb_pts_added = 0;
     for(size_t i = 0; i < pts.size(); i++)
     {
         const auto& pt = pts[i];
@@ -1619,9 +1638,33 @@ void MapDistField::loadMap(const std::string& filename)
                 pts_to_add.back().type = 1;
             }
         }
+
+        if(pts_to_add.size() >= kMaxPointsPerLoadChunk)
+        {
+            addPts(pts_to_add, Mat4::Identity());
+            nb_pts_added += pts_to_add.size();
+            std::cout << "  added " << nb_pts_added << " / " << pts.size() << " points of the map"
+                      << std::endl;
+            // The capacity is kept, so the next chunk reuses the same allocation
+            pts_to_add.clear();
+        }
     }
 
-    addPts(pts_to_add, Mat4::Identity());
+    // The last chunk, and the whole map when it is smaller than one chunk. addPts dereferences its
+    // first point before checking the size, so an empty one is never handed to it.
+    if(pts_to_add.size() > 0)
+    {
+        addPts(pts_to_add, Mat4::Identity());
+        nb_pts_added += pts_to_add.size();
+    }
+
+    opt_.free_space_carving = free_space_carving_backup;
+
+    if(nb_pts_added != pts.size())
+    {
+        std::cout << "  " << (pts.size() - nb_pts_added)
+                  << " point(s) of the file were left out as non-finite" << std::endl;
+    }
 
     sw.stop();
     sw.print("Time to load map");

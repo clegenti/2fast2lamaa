@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <fstream>
 
+#include "nav_msgs/msg/path.hpp"
+
 #include "ffastllamaa/msg/submap_info.hpp"
 
 #include <opencv2/opencv.hpp>
@@ -142,13 +144,22 @@ class PoseGraphNode: public rclcpp::Node
 
             dist_inlier_ratio_threshold_ = readFieldDouble(this, "dist_inlier_ratio_threshold", 0.85);
 
+            // Minimum distance between two consecutive poses of the published trajectory. The pose
+            // graph holds one pose per scan, which is far more than a visualization needs, so the
+            // trajectory is thinned before being published (0 or less publishes every pose).
+            traj_publish_min_dist_ = readFieldDouble(this, "trajectory_publish_min_dist", 0.5);
+
             se3_manifold_ = new ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>();
 
-            
+
             sub_ = this->create_subscription<ffastllamaa::msg::SubmapInfo>(
                 "/submap_info", 1000,
                 std::bind(&PoseGraphNode::submapCallback, this, std::placeholders::_1)
             );
+
+            // Latched so that rviz gets the trajectory even if it subscribes after the last update
+            traj_pub_ = this->create_publisher<nav_msgs::msg::Path>("/pose_graph_trajectory",
+                    rclcpp::QoS(1).transient_local());
 
 
             map_options_.cell_size = -1.0;
@@ -182,6 +193,9 @@ class PoseGraphNode: public rclcpp::Node
         double min_dist_for_carving_ = 4.0;
         int num_threads_ = 4;
         double dist_inlier_ratio_threshold_ = 0.85;
+        double traj_publish_min_dist_ = 0.5;
+
+        rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
 
         ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>* se3_manifold_;
 
@@ -321,6 +335,7 @@ class PoseGraphNode: public rclcpp::Node
             addLoopClosuresToPoseGraph(pose_graph_edges);
 
             writeFullTrajectory();
+            publishFullTrajectory();
 
             // Cleanup the maps to save RAM
             maps_.back()->clear();
@@ -607,6 +622,49 @@ class PoseGraphNode: public rclcpp::Node
             }
             file.close();
             RCLCPP_INFO(this->get_logger(), "Wrote full trajectory with %zu poses to file: %s", time_and_pose_.size(), full_traj_file.c_str());
+        }
+
+        // Publish the optimized trajectory as a nav_msgs/Path, for the `Path` display of rviz. The
+        // poses are thinned to one every `trajectory_publish_min_dist_` meters: the graph holds one
+        // pose per scan, which is orders of magnitude more than the visualization needs. The first and
+        // the last pose are always kept, so the published path spans the whole trajectory.
+        void publishFullTrajectory()
+        {
+            nav_msgs::msg::Path msg;
+            msg.header.frame_id = "map";
+            msg.header.stamp = this->now();
+            msg.poses.reserve(time_and_pose_.size());
+
+            const int64_t last_timestamp = time_and_pose_.empty() ? -1 : time_and_pose_.rbegin()->first;
+            Vec3 last_published_pos = Vec3::Zero();
+            for(const auto& [timestamp, pose_ptr] : time_and_pose_)
+            {
+                const Vec3 pos = pose_ptr->head<3>();
+                if(!msg.poses.empty()
+                        && (traj_publish_min_dist_ > 0.0)
+                        && ((pos - last_published_pos).norm() < traj_publish_min_dist_)
+                        && (timestamp != last_timestamp))
+                {
+                    continue;
+                }
+                last_published_pos = pos;
+
+                geometry_msgs::msg::PoseStamped pose_msg;
+                pose_msg.header.frame_id = msg.header.frame_id;
+                pose_msg.header.stamp = rclcpp::Time(timestamp);
+                pose_msg.pose.position.x = pos[0];
+                pose_msg.pose.position.y = pos[1];
+                pose_msg.pose.position.z = pos[2];
+                // The poses of the graph store the quaternion in the ceres order, w first
+                pose_msg.pose.orientation.w = (*pose_ptr)[3];
+                pose_msg.pose.orientation.x = (*pose_ptr)[4];
+                pose_msg.pose.orientation.y = (*pose_ptr)[5];
+                pose_msg.pose.orientation.z = (*pose_ptr)[6];
+                msg.poses.push_back(pose_msg);
+            }
+
+            traj_pub_->publish(msg);
+            RCLCPP_INFO(this->get_logger(), "Published %zu of the %zu poses of the trajectory on /pose_graph_trajectory", msg.poses.size(), time_and_pose_.size());
         }
 
         std::string getScanPath(int64_t timestamp)

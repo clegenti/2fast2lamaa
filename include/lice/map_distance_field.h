@@ -263,7 +263,10 @@ class MapDistField {
         // `pts_cov` holds the position covariance of each point of `pts`, in the frame of the points.
         // It is only read when the `use_point_covariances` option is set, and the registration falls
         // back on unit weights if it does not have one covariance per point.
-        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr, const std::vector<Mat3>& pts_cov = std::vector<Mat3>());
+        // `disable_odom_prior` overrides the `use_odom_prior` option for this one call. It is meant for
+        // a registration that is recovering from a bad prior pose, where anchoring the solution to that
+        // pose is exactly the wrong thing to do.
+        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr, const std::vector<Mat3>& pts_cov = std::vector<Mat3>(), const bool disable_odom_prior = false);
 
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const std::vector<double>& count=std::vector<double>());
         std::vector<Pointd> getPts();
