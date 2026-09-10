@@ -40,6 +40,18 @@ class SubmapManager
         // Scale of the scans as last estimated by the registration, 1.0 when the estimation is off
         double getScale() const { return (current_map_ != nullptr) ? current_map_->getScale() : 1.0; }
 
+        // Set the weights of the odometry prior for the registrations to come. They are kept in the
+        // options too, so that a submap created later starts with the same ones.
+        void setOdomPriorWeights(const double weight_pos, const double weight_rot)
+        {
+            options_.odom_prior_weight_pos = weight_pos;
+            options_.odom_prior_weight_rot = weight_rot;
+            if(current_map_ != nullptr)
+            {
+                current_map_->setOdomPriorWeights(weight_pos, weight_rot);
+            }
+        }
+
 
         void addGyrMeasurement(const Vec3& gyr, const int64_t time_ns);
 

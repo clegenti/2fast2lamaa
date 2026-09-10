@@ -317,6 +317,15 @@ class MapDistField {
 
         void setGravity(const Vec3& gravity) { gravity_ = gravity; }
 
+        // Weights of the odometry prior, which the caller may want to set per registration rather than
+        // once: the field block of the cost grows with the number of points of the scan while the
+        // prior does not, so a prior that is to keep the same influence has to follow that number.
+        void setOdomPriorWeights(const double weight_pos, const double weight_rot)
+        {
+            opt_.odom_prior_weight_pos = weight_pos;
+            opt_.odom_prior_weight_rot = weight_rot;
+        }
+
 };
 
 

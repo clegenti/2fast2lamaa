@@ -55,6 +55,16 @@ constexpr double kMinDropoutSamples = 10.0;
 // over
 constexpr size_t kScanVelMean = 4;
 
+// The odometry prior weights are multiplied by the mean number of registered points over that many
+// scans. A window rather than the current count alone, so that one unusually sparse or dense scan does
+// not move the prior on its own.
+constexpr size_t kPriorWeightWindow = 5;
+
+// Power the point count is raised to before scaling the prior weights. 1.0 makes the weights
+// proportional to the number of points; 0.5 is what keeps the prior's influence RELATIVE to the field
+// block constant, since that block has one residual per point and the prior enters squared.
+constexpr double kPriorWeightExponent = 1.0;
+
 // Loss scales of the coarse-to-fine registration cascade, from the widest to the narrowest, and the
 // number of iterations each of the coarse steps gets
 const std::vector<double> kCoarseToFineLossScales = {10.0, 5.0, 2.0};
@@ -108,8 +118,13 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // with, separately for the translation (1/m) and the rotation (1/rad).
             options.use_odom_prior = readFieldBool(this, "use_odom_prior", false);
             use_odom_prior_ = options.use_odom_prior;
-            options.odom_prior_weight_pos = readFieldDouble(this, "odom_prior_weight_pos", 1.0);
-            options.odom_prior_weight_rot = readFieldDouble(this, "odom_prior_weight_rot", 1.0);
+            // These are FACTORS, not absolute weights: they are multiplied by the mean number of
+            // registered points over the last kPriorWeightWindow scans, so that the prior follows how
+            // much the field block of the cost weighs. The effective weight is logged per scan.
+            odom_prior_weight_pos_ = readFieldDouble(this, "odom_prior_weight_pos", 1.0);
+            odom_prior_weight_rot_ = readFieldDouble(this, "odom_prior_weight_rot", 1.0);
+            options.odom_prior_weight_pos = odom_prior_weight_pos_;
+            options.odom_prior_weight_rot = odom_prior_weight_rot_;
             if(options.use_odom_prior && !with_init_guess)
             {
                 RCLCPP_WARN(this->get_logger(), "use_odom_prior is set but there is no odometry input (with_init_guess is false): the prior will anchor the registration to the previous pose instead");
@@ -408,6 +423,12 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         };
         std::deque<MotionSample> recent_motions_;
 
+        // Factors the odometry prior weights are given as, and the number of points the registration
+        // actually saw over the last kPriorWeightWindow scans, whose mean scales them
+        double odom_prior_weight_pos_ = 1.0;
+        double odom_prior_weight_rot_ = 1.0;
+        std::deque<size_t> recent_nb_pts_;
+
 
         std::unique_ptr<std::thread> map_publish_thread_;
 
@@ -488,6 +509,35 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                                          kCoarseToFineIterations, pts_cov, disable_odom_prior);
             }
             return pose;
+        }
+
+        // Scale the odometry prior weights by the mean number of registered points over the last few
+        // scans, and hand them to the map. `odom_prior_weight_pos/rot` are the factors, so a scan of
+        // 300 points and one of 5000 do not weigh the prior against the field block the same way.
+        // Called with the count the registration is about to see, i.e. after the downsampling.
+        void updatePriorWeights(const size_t nb_pts)
+        {
+            if(!use_odom_prior_)
+            {
+                return;
+            }
+            recent_nb_pts_.push_back(nb_pts);
+            while(recent_nb_pts_.size() > kPriorWeightWindow)
+            {
+                recent_nb_pts_.pop_front();
+            }
+            double sum = 0.0;
+            for(const size_t count : recent_nb_pts_)
+            {
+                sum += static_cast<double>(count);
+            }
+            const double mean_nb_pts = sum/static_cast<double>(recent_nb_pts_.size());
+            const double scale = std::pow(std::max(mean_nb_pts, 1.0), kPriorWeightExponent);
+            map_->setOdomPriorWeights(odom_prior_weight_pos_*scale, odom_prior_weight_rot_*scale);
+            RCLCPP_INFO(this->get_logger(), "Odometry prior weights: %.3f pos, %.3f rot (factors %.3f and %.3f scaled by %.1f points averaged over %zu scan(s))",
+                    odom_prior_weight_pos_*scale, odom_prior_weight_rot_*scale,
+                    odom_prior_weight_pos_, odom_prior_weight_rot_, mean_nb_pts,
+                    recent_nb_pts_.size());
         }
 
         void updateMap(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, const Mat4 trans)
@@ -578,6 +628,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, false, true);
 
                     map_mutex_.lock();
+                    updatePriorWeights(downsampled_pts.size());
                     // The fine registration below starts from whatever this leaves in current_pose_:
                     // the guess itself when it is trusted, the result of the cascade otherwise
                     current_pose_ = init_guess_;
@@ -602,6 +653,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
                     map_mutex_.lock();
+                    updatePriorWeights(downsampled_pts.size());
                     if(!with_init_guess_)
                     {
                         current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), true, 10.0*loss_scale_, kDefaultRegistrationIterations, downsampled_covs);
