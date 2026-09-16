@@ -2,6 +2,9 @@
 
 This repository contains our open-source implementation of __2Fast-2Lamaaa__, a lidar-inertial mapping and localisation framework for large-scale environments.
 
+
+
+
 __13/02/2026 EDIT__: Adding a gravity constraint in the GP-map registration (if IMU is used: need to remap the topics). Improves Boreas-RT's metrics (tested with suburbs, tunnel,skyway, and regional (formerly called "hygway")). Not tested yet on other datasets.
 
 __09/01/2026 EDIT__: Changing the PH-tree-based spatial indexing to the [i-Octree](https://github.com/zhujun3753/i-octree). Faster and less memory consumption. The paper will be updated accordingly in the next revision.
@@ -15,25 +18,26 @@ These new variants will be added to the paper's ablation study in the next revis
 
 __If you are looking to use the undistortion-related code from our IROS publication, or the first version of 2Fast-2Lamaa, please refer to the `old` branch.__
 
-### Abstract 
+### Abstract
 
-2Fast-2Lamaa stands for Fast Field-based Agent-Subtracted Truly coupled Lidar Localisation And Mapping with Accelerometer and Angular-rate.
-In other words, it performs localisation and mapping with a lidar and an IMU (_accelerometer and angular-rate_) using a Gaussian-Process-based distance field, and allows for dynamic object removal online or offline (_agent-subtracted_).
-The first key component of the proposed approach is the optimization-based undistortion of the lidar scans that leverages continuous IMU preintegration to model the system's pose at every lidar point timestamp.
-The continuous trajectory of the system over a span of 100-200ms is parameterized solely by the initial conditions at the beginning of the scan (linear velocity and gravity orientation) and the IMU biases.
-This represents only eleven state variables that are estimated by minimizing point-to-line and point-to-plane distances between lidar-extracted features without relying on previous estimates, resulting in a prior-less motion-distortion correction strategy.
-As the proposed undistortion strategy performs local state estimation, it directly provides scan-to-scan odometry estimates.
-To enforce geometric consistency over longer periods of time, the undistorted scans are used for scan-to-map registration.
-The proposed map representation relies on Gaussian Processes to provide a continuous distance field, thus allowing point-to-surface distance queries anywhere in space.
-The poses of the undistorted lidar scans are corrected by minimizing such distances in a non-linear least-squares optimization.
-For odometry and mapping, the map is built incrementally in real-time, whereas for pure localization, it reuses existing maps.
-The incremental map building also includes mechanisms to remove dynamic objects from the scene.
-We extensively benchmark 2Fast-2Lamaa using 250km (over 10h) of public and self-collected datasets from both automotive and handheld systems.
-2Fast-2Lamaa displays state-of-the-art performance across a wide range of challenging scenarios, with odometry and localization errors down to 0.27% and 0.06m, respectively.
+This paper introduces 2Fast-2Lamaa, a lidar-inertial state estimation framework for odometry, mapping, and localization.
+Its first key component is the optimization-based undistortion of lidar scans, which uses continuous IMU preintegration to model the system's pose at every lidar point timestamp.
+The continuous trajectory over 100-200ms is parameterized only by the initial scan conditions (linear velocity and gravity orientation) and IMU biases, yielding eleven state variables.
+These are estimated by minimizing point-to-line and point-to-plane distances between lidar-extracted features without relying on previous estimates, resulting in a prior-less motion-distortion correction strategy.
+Because the method performs local state estimation, it directly provides scan-to-scan odometry.
+To maintain geometric consistency over longer periods, undistorted scans are used for scan-to-map registration.
+The map representation employs Gaussian Processes to form a continuous distance field, enabling point-to-surface distance queries anywhere in space.
+Poses of the undistorted scans are refined by minimizing these distances through non-linear least-squares optimization.
+For odometry and mapping, the map is built incrementally in real time; for pure localization, existing maps are reused.
+The incremental map construction also includes mechanisms for removing dynamic objects.
+We benchmark 2Fast-2Lamaa on over 750km of public and self-collected datasets from both automotive and handheld systems.
+The framework achieves state-of-the-art performance across diverse and challenging scenarios, reaching odometry and localization errors as low as 0.22\% and 0.06 m, respectively.
+
+
 
 ![Block diagram of 2Fast-2Lamaa](doc/block_diagram.png)
 
-A thourough presentation and performance analysis of 2Fast-2Lamaa is available in our [paper's preprint](https://arxiv.org/abs/2410.05433).
+A thourough presentation and performance analysis of 2Fast-2Lamaa is available in our [paper's preprint](https://arxiv.org/abs/2410.05433) and [journal version](https://journals.sagepub.com/doi/10.1177/02783649261451003).
 
 
 
@@ -69,7 +73,7 @@ sudo apt install libceres-dev libeigen3-dev
 To build the package, clone the repository in your ROS2 workspace and build it using colcon (if you don't have a workspace yet, create `~/ros2_ws/src`):
 ```bash
 cd /path/to/your/workspace/src
-git clone https://github.com/UTS-RI/2fast2lamaa.git
+git clone https://github.com/clegenti/2fast2lamaa.git
 cd ..
 colcon build --packages-select ffastllamaa
 source install/setup.bash
@@ -138,6 +142,7 @@ The most important step to run 2Fast-2Lamaa is to provide the correct topic rema
 | `/imu/acc` | `sensor_msgs/msg/Imu` | Accelerometer measurements from IMU |
 | `/imu/gyr` | `sensor_msgs/msg/Imu` | Gyroscope measurements from IMU |
 | `/lidar_raw_points` | `sensor_msgs/msg/PointCloud2` | Raw LiDAR point cloud input |
+| `/odom_map_correction` | `geometry_msgs/msg/TransformStamped` | Optional, from the `gp_map` node: the `map` to `odom` correction, republished as TF (see the frames below) |
 
 
 | Output Topics | | |
@@ -147,8 +152,12 @@ The most important step to run 2Fast-2Lamaa is to provide the correct topic rema
 | `/undistortion_pose` | `geometry_msgs/msg/TransformStamped` | Current pose in odom frame |
 | `/end_of_scan_odom` | `nav_msgs/msg/Odometry` | Full odometry message with pose and twist at end of scan |
 | `/end_of_scan_odom_twist` | `geometry_msgs/msg/TwistStamped` | Velocity estimate at end of scan |
+| `/start_of_scan_twist` | `geometry_msgs/msg/TwistStamped` | Velocity estimate at the start of the scan |
 | `/lidar_scan_undistorted` | `sensor_msgs/msg/PointCloud2` | Motion-compensated point cloud, expressed in the `imu` frame at the scan reference time (the extrinsic calibration is applied during the undistortion) |
 | `/lidar_scan_undistorted_dense` | `sensor_msgs/msg/PointCloud2` | Dense motion-compensated point cloud (only if `dense_pc_output` is enabled), same frame as above |
+| `/lidar_odometry/associations` | `visualization_msgs/msg/Marker` | Debug, only if `publish_associations` is enabled: one line per data association, coloured by feature type, in the `association_debug` frame |
+| `/lidar_odometry/association_source` | `sensor_msgs/msg/PointCloud2` | Debug, only if `publish_associations` is enabled: the projected source features of the registration |
+| `/lidar_odometry/association_target` | `sensor_msgs/msg/PointCloud2` | Debug, only if `publish_associations` is enabled: the projected target features of the registration |
 
 Note that the estimated state is the pose of the IMU/body frame, not the pose of the physical LiDAR.
 The undistorted point clouds and every published pose are therefore expressed in the `imu` frame.
@@ -160,6 +169,7 @@ The undistorted point clouds and every published pose are therefore expressed in
 | `odom` | `imu` | Current IMU/body pose estimate |
 | `odom` | `imu_head` | IMU/body pose at the end of the scan, with velocity information |
 | `imu` | `lidar` | Extrinsic calibration, broadcast once as a static transform (locates the raw LiDAR point clouds) |
+| `odom` | `association_debug` | Only if `publish_associations` is enabled: the pose the registration state is anchored at, which is where the association debug topics above are drawn |
 
 
 #### Required Parameters
@@ -202,10 +212,11 @@ calib_rx, calib_ry, calib_rz = rvec
 | `min_range` | double | `1.0` | Minimum point range to consider (meters) |
 | `max_range` | double | `150.0` | Maximum point range to consider (meters) |
 | `min_feature_dist` | double | `0.05` | Minimum distance for feature association (meters) |
-| `max_feature_dist` | double | `0.5` | Maximum distance for feature association (meters) |
+| `max_feature_dist` | double | `1.5` | Maximum distance for feature association (meters) |
 | `max_feature_range` | double | `max_range` | Maximum range for feature extraction (meters) |
 | `feature_voxel_size` | double | `0.3` | Voxel size for (planar) feature downsampling (meters) |
 | `planar_only` | bool | `false` | Use only planar features (ignore edge features) |
+| `minimum_intensity` | double | `-1.0` | If positive, drop the points whose intensity is below it during feature extraction. A non-positive value disables the test |
 | `point_cloud_scale` | double | `1.0` | Scale factor applied to incoming point cloud coordinates in case there is a discrepancy in scale or unit between the LiDAR data and the map |
 | `unsorted_pc` | bool | `false` | Indicates if incoming point cloud is unsorted (not ordered by time). If true, the algorithm will handle the point cloud accordingly given a bit more computation burden |
 | `broken_channels` | string | `""` | Comma-separated list of LiDAR channels to ignore (e.g., "0,5,10") |
@@ -224,9 +235,13 @@ calib_rx, calib_ry, calib_rz = rvec
 | `loss_function_scale` | double | `5/3*feature_voxel_size` | Scale parameter for robust loss function |
 | `max_associations_per_type` | int | `1000` | Maximum number of feature associations per type |
 | `g` | double | `9.80` | Gravitational acceleration magnitude (m/s²) |
+| `gyr_std` | double | `0.005` | Assumed gyroscope noise standard deviation (rad/s). __Currently has no effect on the estimate__: it only feeds the uncertainty propagation of the preintegration, and with the LPM preintegration in use the resulting covariance is not read by any residual. The IMU is not a cost term here, it parameterises the state |
+| `acc_std` | double | `0.02` | Assumed accelerometer noise standard deviation (m/s²). Same as above: __currently has no effect on the estimate__ |
+| `lidar_std` | double | `0.02` | LiDAR point noise standard deviation (meters). Its inverse scales every point-to-plane/point-to-line residual and its jacobian. Since the robust loss is applied to the scaled residual, this is effectively a second handle on where the loss cuts, alongside `loss_function_scale`; it also sets the weight of the LiDAR term relative to the zero-prior on the accelerometer bias |
 | `dense_pc_output` | bool | `false` | Enable publishing of dense undistorted point cloud |
 | `mode` | string | `imu` | Mode of operation: `imu` (acc. and gyr. preintegration), `gyr` (gyr. preintegration and constant linear velocity model), or `no_imu` (constant linear and angular velocity model) |
-| `num_threads` | int | `4` | Number of threads for parallel residual computation |
+| `num_threads` | int | `4` | Number of threads for the Ceres solver. It only reaches the residual/jacobian evaluation: the feature extraction, the kd-tree construction and the association search do not use it |
+| `publish_associations` | bool | `false` | Debug: publish the data associations of every registration (see the topics above). Off by default, and it costs nothing when off |
 
 
 
@@ -243,12 +258,22 @@ In that case, the parameter `using_submaps` can be set to `true` to enable topom
 
 #### Topics
 
+| Input Topics | | |
+|-------|------|-------------|
+| __Topic__ | __Type__ | __Description__ |
+| `/points_input` | `sensor_msgs/msg/PointCloud2` | The scan to register and add to the map, typically `/lidar_scan_undistorted` from the `lidar_odometry` node |
+| `/pose_input` | `geometry_msgs/msg/TransformStamped` | The initial guess for the registration, typically `/undistortion_pose`. Only when `with_init_guess` is `true` (the default), in which case it is __time-synchronized__ with `/points_input`: the two must carry identical stamps or nothing is processed |
+| `/gp_map/gyr` | `sensor_msgs/msg/Imu` | Optional gyroscope input, see `/twist` below |
+| `/gp_map/acc` | `sensor_msgs/msg/Imu` | Optional accelerometer input, see `/twist` below |
+| `/twist` | `geometry_msgs/msg/TwistStamped` | Optional body velocity, only accepted with `imu` as its `frame_id`. Together with the two IMU inputs above it estimates the gravity direction and the IMU biases: the velocities at two consecutive registration times, and the preintegration between them, give a gravity measurement. That estimate is stored with the map/submaps and added as a factor to the registration. All three topics are needed — the factor is skipped if the velocity of either time is missing |
+
 | Output Topics | | |
 |-------|------|-------------|
 | __Topic__ | __Type__ | __Description__ |
 | `/map` | `sensor_msgs/msg/PointCloud2` | Current map point cloud (published periodically based on `map_publish_period`) |
 | `/odom_map_correction` | `geometry_msgs/msg/TransformStamped` | Transform correction from odom frame to map frame (published during registration) |
 | `/scan_to_map_pose` | `geometry_msgs/msg/TransformStamped` | Current scan pose in map frame |
+| `/submap_info` | `ffastllamaa/msg/SubmapInfo` | Only with submaps: the ply file, trajectory file, scan folder, resolution and gravity of each submap as it is completed |
 
 #### Services
 
@@ -272,7 +297,6 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `localization_only` | bool | `false` | Enable localization-only mode (no map building, requires existing map) |
 | `register` | bool | `true` | Enable scan-to-map registration (if false, uses dead-reckoning from input poses) |
-| `use_temporal_weights` | bool | `false` | Apply temporal weighting to map points for registration (recent points weighted higher) |
 | `no_gp` | bool | `false` | Use approximate distance field queries for faster registration (point-to-point, no GP distance field) |
 | `loss_function_scale` | double | `5/3*voxel_size` (`1.0` with `use_point_covariances`) | Scale parameter for robust loss function in registration optimization |
 | `use_point_covariances` | bool | `false` | Weight the registration with the per-point position covariance of the input cloud, and apply the robust loss to the Mahalanobis distance instead of the euclidean one (see below) |
@@ -281,7 +305,9 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | `scale_prior_weight` | double | `100.0` | Only with `use_scale_optimization`: inverse of the standard deviation of the scale change between two consecutive scans. Nothing else pins the scale down, so this is what makes it a slowly drifting quantity rather than a free parameter of every registration |
 | `voxel_size_factor_for_registration` | double | `2.0` | Multiplier for `voxel_size` to compute downsampling size for registration. A non-positive value disables the downsampling: the scans are registered as they come, and `max_num_pts_for_registration` no longer applies (useful for an already sparse input, such as the landmarks of a visual front-end) |
 | `max_num_pts_for_registration` | int | `4000` | Maximum number of points to use for scan-to-map registration |
-| `use_edge_field` | bool | `true` | Enable separate edge feature distance field (sometimes it seems to converge faster) |
+| `use_odom_prior` | bool | `false` | Use the input odometry as a prior of the registration and not only as an initial guess. Warns if set without an odometry input (`with_init_guess` false), as the prior then anchors the registration to the previous pose |
+| `odom_prior_weight_pos` | double | `1.0` | Only with `use_odom_prior`: __factor__, not an absolute weight. It is multiplied by the mean number of registered points of the recent scans, so the prior follows how much the distance-field part of the cost weighs. The effective weight is logged per scan |
+| `odom_prior_weight_rot` | double | `1.0` | Only with `use_odom_prior`: the same factor for the rotation part of the prior |
 | `key_framing` | bool | `false` | Enable key-frame-based map updates (skip scans that don't meet criteria) |
 | `key_framing_dist_thr` | double | `1.0` | Distance threshold for creating new keyframe (meters) |
 | `key_framing_rot_thr` | double | `0.1` | Rotation threshold for creating new keyframe (radians) |
@@ -294,7 +320,6 @@ __In localization-only mode with 2Fast-2Lamaa-made maps, the voxel_size paramete
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
 | `max_range` | double | `1000.0` | Maximum range of points to consider from sensor (meters) |
 | `free_space_carving_radius` | double | `-1.0` | Radius for free space carving (negative value disables carving) |
-| `over_reject` | bool | `false` | Enable aggressive dynamic object removal |
 
 | Topometric mapping/odometry parameters |  |  |  |
 |-----------|------|---------|-------------|
@@ -370,9 +395,10 @@ all, the node warns once and registers with uniform weights.
 | Other parameters |  |  |  |
 |-----------|------|---------|-------------|
 | __Parameter__ | __Type__ | __Default__ | __Description__ |
-| `map_publish_period` | double | `1.0` | Period for publishing map point cloud (seconds) |
+| `map_publish_period` | double | `2.0` | Period for publishing map point cloud (seconds). Each publish walks every cell of the map and recomputes its normal while holding the map mutex, so it competes with the registration: lower it only when you actually need a responsive `/map` view |
 | `write_scans` | bool | `false` | Save individual scans to disk in `map_path/scans/` directory |
 | `point_cloud_internal_type` | bool | `true` | Use internal point cloud representation (optimization for specific format). Should be `true` for normal 2fast2lamaa operation. |
+| `use_frame_dropout_detection` | bool | `true` | Detect a gap in the input stream and, for the increment spanning it, replace the odometry prior by a constant-velocity prediction from the mean velocity of the recent scans |
 
 
 
@@ -410,6 +436,7 @@ Note that you have the choice of IMU as the old sequences (before 2024) did not 
 
 - If the odometry does not work, check the extrinsic calibration and the topic remapping for the lidar and IMU data. Also check the timestamps of the lidar data: there are multiple parameters to handle different timestamp formats: `point_time_multiplier` and `absolute_time`.
 - If the topometric localization (teach-and-repeat style) does not work, and that your repeat trajectory is not so close to the teach trajectory, you may need to increase the `submap_node_search_dist` parameter to allow the localization to jump further in the topometric graph (if you run into issues, don't hesitate to contact me).
+- The framework have not been extensively tested with low-resolution lidars. If you run into issues, open an issue or shoot me an email to see if there are any workarounds or planned improvements :).
 
 
 ## TODOs
@@ -425,13 +452,16 @@ Note that you have the choice of IMU as the old sequences (before 2024) did not 
 
 2Fast-2Lamaa
 ```bibtex
-@misc{legentil20242fast2lamaa,
-  title={2FAST-2LAMAA: Large-Scale Lidar-Inertial Localization and Mapping with Continuous Distance Fields},
+@misc{legentil20262fast2lamaa,
   author={{Le Gentil}, Cedric and Falque, Raphael and Lisus, Daniil and Barfoot, Timothy D.},
-  year={2025},
-  eprint={2410.05433},
-  archivePrefix={arXiv},
-  primaryClass={cs.RO},
-  url={https://arxiv.org/abs/2410.05433}, 
+  title ={2Fast-2Lamaa: Large-scale lidar-inertial localization and mapping with continuous distance fields},
+  journal = {The International Journal of Robotics Research},
+  volume = {0},
+  number = {0},
+  pages = {02783649261451003},
+  year = {2026},
+  doi = {10.1177/02783649261451003},
+  URL = { https://doi.org/10.1177/02783649261451003 },
 }
+
 ```

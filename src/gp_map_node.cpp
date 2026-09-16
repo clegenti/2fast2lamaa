@@ -95,7 +95,10 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             approximate_ = readFieldBool(this, "no_gp", false);
             use_edge_field_ = options.edge_field;
 
-            map_publish_period_ = readFieldDouble(this, "map_publish_period", 0.2);
+            // Each publish walks every cell of the map and recomputes its normal, while holding
+            // map_mutex_, so it competes with (and blocks) the registration. The map is a debug
+            // view rather than something the pipeline consumes, so it is published sparingly.
+            map_publish_period_ = readFieldDouble(this, "map_publish_period", 2.0);
 
             options.free_space_carving_radius = readFieldDouble(this, "free_space_carving_radius", -1.0);
 
