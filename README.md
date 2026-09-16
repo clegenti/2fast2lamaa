@@ -452,7 +452,7 @@ Note that you have the choice of IMU as the old sequences (before 2024) did not 
 
 2Fast-2Lamaa
 ```bibtex
-@misc{legentil20262fast2lamaa,
+@article{legentil20262fast2lamaa,
   author={{Le Gentil}, Cedric and Falque, Raphael and Lisus, Daniil and Barfoot, Timothy D.},
   title ={2Fast-2Lamaa: Large-scale lidar-inertial localization and mapping with continuous distance fields},
   journal = {The International Journal of Robotics Research},
