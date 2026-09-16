@@ -245,7 +245,28 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             traj_path_ = map_path + "/trajectory.csv";
             createTrajectoryFile(traj_path_);
 
-
+            std::string log_dir = map_path;
+            if(!log_dir.empty() && (log_dir.back() == '/'))
+            {
+                log_dir.pop_back();
+            }
+            const size_t last_slash = log_dir.find_last_of("/\\");
+            if(last_slash != std::string::npos)
+            {
+                std::string parent_dir = log_dir.substr(0, last_slash);
+                std::string other_logs_dir = parent_dir + "/other_logs";
+                if(!folderExists(other_logs_dir))
+                {
+                    createFolder(other_logs_dir);
+                }
+                processing_time_log_path_ = other_logs_dir + "/gp_map_processing_time.csv";
+                std::ofstream timing_log_file(processing_time_log_path_, std::ios::out | std::ios::trunc);
+                if(timing_log_file.is_open())
+                {
+                    timing_log_file << "time_ms,average_time_ms" << std::endl;
+                    timing_log_file.close();
+                }
+            }
 
             // Create the ROS related objects
             if(with_init_guess)
@@ -342,6 +363,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         double voxel_size_ = 0.2;
 
         std::string traj_path_ = "";
+        std::string processing_time_log_path_ = "";
 
         bool localization_ = false;
         bool use_edge_field_ = true;
@@ -395,6 +417,10 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         int previous_counter_ = 0;
 
         int last_write_counter_ = 0;
+
+        // Running average of the per-scan processing time, logged alongside each scan's own time
+        double total_processing_time_ms_ = 0.0;
+        size_t nb_processed_scans_ = 0;
 
         bool pc_type_internal_ = false;
         rclcpp::Time last_pc_time_;
@@ -729,7 +755,24 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
             double time_ms = sw.stop();
-            RCLCPP_INFO(this->get_logger(), "Total time to process point cloud: %f ms", time_ms);
+            total_processing_time_ms_ += time_ms;
+            nb_processed_scans_++;
+            const double average_time_ms = total_processing_time_ms_ / nb_processed_scans_;
+            RCLCPP_INFO(this->get_logger(), "Total time to process point cloud: %f ms (average: %f ms)", time_ms, average_time_ms);
+
+            if(!processing_time_log_path_.empty())
+            {
+                std::ofstream timing_log_file(processing_time_log_path_, std::ios::out | std::ios::app);
+                if(timing_log_file.is_open())
+                {
+                    timing_log_file << std::fixed << time_ms << "," << average_time_ms << std::endl;
+                    timing_log_file.close();
+                }
+                else
+                {
+                    RCLCPP_WARN(this->get_logger(), "Could not open gp_map processing time log: %s", processing_time_log_path_.c_str());
+                }
+            }
 
 
 

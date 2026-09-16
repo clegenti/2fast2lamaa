@@ -13,9 +13,31 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/static_transform_broadcaster.h"
 #include "sensor_msgs/msg/imu.hpp"
+#include "visualization_msgs/msg/marker.hpp"
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
 
+
+
+// Frame the data association debug output is published in. The residuals of a registration are
+// written in the frame of its state, which is the identity at the ANCHOR TIME of that state, not the
+// odometry frame, so the associations cannot be drawn in "odom" without putting them in the wrong
+// place. They get their own frame, broadcast at every registration as the pose the state is anchored
+// at, which is the last pose published before it: the pairs are then drawn on the vehicle, where they
+// were measured.
+const char* kAssociationFrame = "association_debug";
+
+// Line colour per feature type, as set by the feature extraction: 1 planar, 2 edge, 3 rough
+inline std::array<float, 3> associationColor(const int type)
+{
+    switch(type)
+    {
+        case 1: return {0.2f, 0.9f, 0.3f};  // planar, green
+        case 2: return {0.95f, 0.25f, 0.2f};  // edge, red
+        case 3: return {0.3f, 0.5f, 1.0f};  // rough, blue
+        default: return {1.0f, 1.0f, 1.0f};
+    }
+}
 
 
 class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
@@ -69,6 +91,8 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
 
             params.planar_only = readFieldBool(this, "planar_only", false);
 
+            params.publish_associations = readFieldBool(this, "publish_associations", false);
+
             pc_scale_ = readFieldDouble(this, "point_cloud_scale", 1.0);
 
 
@@ -101,6 +125,13 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             odom_twist_only_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/end_of_scan_odom_twist", 10);
             odom_twist_start_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/start_of_scan_twist", 10);
             pc_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_scan_undistorted", 10);
+            if(params.publish_associations)
+            {
+                assoc_marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/lidar_odometry/associations", 10);
+                assoc_source_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_odometry/association_source", 10);
+                assoc_target_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_odometry/association_target", 10);
+                RCLCPP_INFO(this->get_logger(), "Publishing the data associations on /lidar_odometry/associations (lines), /lidar_odometry/association_source and /lidar_odometry/association_target, in the '%s' frame", kAssociationFrame);
+            }
             if(params.dense_pc_output)
             {
                 pc_dense_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/lidar_scan_undistorted_dense", 10);
@@ -181,6 +212,11 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             br_->sendTransform(temp_msg);
             br_->sendTransform(transformStamped);
             global_odom_pub_->publish(transformStamped);
+            // The associations of the NEXT registration are written in the frame of a state anchored
+            // at this very pose (publishAssociations runs before the next publishTransform), so this
+            // is what places them in the world
+            last_published_pos_ = pos;
+            last_published_rot_ = rot;
             mutex_br_.unlock();
         }
         // Pose and twist of the IMU/body frame at the end of the scan ("imu_head" is the same
@@ -302,6 +338,98 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             mutex_pc_.unlock();
         }
 
+        // Draw the data associations of one registration: a line per pair, coloured by feature type,
+        // plus the two projected feature clouds they were taken from. What to look for is whether the
+        // lines are short and consistent (a rigid motion) or long, crossed and pointing every which
+        // way (the correspondences are wrong, and no amount of solving will fix that).
+        void publishAssociations(
+                const int64_t t
+                , const std::vector<std::shared_ptr<std::vector<Pointd> > >& features
+                , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_features
+                , const std::vector<DataAssociation>& associations) override
+        {
+            if(!assoc_marker_pub_)
+            {
+                return;
+            }
+            rclcpp::Time new_time(t);
+
+            // Put the frame the pairs live in where the state that produced them is anchored
+            {
+                mutex_br_.lock();
+                const Vec3 pos = last_published_pos_;
+                const Vec3 rot = last_published_rot_;
+                geometry_msgs::msg::TransformStamped odom_to_assoc;
+                odom_to_assoc.header.stamp = new_time;
+                odom_to_assoc.header.frame_id = "odom";
+                odom_to_assoc.child_frame_id = kAssociationFrame;
+                odom_to_assoc.transform = mat4ToTransform(posRotToTransform(pos, rot));
+                br_->sendTransform(odom_to_assoc);
+                mutex_br_.unlock();
+            }
+
+            visualization_msgs::msg::Marker marker;
+            marker.header.stamp = new_time;
+            marker.header.frame_id = kAssociationFrame;
+            marker.ns = "associations";
+            marker.id = 0;
+            marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+            marker.action = visualization_msgs::msg::Marker::ADD;
+            marker.scale.x = 0.02;
+            marker.pose.orientation.w = 1.0;
+            marker.points.reserve(2*3*associations.size());
+            marker.colors.reserve(2*3*associations.size());
+
+            for(const auto& association: associations)
+            {
+                if((association.pc_id < 0) || ((size_t)association.pc_id >= sparse_features.size()))
+                {
+                    continue;
+                }
+                const Vec3 source = sparse_features.at(association.pc_id)->at(association.feature_id).vec3();
+                const std::array<float, 3> rgb = associationColor(association.type);
+                std_msgs::msg::ColorRGBA color;
+                color.r = rgb[0];
+                color.g = rgb[1];
+                color.b = rgb[2];
+                color.a = 1.0;
+
+                for(const auto& target_id: association.target_ids)
+                {
+                    if((target_id.first < 0) || ((size_t)target_id.first >= features.size()))
+                    {
+                        continue;
+                    }
+                    const Vec3 target = features.at(target_id.first)->at(target_id.second).vec3();
+                    geometry_msgs::msg::Point from, to;
+                    from.x = source[0];
+                    from.y = source[1];
+                    from.z = source[2];
+                    to.x = target[0];
+                    to.y = target[1];
+                    to.z = target[2];
+                    marker.points.push_back(from);
+                    marker.points.push_back(to);
+                    marker.colors.push_back(color);
+                    marker.colors.push_back(color);
+                }
+            }
+
+            mutex_pc_.lock();
+            assoc_marker_pub_->publish(marker);
+            if(!sparse_features.empty() && assoc_source_pub_)
+            {
+                assoc_source_pub_->publish(ptsVecToPointCloud2MsgInternal(
+                        *sparse_features.back(), kAssociationFrame, new_time));
+            }
+            if(!features.empty() && assoc_target_pub_)
+            {
+                assoc_target_pub_->publish(ptsVecToPointCloud2MsgInternal(
+                        *features.front(), kAssociationFrame, new_time));
+            }
+            mutex_pc_.unlock();
+        }
+
 
     private:
         std::shared_ptr<LidarOdometry> lidar_odometry_;
@@ -321,6 +449,11 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
 
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_dense_pub_;
 
+        // Only created when `publish_associations` is set (see publishAssociations)
+        rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr assoc_marker_pub_;
+        rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr assoc_source_pub_;
+        rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr assoc_target_pub_;
+
         LidarOdometryMode mode_ = LidarOdometryMode::IMU;
 
         std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
@@ -328,6 +461,11 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
 
         std::mutex mutex_br_;
         std::mutex mutex_pc_;
+
+        // Last pose sent by publishTransform, which is where the state of the next registration is
+        // anchored (guarded by mutex_br_, see publishAssociations)
+        Vec3 last_published_pos_ = Vec3::Zero();
+        Vec3 last_published_rot_ = Vec3::Zero();
 
         int scan_count_ = 0;
         bool invert_imu_ = false;

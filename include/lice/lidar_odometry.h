@@ -55,6 +55,13 @@ struct LidarOdometryParams
 
     bool planar_only = false; // If true, only use planar features (no edge features)
 
+    // If true, every registration publishes the data associations it is about to solve for, and
+    // reports how far apart the associated points are before and after the solve. Meant for working
+    // out why a registration does not move: the cost can look busy while the pairs it is made of are
+    // wrong. Off by default, as it projects the features one extra time and publishes two clouds and
+    // a line per association at every scan.
+    bool publish_associations = false;
+
     LidarOdometryMode mode = LidarOdometryMode::IMU;
 };
 
@@ -84,6 +91,21 @@ class LidarOdometryPublisher
         virtual void publishGlobalOdom(const int64_t t, const Vec3& pos, const Vec3& rot, const Vec3& vel, const Vec3& ang_vel) = 0;
         virtual void publishPcDense(const int64_t t, const std::vector<Pointd>& pc) = 0;
         virtual void publishTwist(const int64_t t, const Vec3& linear, const Vec3& angular) = 0;
+
+        // The data associations a registration is about to solve for, in the frame the residuals are
+        // written in (the state frame, which is the identity at the anchor time of the state, NOT the
+        // odometry frame). `features` and `sparse_features` are the two chunks already projected to
+        // that frame; the source of an association is `sparse_features[pc_id][feature_id]` and its
+        // targets are `features[target_ids[k].first][target_ids[k].second]`, the same convention as
+        // LidarNoCalCostFunction. Not pure: a node that does not care about it does nothing.
+        virtual void publishAssociations(
+                const int64_t t
+                , const std::vector<std::shared_ptr<std::vector<Pointd> > >& features
+                , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_features
+                , const std::vector<DataAssociation>& associations)
+        {
+            (void)t; (void)features; (void)sparse_features; (void)associations;
+        }
 };
 
 

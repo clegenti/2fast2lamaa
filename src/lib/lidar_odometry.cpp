@@ -1,5 +1,8 @@
 #include "lice/lidar_odometry.h"
+#include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <random>
 #include "KDTree.h"
 #include "ankerl/unordered_dense.h"
@@ -7,6 +10,31 @@
 
 typedef jk::tree::KDTree<std::pair<int,int>, 3, 16> KDTree3;
 typedef jk::tree::KDTree<int, 3, 16> KDTree3Simple;
+
+
+// ---- Conditioning of the target triplets/pairs a data association is built on -------------------
+//
+// The neighbours of a feature are overwhelmingly its own scanline: along a ring the points are
+// centimetres apart, while the next ring is half a metre away at range. Taking the closest ones
+// therefore gives three (or two) collinear points, and a plane or a line fitted through those says
+// nothing about the motion across them. The residual is not merely noisy, it is blind: for a triplet
+// on one scanline `v1 x v2` is a vanishing, arbitrarily oriented vector, so the point-to-plane
+// distance stays near zero whatever the pose does.
+
+// Two targets count as coming from different scanlines when their ring differs. Sensors that report
+// no ring fall back on the sampling time: more than this apart is a different part of the sweep.
+const int64_t kMinTargetTimeSpread = 5000000; // 5 ms in nanoseconds
+
+// Smallest |v1 x v2|/(|v1||v2|) accepted for a planar triplet, which is the sine of the angle at
+// their common vertex and exactly the quantity that normalises the normal in
+// DataAssociation::computeResidual. 0.2 keeps the triplet at least ~11.5 degrees off collinear.
+const double kMinPlanarSine = 0.2;
+
+// How many neighbours to pull out of the kd tree as candidates. Enough of them are needed for a
+// second scanline to be within reach at all: on a 16 beam sensor the six closest neighbours of a
+// point are all its own ring.
+const int kPlanarCandidates = 16;
+const int kEdgeCandidates = 12;
 
 
 
@@ -362,6 +390,41 @@ void LidarOdometry::initState(const ugpm::ImuData& imu_data)
 
 
 
+namespace
+{
+
+// Whether two target points were measured by different scanlines: a different ring when the sensor
+// reports one, and otherwise a sampling time far enough apart to be a different part of the sweep
+// (see kMinTargetTimeSpread)
+inline bool differentScanlines(const Pointd& a, const Pointd& b)
+{
+    if((a.channel != kNoChannel) && (b.channel != kNoChannel))
+    {
+        return a.channel != b.channel;
+    }
+    return std::abs(a.t - b.t) > kMinTargetTimeSpread;
+}
+
+
+// How well conditioned the plane through three points is: the sine of the angle at `a`, between the
+// two edges leaving it. Zero when the three are collinear, one when they are perpendicular. This is
+// the same v1/v2 pair DataAssociation::computeResidual builds its normal from.
+inline double planarSine(const Vec3& a, const Vec3& b, const Vec3& c)
+{
+    const Vec3 v1 = b - a;
+    const Vec3 v2 = c - a;
+    const double norms = v1.norm()*v2.norm();
+    if(norms < 1e-9)
+    {
+        return 0.0;
+    }
+    return v1.cross(v2).norm()/norms;
+}
+
+
+} // namespace
+
+
 std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
         const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts
         , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_pts
@@ -395,6 +458,15 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
 
     std::vector<DataAssociation> data_associations = getDataAssociations(types, projected_features, projected_sparse_features);
 
+    // What the solver is about to be fed, for the eyes
+    if(params_.publish_associations)
+    {
+        if((node_ != nullptr) && !pts.empty() && !pts.back()->empty())
+        {
+            node_->publishAssociations(pts.back()->back().t, projected_features,
+                    projected_sparse_features, data_associations);
+        }
+    }
 
     ceres::Problem::Options pb_options;
     pb_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
@@ -421,8 +493,7 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
     // Solve the problem
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-    //std::cout << summary.BriefReport() << std::endl;
-
+    //std::cout << summary.FullReport() << std::endl;
 
     return data_associations;
 }
@@ -599,7 +670,7 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
 
             if(type == 1)
             {
-                auto nn = tree.searchCapacityLimitedBall({temp_feature(0), temp_feature(1), temp_feature(2)}, max_dist2, 6);
+                auto nn = tree.searchCapacityLimitedBall({temp_feature(0), temp_feature(1), temp_feature(2)}, max_dist2, kPlanarCandidates);
 
                 if(nn.size() < 3)
                     continue;
@@ -607,11 +678,11 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
 
                 int target_feature_id = nn[0].payload;
 
-                Vec3 candidate_1 = target->at(target_feature_id).vec3();
+                const Pointd& point_1 = target->at(target_feature_id);
+                Vec3 candidate_1 = point_1.vec3();
                 int candidate_2_id = 1;
-                // Get the second cadidate with at distance greater that params_.min_feature_dist between the first and the second
-
-
+                // Get the second candidate at a distance greater than params_.min_feature_dist from
+                // the first
                 while(((size_t)(candidate_2_id) < nn.size())&&
                     ((candidate_1 - target->at(nn[candidate_2_id].payload).vec3()).norm() < params_.min_feature_dist))
                 {
@@ -621,18 +692,30 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                 if((size_t)(candidate_2_id) >= nn.size())
                     continue;
 
+                const Pointd& point_2 = target->at(nn[candidate_2_id].payload);
+                Vec3 candidate_2 = point_2.vec3();
 
+                // Get the third candidate: far enough from BOTH of the first two, spanning a second
+                // scanline together with them, and far enough off their line for the normal of the
+                // plane to mean anything. Any one of those failing rules the candidate out, hence the
+                // disjunction: a triplet on a single scanline is collinear, and its point-to-plane
+                // residual is blind to the motion (see kMinPlanarSine).
                 int candidate_3_id = candidate_2_id + 1;
-                Vec3 candidate_2 = target->at(nn[candidate_2_id].payload).vec3();
-
-                Vec3 v1 = candidate_2 - candidate_1;
-                v1.normalize();
-                // Get the third candidate with at distance greater that params_.min_feature_dist between to the first, the second and the third, also check that the three points are not aligned
-                while(((size_t)(candidate_3_id) < nn.size())&&
-                    ((candidate_1 - target->at(nn[candidate_3_id].payload).vec3()).norm() < params_.min_feature_dist)&&
-                    ((candidate_2 - target->at(nn[candidate_3_id].payload).vec3()).norm() < params_.min_feature_dist)&&
-                    (std::abs(v1.dot((target->at(nn[candidate_3_id].payload).vec3() - candidate_2).normalized())) > 0.2))
+                while((size_t)(candidate_3_id) < nn.size())
                 {
+                    const Pointd& point_3 = target->at(nn[candidate_3_id].payload);
+                    const Vec3 candidate_3 = point_3.vec3();
+                    const bool far_enough = ((candidate_1 - candidate_3).norm() >= params_.min_feature_dist)
+                            && ((candidate_2 - candidate_3).norm() >= params_.min_feature_dist);
+                    const bool spans_scanlines = differentScanlines(point_1, point_2)
+                            || differentScanlines(point_1, point_3)
+                            || differentScanlines(point_2, point_3);
+                    const bool well_conditioned =
+                            planarSine(candidate_1, candidate_2, candidate_3) >= kMinPlanarSine;
+                    if(far_enough && spans_scanlines && well_conditioned)
+                    {
+                        break;
+                    }
                     candidate_3_id++;
                 }
 
@@ -652,21 +735,24 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
             }
             else if((type == 2))
             {
-                auto nn = tree.searchCapacityLimitedBall({temp_feature(0), temp_feature(1), temp_feature(2)}, max_dist2, 5);
+                auto nn = tree.searchCapacityLimitedBall({temp_feature(0), temp_feature(1), temp_feature(2)}, max_dist2, kEdgeCandidates);
 
-                if(nn.size() < 2) 
+                if(nn.size() < 2)
                     continue;
 
 
                 int target_feature_id = nn[0].payload;
 
-                Vec3 candidate_1 = target->at(target_feature_id).vec3();
+                const Pointd& point_1 = target->at(target_feature_id);
+                Vec3 candidate_1 = point_1.vec3();
+                // Get the second candidate at a distance greater than params_.min_feature_dist from
+                // the first AND off its scanline: two edge points of one scanline lie along that
+                // scanline, not along the physical edge, so the line they define is the wrong one and
+                // the point-to-line residual measures nothing.
                 int candidate_2_id = 1;
-                // Get the second cadidate with at distance greater that params_.min_feature_dist between the first and the second
-
-
                 while(((size_t)(candidate_2_id) < nn.size())&&
-                    ((candidate_1 - target->at(nn[candidate_2_id].payload).vec3()).norm() < params_.min_feature_dist))
+                    (((candidate_1 - target->at(nn[candidate_2_id].payload).vec3()).norm() < params_.min_feature_dist)
+                     || !differentScanlines(point_1, target->at(nn[candidate_2_id].payload))))
                 {
                     candidate_2_id++;
                 }
