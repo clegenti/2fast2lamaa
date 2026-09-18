@@ -715,7 +715,11 @@ class PoseGraphNode: public rclcpp::Node
                 }
                 // Get the pose
                 Mat4 pose_mat = posQuatToTransform(pose);
-                // Carve free space
+                // Carve free space. The reference of the distance test is the pose the map was last
+                // carved from, so that the carving happens every `min_dist_for_carving_` meters along
+                // the trajectory. It is only moved once a scan is actually carved, a pose whose scan
+                // could not be read does not count as one.
+                last_pose = pose;
                 map->freeSpaceCarving(scan, pose_mat);
             }
         }
