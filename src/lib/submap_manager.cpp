@@ -675,6 +675,16 @@ GravityFactorFunctor* SubmapManager::computeGravityFactor(const int64_t current_
         return nullptr;
     }
 
+    // A scan can be registered several times: the coarse-to-fine cascade of a dropped frame, or the
+    // first pass when there is no initial guess. `last_registered_time_` has then already been moved
+    // to `current_time`, so there is no interval left to derive a gravity from and the division below
+    // would give 0/0. That scan is registered without the gravity factor rather than with a residual
+    // that is not a number, which ceres answers by abandoning the registration altogether.
+    if(time_B <= time_A)
+    {
+        return nullptr;
+    }
+
     Vec3 body_vel_A = body_velocities_[time_A];
     Vec3 body_vel_B = body_velocities_[time_B];
 
@@ -687,14 +697,19 @@ GravityFactorFunctor* SubmapManager::computeGravityFactor(const int64_t current_
     Vec3 corrected_delta_v = preint_meas.delta_v + preint_meas.d_delta_v_d_bf * bias_acc_ + preint_meas.d_delta_v_d_bw * bias_gyr_;
     Mat3 corrected_delta_R = preint_meas.delta_R * expMap(preint_meas.d_delta_R_d_bw * bias_gyr_);
     Vec3 local_g = (body_vel_B - corrected_delta_R.transpose()*(body_vel_A + corrected_delta_v)) / ((time_B - time_A) * 1e-9);
-    
-    GravityFactorFunctor* gravity_factor = new GravityFactorFunctor(local_g, gravity_, gravity_angle_std_);
-
-
 
     cleanBodyVelocities();
     imu_data_ = imu_data_.get((time_B * 1e-9) - 0.1, std::numeric_limits<double>::max());
 
-    return gravity_factor;
+    // The preintegration over an interval the IMU has a hole in can come back non-finite, and a
+    // gravity of zero length would divide by zero in the residual. Either way ceres abandons the
+    // whole registration when the residual is not a number, so it is better to register that scan
+    // without the gravity factor than to lose the registration.
+    if(!local_g.allFinite() || (local_g.norm() < 1e-6))
+    {
+        return nullptr;
+    }
+
+    return new GravityFactorFunctor(local_g, gravity_, gravity_angle_std_);
 
 }

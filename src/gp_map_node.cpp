@@ -243,6 +243,29 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // With the point covariances the residuals are mahalanobis distances, so the loss scale is
             // a number of standard deviations and not a distance in meters
             loss_scale_ = readFieldDouble(this, "loss_function_scale", use_point_covariances_ ? 1.0 : 5.0*voxel_size_/3.0);
+
+            // Adaptive scene scale: the registration voxel and the loss scale of the fine registration
+            // are tuned for a given size of scene, and a configuration meeting a much smaller one
+            // downsamples structure it cannot spare and carries a loss that rejects nothing. When this
+            // is on, both follow the median range of every scan, `adaptive_reference_range` being the
+            // median the configured values were tuned for. The configured values stay the ceiling: the
+            // mode only ever makes them finer, and never past `adaptive_min_ratio` of them.
+            adaptive_scene_scale_ = readFieldBool(this, "adaptive_scene_scale", false);
+            adaptive_reference_range_ = readFieldDouble(this, "adaptive_reference_range", 30.0);
+            adaptive_min_ratio_ = readFieldDouble(this, "adaptive_min_ratio", 0.25);
+            if(adaptive_scene_scale_)
+            {
+                if(adaptive_reference_range_ <= 0.0)
+                {
+                    RCLCPP_WARN(this->get_logger(), "adaptive_reference_range must be positive, the adaptive scene scale is disabled");
+                    adaptive_scene_scale_ = false;
+                }
+                else
+                {
+                    adaptive_min_ratio_ = std::clamp(adaptive_min_ratio_, 0.0, 1.0);
+                    RCLCPP_INFO(this->get_logger(), "Adaptive scene scale enabled: reference range %f m, minimum ratio %f (registration voxel %f m and loss scale %f at the reference range)", adaptive_reference_range_, adaptive_min_ratio_, downsample_size_, loss_scale_);
+                }
+            }
             
             // Write the first line of the trajectory file
             traj_path_ = map_path + "/trajectory.csv";
@@ -414,6 +437,11 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         bool with_init_guess_ = false;
 
         double downsample_size_ = 0.4;
+
+        // Adaptive scene scale, see the parameter read in the constructor
+        bool adaptive_scene_scale_ = false;
+        double adaptive_reference_range_ = 30.0;
+        double adaptive_min_ratio_ = 0.25;
 
         std::atomic<bool> running_ = true;
         std::atomic<int> counter_ = 0;
@@ -643,6 +671,10 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 int original_pts_size = pts.size();
                 filterScan(pts, covs);
 
+                // Scale of the scene, from which the registration voxel and the loss scale of the fine
+                // registration follow. Both stay at their configured value when the mode is off.
+                auto [scan_downsample_size, scan_loss_scale] = getAdaptiveRegistrationSettings(pts);
+
                 if(is_2d)
                 {
                     map_mutex_.lock();
@@ -654,7 +686,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 {
                     // Downsample the points
                     std::vector<Mat3> downsampled_covs;
-                    std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, false, true);
+                    std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, false, true, scan_downsample_size);
 
                     map_mutex_.lock();
                     updatePriorWeights(downsampled_pts.size());
@@ -668,7 +700,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                         // its cost when the guess is not to be trusted.
                         current_pose_ = registerCoarseToFine(downsampled_pts, init_guess_, getTimeNs(time), downsampled_covs);
                     }
-                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), approximate_, loss_scale_, kDefaultRegistrationIterations, downsampled_covs);
+                    current_pose_ = map_->registerPts(downsampled_pts, current_pose_, getTimeNs(time), approximate_, scan_loss_scale, kDefaultRegistrationIterations, downsampled_covs);
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
                 }
@@ -678,7 +710,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
                     // Downsample the points
                     std::vector<Mat3> downsampled_covs;
-                    std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, use_edge_field_, false);
+                    std::vector<Pointd> downsampled_pts = downsampleScan(pts, covs, downsampled_covs, use_edge_field_, false, scan_downsample_size);
 
 
                     map_mutex_.lock();
@@ -703,7 +735,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                         pending_frame_dropout_ = false;
                     }
                     //current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), true, 2*loss_scale_, 7);
-                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), approximate_, loss_scale_, 25, downsampled_covs);
+                    current_pose_ = map_->registerPts(downsampled_pts, init_guess_, getTimeNs(time), approximate_, scan_loss_scale, 25, downsampled_covs);
                     init_guess_ = current_pose_;
                     map_mutex_.unlock();
 
@@ -942,17 +974,46 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             }
         }
 
+        // Registration voxel size and loss scale for one scan. With the adaptive scene scale off, the
+        // configured values come back untouched.
+        //
+        // The ratio is the median range of the scan over the range the configuration was tuned for,
+        // clamped to [adaptive_min_ratio, 1]: the mode only ever makes the settings finer, never
+        // coarser than what the launch file asked for. The voxel follows the ratio directly, the loss
+        // takes its square root: the loss parameter enters the Cauchy loss squared (the saturation of
+        // `rho(d) = a^2*log(1 + d/a^2)` sits near `a^2` meters), so sqrt(ratio) on the parameter is
+        // what scales the saturation distance by `ratio`.
+        std::pair<double, double> getAdaptiveRegistrationSettings(const std::vector<Pointd>& pts)
+        {
+            if(!adaptive_scene_scale_)
+            {
+                return {downsample_size_, loss_scale_};
+            }
+            const double median_range = getMedianRange(pts);
+            if(median_range <= 0.0)
+            {
+                RCLCPP_WARN(this->get_logger(), "Adaptive scene scale: the scan holds no usable range, the configured settings are kept for this one");
+                return {downsample_size_, loss_scale_};
+            }
+            const double ratio = std::clamp(median_range/adaptive_reference_range_, adaptive_min_ratio_, 1.0);
+            const double downsample_size = ratio*downsample_size_;
+            const double loss_scale = std::sqrt(ratio)*loss_scale_;
+            RCLCPP_INFO(this->get_logger(), "Adaptive scene scale: median range %.2f m, ratio %.3f, registration voxel %.3f m, loss scale %.3f", median_range, ratio, downsample_size, loss_scale);
+            return {downsample_size, loss_scale};
+        }
+
         // Downsample the scan for the registration, carrying the per-point covariances when they are
         // in use. `downsampled_covs` comes back empty otherwise, which is what registerPts expects to
         // register without them.
-        // A non-positive `voxel_size_factor_for_registration` disables the downsampling altogether and
-        // the scan is registered as it comes: useful for an already sparse input (the landmarks of a
-        // visual front-end for instance), where merging points into voxel centroids only blurs them.
-        std::vector<Pointd> downsampleScan(const std::vector<Pointd>& pts, const std::vector<Mat3>& covs, std::vector<Mat3>& downsampled_covs, const bool per_type, const bool quadrant_balanced)
+        // A non-positive `downsample_size` disables the downsampling altogether and the scan is
+        // registered as it comes: useful for an already sparse input (the landmarks of a visual
+        // front-end for instance), where merging points into voxel centroids only blurs them. It is
+        // passed per scan rather than read from the member, as the adaptive scene scale shrinks it.
+        std::vector<Pointd> downsampleScan(const std::vector<Pointd>& pts, const std::vector<Mat3>& covs, std::vector<Mat3>& downsampled_covs, const bool per_type, const bool quadrant_balanced, const double downsample_size)
         {
             downsampled_covs.clear();
             const bool with_covs = !covs.empty() && (covs.size() == pts.size());
-            if(downsample_size_ <= 0.0)
+            if(downsample_size <= 0.0)
             {
                 // The invalid points are still dropped, as the downsampling does
                 std::vector<Pointd> kept_pts;
@@ -975,9 +1036,9 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             std::vector<Mat3>* covs_out = with_covs ? &downsampled_covs : nullptr;
             if(per_type)
             {
-                return downsamplePointCloudPerType<double>(pts, downsample_size_, max_nb_pts_, covs_in, covs_out);
+                return downsamplePointCloudPerType<double>(pts, downsample_size, max_nb_pts_, covs_in, covs_out);
             }
-            return downsamplePointCloud<double>(pts, downsample_size_, max_nb_pts_, quadrant_balanced, covs_in, covs_out);
+            return downsamplePointCloud<double>(pts, downsample_size, max_nb_pts_, quadrant_balanced, covs_in, covs_out);
         }
 
         void pcPriorCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc_msg, const geometry_msgs::msg::TransformStamped::ConstSharedPtr odom_msg)

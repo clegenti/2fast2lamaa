@@ -354,6 +354,41 @@ inline std::vector<std::vector<Pointd> > splitChannels(const std::vector<Pointd>
     return output;
 }
 
+// Median of the point ranges, in the frame the points come in. Sampled rather than exhaustive: the
+// median of a few thousand points of a scan is the same number for the purpose it serves, and this
+// runs on every scan. Returns -1.0 when the cloud holds no usable point.
+template <typename T>
+inline double getMedianRange(const std::vector<PointTemplated<T> >& pc, const size_t max_samples = 4096)
+{
+    if(pc.empty())
+    {
+        return -1.0;
+    }
+    const size_t step = std::max<size_t>(1, pc.size()/max_samples);
+    std::vector<double> ranges;
+    ranges.reserve((pc.size()/step) + 1);
+    for(size_t i = 0; i < pc.size(); i += step)
+    {
+        const auto& pt = pc[i];
+        if(pt.type == kInvalidPoint)
+        {
+            continue;
+        }
+        if(!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+        {
+            continue;
+        }
+        ranges.push_back(pt.vec3d().norm());
+    }
+    if(ranges.empty())
+    {
+        return -1.0;
+    }
+    const size_t mid = ranges.size()/2;
+    std::nth_element(ranges.begin(), ranges.begin() + mid, ranges.end());
+    return ranges[mid];
+}
+
 // Get median time between points in a point cloud channel
 inline int64_t getMedianDt(const std::vector<Pointd>& pc)
 {
