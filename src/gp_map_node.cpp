@@ -147,6 +147,11 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // is not exactly metric. A prior keeps it from moving much between two consecutive scans.
             options.use_scale_optimization = readFieldBool(this, "use_scale_optimization", false);
             options.scale_prior_weight = readFieldDouble(this, "scale_prior_weight", 100.0);
+
+            // Upper bound on the number of cells holding a GP weight block, -1 for no limit. The
+            // blocks survive from one scan to the next as long as the map does not change, so this
+            // is what trades the memory they take against the cost of rebuilding them.
+            options.max_num_alpha_cells = readFieldInt(this, "max_num_alpha_cells", -1);
             use_scale_optimization_ = options.use_scale_optimization;
             if(options.use_scale_optimization && !localization_)
             {

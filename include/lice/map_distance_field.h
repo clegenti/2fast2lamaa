@@ -51,6 +51,8 @@ class GpMapPublisher
 
 
 class MapDistField;
+class Cell;
+typedef Cell* CellPtr;
 
 struct AlphaBlock
 {
@@ -140,8 +142,6 @@ class Cell {
 
 };
 
-typedef Cell* CellPtr;
-
 
 
 struct MapDistFieldOptions {
@@ -183,10 +183,30 @@ struct MapDistFieldOptions {
     // else pins the scale down, so this is what makes it a slowly drifting quantity rather than a free
     // parameter of every registration.
     double scale_prior_weight = 100.0;
+    // Largest number of cells allowed to hold a GP weight block at once, or -1 for no limit. Only
+    // bites in a localization run: `addPts` releases every block when it runs, and a mapping run
+    // reaches it on every scan it processes, so it never accumulates any. Dropping the blocks further than
+    // `kMaxAlphaRange` from the pose bounds the footprint on a trajectory that travels, but not on a
+    // map that fits inside that range, which is what this bounds instead. It costs rebuilding what
+    // it evicts. A block is a few hundred bytes to a kilobyte, depending on `neighborhood_size`.
+    int64_t max_num_alpha_cells = -1;
 };
 
 
 struct GravityFactorFunctor;
+
+
+// GP weight blocks belonging to cells further than this from the current pose are released. They
+// are rebuilt on demand if the trajectory comes back, so this only trades memory against
+// recomputation. Like `max_num_alpha_cells`, it only bites in a localization run, where `addPts`
+// never runs to release them.
+inline constexpr double kMaxAlphaRange = 100.0;                // m
+
+// Distance travelled between two range evictions. The sweep is a contiguous scan over the set of
+// alpha-holding cells that never dereferences a cell it keeps, so it can afford to be frequent.
+inline constexpr double kAlphaSweepTravelDistance = 10.0;      // m
+
+
 
 class MapDistField {
     private:
@@ -205,7 +225,14 @@ class MapDistField {
         const int num_threads_;
 
         std::mutex clean_mutex_;
+        // The cells currently holding an alpha block: what `cleanCells` releases when the map
+        // changes, and what `evictFarAlphas` sweeps by range when it does not.
         ankerl::unordered_dense::set<GridIndex> cells_to_clean_;
+
+        // Distance travelled since the last range eviction.
+        double travel_since_sweep_ = 0.0;
+        bool has_sweep_position_ = false;
+        Vec3 last_sweep_position_ = Vec3::Zero();
 
         thuni::Octree ioctree_;
         thuni::Octree ioctree_edge_;
@@ -238,6 +265,12 @@ class MapDistField {
         double scale_ = 1.0;
 
         void cleanCells();
+
+
+        // Release the GP weight blocks of the cells further than `kMaxAlphaRange` from `position`,
+        // every `kAlphaSweepTravelDistance` of travel. Nothing else bounds the memory when `addPts`
+        // never runs, which is a localization run.
+        void evictFarAlphas(const Vec3& position);
 
         std::pair<ankerl::unordered_dense::set<GridIndex>, std::vector<bool> > getFreeSpaceCellsToRemove(const std::vector<Pointd>& scan, const std::vector<Vec3>& map_pts, const Mat4& pose_scan, const Mat4& pose_map);
 
@@ -299,6 +332,7 @@ class MapDistField {
         std::vector<CellPtr> getNeighborCells(const Vec3& pt);
         
         void cellToClean(const GridIndex& index);
+
 
 
         double getPathLength() const { return path_length_; }

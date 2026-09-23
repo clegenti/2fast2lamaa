@@ -488,6 +488,9 @@ void MapDistField::clear()
     prev_scan_.clear();
     prev_pose_ = Mat4::Identity();
     cells_to_clean_.clear();
+    travel_since_sweep_ = 0.0;
+    has_sweep_position_ = false;
+    last_sweep_position_ = Vec3::Zero();
 }
 
 
@@ -595,7 +598,13 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 {
     if(current_time != last_time_register_)
     {
-        cleanCells();
+        // A GP weight block only goes stale when the map changes, and registering does not change
+        // it: `addPts` moves the centroids the blocks were fitted to, and it releases them itself.
+        // Cleaning here as well meant every cell the registration touched was rebuilt on the next
+        // scan even when the map had not moved at all, which is what a localization run does: it
+        // never calls `addPts`, so its blocks stay valid for the whole run. Nothing releases them
+        // there, so the eviction below is what bounds the memory instead.
+        evictFarAlphas(pose.block<3,1>(0,3));
     }
     Vec6 pose_correction_state = Vec6::Zero();
 
@@ -772,6 +781,79 @@ void MapDistField::cleanCells()
     clean_mutex_.unlock();
 }
 
+void MapDistField::evictFarAlphas(const Vec3& position)
+{
+    if(!has_sweep_position_)
+    {
+        has_sweep_position_ = true;
+        last_sweep_position_ = position;
+    }
+    else
+    {
+        travel_since_sweep_ += (position - last_sweep_position_).norm();
+        last_sweep_position_ = position;
+    }
+
+    clean_mutex_.lock();
+
+    // The optional size cap is checked every scan, the range sweep only every
+    // `kAlphaSweepTravelDistance`. They cover different cases: the range sweep bounds a trajectory
+    // that travels, the cap bounds a map that fits within `kMaxAlphaRange` and so never trips it.
+    const size_t max_alpha_cells = (opt_.max_num_alpha_cells < 0)
+        ? std::numeric_limits<size_t>::max()
+        : static_cast<size_t>(opt_.max_num_alpha_cells);
+    const bool over_budget = cells_to_clean_.size() > max_alpha_cells;
+    const bool sweep_range = travel_since_sweep_ >= kAlphaSweepTravelDistance;
+    if(!over_budget && !sweep_range)
+    {
+        clean_mutex_.unlock();
+        return;
+    }
+    if(sweep_range)
+    {
+        travel_since_sweep_ = 0.0;
+    }
+
+    // `cells_to_clean_` is the set of cells currently holding an alpha block, so it is also the set
+    // to evict from. It is keyed on the grid index, which gives the cell centre arithmetically
+    // through `getCenterPt`: the cells that are kept are never dereferenced, and an index whose cell
+    // has been carved away in the meantime simply fails the lookup.
+    double range_2 = sweep_range ? (kMaxAlphaRange*kMaxAlphaRange)
+                                 : std::numeric_limits<double>::max();
+    if(over_budget)
+    {
+        // Keep the `max_alpha_cells` closest blocks: `nth_element` puts the cutoff distance in place
+        // without sorting the rest.
+        std::vector<double> distances;
+        distances.reserve(cells_to_clean_.size());
+        for(const auto& index : cells_to_clean_)
+        {
+            distances.push_back((getCenterPt(index) - position).squaredNorm());
+        }
+        std::nth_element(distances.begin(), distances.begin() + max_alpha_cells, distances.end());
+        range_2 = std::min(range_2, distances[max_alpha_cells]);
+    }
+
+    std::vector<GridIndex> to_evict;
+    for(const auto& index : cells_to_clean_)
+    {
+        if((getCenterPt(index) - position).squaredNorm() >= range_2)
+        {
+            to_evict.push_back(index);
+        }
+    }
+    for(const auto& index : to_evict)
+    {
+        auto it = hash_map_->find(index);
+        if(it != hash_map_->end())
+        {
+            it->second->resetAlpha();
+        }
+        cells_to_clean_.erase(index);
+    }
+    clean_mutex_.unlock();
+}
+
 
 std::pair<ankerl::unordered_dense::set<GridIndex>, std::vector<bool> > MapDistField::getFreeSpaceCellsToRemove(const std::vector<Pointd>& scan, const std::vector<Vec3>& map_pts, const Mat4& pose_scan, const Mat4& pose_map)
 {
@@ -924,7 +1006,12 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     {
         time_offset_ = pts[0].t;
     }
+    // Adding points moves the centroids the GP weight blocks were fitted to, so every block built
+    // against the previous state of the map is now out of date. This is the only thing that
+    // invalidates them, and a mapping run reaches it on every scan it processes, so the blocks are
+    // only ever reused where this is not called at all, which is a localization run.
     cleanCells();
+
     if (pts.size() == 0)
     {
         return;
