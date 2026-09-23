@@ -1,6 +1,8 @@
 #include "lice/submap_manager.h"
 #include "lice/pointcloud_utils.h"
 
+#include <algorithm>
+
 #include <ceres/manifold.h>
 #include <ceres/rotation.h>
 
@@ -503,22 +505,54 @@ void SubmapManager::attemptGravityBiasInit()
         std::vector<double> gravity_residuals;
         for(size_t i = 1; i < num_poses; i++)
         {
-            Vec3 corrected_delta_v = preint_meas_vec_[i-1].delta_v + preint_meas_vec_[i-1].d_delta_v_d_bf * bias_acc_ + preint_meas_vec_[i-1].d_delta_v_d_bw * bias_gyr_;
-            Mat3 corrected_delta_R = preint_meas_vec_[i-1].delta_R * expMap(preint_meas_vec_[i-1].d_delta_R_d_bw * bias_gyr_);
             int64_t time_A = imu_times_[i-1];
             int64_t time_B = imu_times_[i];
+
+            // A scan can be registered more than once (the coarse-to-fine cascade of a dropped
+            // frame, or the first pass when there is no initial guess), and every registration
+            // appends to `imu_times_`. Consecutive entries are then equal, and the division below
+            // would be 0/0. Same reasoning as in `computeGravityFactor`, except that here a single
+            // such sample is enough to make `gravity_angle_std_` not a number, which then makes
+            // every gravity residual of the whole run not a number.
+            if(time_B <= time_A)
+            {
+                continue;
+            }
+
+            Vec3 corrected_delta_v = preint_meas_vec_[i-1].delta_v + preint_meas_vec_[i-1].d_delta_v_d_bf * bias_acc_ + preint_meas_vec_[i-1].d_delta_v_d_bw * bias_gyr_;
+            Mat3 corrected_delta_R = preint_meas_vec_[i-1].delta_R * expMap(preint_meas_vec_[i-1].d_delta_R_d_bw * bias_gyr_);
 
             Vec3 vel_A = body_velocities_[time_A];
             Vec3 vel_B = body_velocities_[time_B];
             Vec3 local_g = (vel_B - corrected_delta_R.transpose()*(vel_A + corrected_delta_v)) / ((time_B - time_A) * 1e-9);
             Vec3 global_g = imu_poses_[i].block<3,3>(0,0) * local_g;
 
-            double diff_angle = std::acos(global_g.dot(gravity_) / (global_g.norm() * gravity_.norm()));
-            gravity_residuals.push_back(diff_angle);
-            
+            // A preintegration over an interval the IMU has a hole in can still come back
+            // non-finite, and a zero-length sample has no direction to compare.
+            const double norm_product = global_g.norm() * gravity_.norm();
+            if(!global_g.allFinite() || (norm_product < 1e-12))
+            {
+                continue;
+            }
+
+            // The quotient is a cosine, but rounding can put it just outside [-1, 1], where acos
+            // is not a number. Clamped as in `GravityFactorFunctor::operator()`.
+            const double cos_angle = std::clamp(global_g.dot(gravity_) / norm_product, -1.0, 1.0);
+            gravity_residuals.push_back(std::acos(cos_angle));
         }
-        double sq_sum = std::inner_product(gravity_residuals.begin(), gravity_residuals.end(), gravity_residuals.begin(), 0.0);
-        gravity_angle_std_ = std::sqrt(sq_sum / gravity_residuals.size());
+
+        if(gravity_residuals.empty())
+        {
+            // Nothing to derive a spread from. Leaving `gravity_angle_std_` at its default keeps the
+            // gravity factor disabled rather than weighting it by a number that is not one.
+            std::cout << "Gravity initialization: no usable interval, skipping the angle stdev" << std::endl;
+        }
+        else
+        {
+            double sq_sum = std::inner_product(gravity_residuals.begin(), gravity_residuals.end(), gravity_residuals.begin(), 0.0);
+            gravity_angle_std_ = std::sqrt(sq_sum / gravity_residuals.size());
+        }
+
 
         // Clean the data used to initialize the gravity and biases
         cleanBodyVelocities();
@@ -706,6 +740,15 @@ GravityFactorFunctor* SubmapManager::computeGravityFactor(const int64_t current_
     // whole registration when the residual is not a number, so it is better to register that scan
     // without the gravity factor than to lose the registration.
     if(!local_g.allFinite() || (local_g.norm() < 1e-6))
+    {
+        return nullptr;
+    }
+
+    // The residual is divided by this, and the target gravity is divided by its own norm, so
+    // neither can be zero or not a number. Both come from the initialization, which gives up on
+    // them when it has no usable interval to measure a spread over.
+    if(!std::isfinite(gravity_angle_std_) || (gravity_angle_std_ <= 0.0)
+        || !gravity_.allFinite() || (gravity_.norm() < 1e-6))
     {
         return nullptr;
     }
