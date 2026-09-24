@@ -509,9 +509,14 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
     // Prepare the output vector
     std::vector<std::shared_ptr<std::vector<Pointd> > > output(pts.size());
 
-    // Convert the extrinsic calibration state to R and t
+    // Convert the extrinsic calibration state to R and t. The adapter is required: the raw pointer
+    // overload of QuaternionToRotation writes row-major, unlike the other ceres rotation functions,
+    // and R_calib is column-major, so without it this was the transpose of the calibration. That
+    // went unnoticed because both launch file calibrations are rotations by (nearly) pi, which are
+    // (nearly) symmetric: exact for os1, 0.03 degrees for Boreas; a 90 degree mount would be 180
+    // degrees off. The residuals rotate with the quaternion directly, and were not affected.
     Mat3 R_calib;
-    ceres::QuaternionToRotation<double>(state_calib.data(), R_calib.data());
+    ceres::QuaternionToRotation<double>(state_calib.data(), ceres::ColumnMajorAdapter3x3(R_calib.data()));
     Vec3 t_calib = state_calib.segment<3>(4);
 
     // Project each point cloud to the state times
@@ -1058,6 +1063,10 @@ void LidarOdometry::correctAndPublishPc(
     ceres::QuaternionToAngleAxis<double>(state_calib.data(), r_calib.data());
     Vec3 t_calib = state_calib.segment<3>(4);
 
+    // Both are the same for every point of the scan, so they are turned into rotation matrices once
+    const Mat3 R_calib = expMap(r_calib);
+    const Mat3 R_inv_t1 = expMap(inv_rot_t1);
+
     // Correct the points of chuncks 1 and 2 and publish them
     std::vector<Pointd> pc_corrected;
     pc_corrected.reserve(pts.at(1)->size());
@@ -1074,12 +1083,15 @@ void LidarOdometry::correctAndPublishPc(
 
         for(size_t j = 0; j < pts.at(i)->size(); ++j)
         {
-            auto[pos, rot] = combineTransforms(poses[j].first, poses[j].second, t_calib, r_calib);
-            std::tie(pos, rot) = combineTransforms(inv_pos_t1, inv_rot_t1, pos, rot);
-            Vec3 p_L = pts.at(i)->at(j).vec3();
-            Vec3 p_t1;
-            ceres::AngleAxisRotatePoint<double>(rot.data(), p_L.data(), p_t1.data());
-            p_t1 += pos;
+            // The point in the frame at t1, R_inv_t1 * (R_j * (R_calib * p_L + t_calib) + pos_j) +
+            // inv_pos_t1: the three transforms applied in turn. Composing them as angle-axis vectors
+            // instead cost six conversions to and from rotation matrices per point, two of them of
+            // the per-scan constants above, and was a tenth of the node's cpu.
+            const Vec3 p_I = R_calib * pts.at(i)->at(j).vec3() + t_calib;
+            Vec3 p_W;
+            ceres::AngleAxisRotatePoint<double>(poses[j].second.data(), p_I.data(), p_W.data());
+            p_W += poses[j].first;
+            const Vec3 p_t1 = R_inv_t1 * p_W + inv_pos_t1;
             pc_corrected.push_back(Pointd(p_t1, pts.at(i)->at(j).t, pts.at(i)->at(j).i, pts.at(i)->at(j).channel, pts.at(i)->at(j).type));
         }
 

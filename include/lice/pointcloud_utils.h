@@ -315,25 +315,29 @@ inline std::vector<PointTemplated<T> > downsamplePointCloudSubset(
 
 
 
-inline std::vector<std::vector<Pointd> > splitChannels(const std::vector<Pointd>& pc, double min_dist = 0.0, double max_dist = 1000.0)
+namespace detail
 {
-    std::vector<double> ranges;
+// Whether a point is kept by `splitChannels`. Written as the negation of the out-of-range test so
+// that a NaN point, whose range compares false against both bounds, is kept as it always was.
+inline bool inChannelRange(const Pointd& p, const double min_dist, const double max_dist)
+{
+    const double range = p.vec3().norm();
+    return !(range < min_dist || range > max_dist);
+}
+
+// `splitChannels` for channel numbers too large or negative for a flat table: same passes, with
+// a map. Slower, but it makes no assumption on the numbering.
+inline std::vector<std::vector<Pointd> > splitChannelsMap(const std::vector<Pointd>& pc, double min_dist, double max_dist)
+{
     std::map<int,int> channel_ids;
     int counter = 0;
     for(size_t i = 0; i < pc.size(); ++i)
     {
-        if(channel_ids.find(pc[i].channel) != channel_ids.end())
+        if(channel_ids.find(pc[i].channel) != channel_ids.end() || !inChannelRange(pc[i], min_dist, max_dist))
         {
             continue;
         }
-
-        double range = pc[i].vec3().norm();
-        if(range < min_dist || range > max_dist)
-        {
-            continue;
-        }
-        channel_ids[pc[i].channel] = counter;
-        counter++;
+        channel_ids[pc[i].channel] = counter++;
     }
 
     std::vector<std::vector<Pointd> > output(counter);
@@ -343,13 +347,60 @@ inline std::vector<std::vector<Pointd> > splitChannels(const std::vector<Pointd>
     }
     for(size_t i = 0; i < pc.size(); ++i)
     {
-        if(min_dist > 0.0)
+        if(inChannelRange(pc[i], min_dist, max_dist))
         {
-            double range = pc[i].vec3().norm();
-            if(range < min_dist || range > max_dist)
-                continue;
+            output[channel_ids.at(pc[i].channel)].push_back(pc[i]);
         }
-        output[channel_ids[pc[i].channel]].push_back(pc[i]);
+    }
+    return output;
+}
+} // namespace detail
+
+// Split a point cloud into one vector per channel, keeping only the points whose range is within
+// [min_dist, max_dist]. The channels come out in the order of their first kept point, and the
+// points of a channel in their input order: the feature extraction concatenates its output in
+// that order and downsamples it with random draws, so the order is part of the result.
+//
+// Both passes apply the same range test, so a point is kept iff it is in range, and its channel
+// has necessarily been given an id by the time the second pass reaches it. (The second pass used
+// to skip the test when min_dist <= 0: points beyond max_dist were then kept, and those of a
+// channel with no point in range were appended to channel 0, mixing two scanlines.)
+inline std::vector<std::vector<Pointd> > splitChannels(const std::vector<Pointd>& pc, double min_dist = 0.0, double max_dist = 1000.0)
+{
+    // Channel numbers are small non-negative integers on the lidars we handle, so they index a
+    // flat table; this was a std::map, looked up twice per point, and 2.4 to 2.8 times slower.
+    constexpr int kMaxTableChannel = 1 << 16;
+    std::vector<int> channel_ids;
+    int counter = 0;
+    for(size_t i = 0; i < pc.size(); ++i)
+    {
+        const int channel = pc[i].channel;
+        if(channel < 0 || channel >= kMaxTableChannel)
+        {
+            return detail::splitChannelsMap(pc, min_dist, max_dist);
+        }
+        if(channel >= (int)channel_ids.size())
+        {
+            channel_ids.resize(channel + 1, -1);
+        }
+        if(channel_ids[channel] >= 0 || !detail::inChannelRange(pc[i], min_dist, max_dist))
+        {
+            continue;
+        }
+        channel_ids[channel] = counter++;
+    }
+
+    std::vector<std::vector<Pointd> > output(counter);
+    for(int i = 0; i < counter; ++i)
+    {
+        output[i].reserve(pc.size()/counter);
+    }
+    for(size_t i = 0; i < pc.size(); ++i)
+    {
+        if(detail::inChannelRange(pc[i], min_dist, max_dist))
+        {
+            output[channel_ids[pc[i].channel]].push_back(pc[i]);
+        }
     }
     return output;
 }

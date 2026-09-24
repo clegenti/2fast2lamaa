@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <vector>
+#include <array>
 #include <set>
 #include <memory>
 #include <iostream>
@@ -142,6 +143,25 @@ typedef PointTemplated<double> Pointd;
 typedef PointTemplated<float> Pointf;
 
 
+// Most target points a lidar association uses: three for a point-to-plane one, two for a
+// point-to-line one.
+constexpr size_t kMaxAssociationTargets = 3;
+
+// The target points of one association, with a fixed capacity so that a residual evaluated in the
+// solver's inner loop can hold them without allocating. Indexable like the std::vector it replaces.
+struct TargetPoints
+{
+    std::array<Vec3, kMaxAssociationTargets> pts;
+    size_t n = 0;
+    size_t size() const { return n; }
+    const Vec3& operator[](const size_t i) const { return pts[i]; }
+    Vec3& operator[](const size_t i) { return pts[i]; }
+};
+
+// Jacobian of a residual with respect to its feature and target points: 3 + 3*targets values, at
+// most 12, kept on the stack rather than in a dynamically allocated row.
+typedef Eigen::Matrix<double, 1, Eigen::Dynamic, Eigen::RowMajor, 1, 3 + 3*kMaxAssociationTargets> RowAssocJacobian;
+
 
 struct DataAssociation
 {
@@ -171,8 +191,9 @@ struct DataAssociation
         if((type == 2) || (type == 3)) return 2;
         return 3;
     }
-    template<typename T>
-    T computeResidual(const Eigen::Matrix<T, 3,1> & feature, const std::vector<Eigen::Matrix<T,3,1> >& targets) const
+    // `targets` is a std::vector or a TargetPoints: anything indexable with a size()
+    template<typename T, typename Targets>
+    T computeResidual(const Eigen::Matrix<T, 3,1> & feature, const Targets& targets) const
     {
         T output = T(0.0);
         // Point to plane residual
@@ -196,9 +217,11 @@ struct DataAssociation
         return output;
     }
 
-    RowX computeJacobian(const Vec3& feature, const std::vector<Vec3>& targets) const
+    // `targets` as in computeResidual. Holds at most kMaxAssociationTargets of them.
+    template<typename Targets>
+    RowAssocJacobian computeJacobian(const Vec3& feature, const Targets& targets) const
     {
-        RowX output(3+(3*targets.size()));
+        RowAssocJacobian output(3+(3*targets.size()));
         output.setZero();
         if(type == 1)
         {

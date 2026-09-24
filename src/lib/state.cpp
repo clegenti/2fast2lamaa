@@ -305,11 +305,12 @@ std::tuple<std::pair<Vec3, Vec3>,
         
         if(use_cache && !cached_state_poses_.empty())
         {
+            // Only the rotations: the position jacobians were set with the position above. They used
+            // to be reassigned here from the cache, which holds the IMU-preintegration ones whatever
+            // the mode, so in GYR mode the gyro-bias jacobian of the position came back as
+            // d_delta_p_d_bw instead of zero (the constant-velocity position does not depend on it).
             r0 = cached_state_poses_[state_id].second;
             r1 = cached_state_poses_[state_id+1].second;
-
-            state_jacobian_0 = cached_state_jacobians_[state_id];
-            state_jacobian_1 = cached_state_jacobians_[state_id+1];
         }
         else
         {

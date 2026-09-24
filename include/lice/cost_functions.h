@@ -4,6 +4,8 @@
 #include "lice/utils.h"
 #include "lice/math_utils.h"
 #include <ceres/rotation.h>
+#include <array>
+#include <stdexcept>
 
 #include "lice/state.h"
 
@@ -127,6 +129,11 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3>
                 , data_association_(data_association)
                 , weight_(weight)
         {
+            // Evaluate holds the targets in fixed-capacity containers
+            if(data_association_.target_ids.size() > kMaxAssociationTargets)
+            {
+                throw std::invalid_argument("LidarNoCalCostFunction: an association has more than kMaxAssociationTargets target points");
+            }
             feature_times_.resize(1+data_association_.target_ids.size());
             feature_times_[0] = nanosToSeconds(sparse_features[data_association_.pc_id]->at(data_association_.feature_id).t, offset_time);
             for(size_t i = 0; i < data_association_.target_ids.size(); ++i)
@@ -157,11 +164,14 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3>
             Eigen::Map<const Vec3> arg_2(parameters[2]);
             Eigen::Map<const Vec3> arg_3(parameters[3]);
 
-            std::vector<std::pair<Vec3, Vec3> > poses(1+data_association_.target_ids.size());
-            std::vector<std::array<std::pair<Mat3, Mat3>, 4> > pose_jacobians;
+            // Fixed capacity rather than std::vector: this runs once per residual per solver evaluation,
+            // and every container below used to be a heap allocation (the target count is checked in
+            // the constructor)
+            const size_t nb_targets = data_association_.target_ids.size();
+            std::array<std::pair<Vec3, Vec3>, 1 + kMaxAssociationTargets> poses;
+            std::array<std::array<std::pair<Mat3, Mat3>, 4>, 1 + kMaxAssociationTargets> pose_jacobians;
             if(jacobians != NULL)
             {
-                pose_jacobians.resize(1+data_association_.target_ids.size());
                 for(size_t i = 0; i < feature_times_.size(); ++i)
                 {
                     std::tie(poses[i], pose_jacobians[i]) = state_.queryWthJacobian(feature_times_[i], arg_0, arg_1, arg_2, arg_3, true);
@@ -182,17 +192,16 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3>
             ceres::AngleAxisRotatePoint(feature_rot.data(), source_pt_.data(), feature_W_rot.data());
             Vec3 feature_W = feature_W_rot + feature_pos;
 
-            std::vector<Vec3> target_rots(data_association_.target_ids.size());
-            std::vector<Vec3> targets_W_rot(data_association_.target_ids.size());
-            std::vector<Vec3> targets_W(data_association_.target_ids.size());
-            for(size_t j = 0; j < data_association_.target_ids.size(); ++j)
+            std::array<Vec3, kMaxAssociationTargets> targets_W_rot;
+            TargetPoints targets_W;
+            targets_W.n = nb_targets;
+            for(size_t j = 0; j < nb_targets; ++j)
             {
                 Vec3& target_rot = poses[j+1].second;
                 Vec3& target_pos = poses[j+1].first;
 
                 Vec3 target_W;
                 ceres::AngleAxisRotatePoint(target_rot.data(), target_pts_[j].data(), target_W.data());
-                target_rots[j] = target_rot;
                 targets_W_rot[j] = target_W;
                 targets_W[j] = target_W + target_pos;
             }
@@ -202,10 +211,10 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3>
 
             if(jacobians != NULL)
             {
-                RowX d_res_d_pts = data_association_.computeJacobian(feature_W, targets_W);
+                const RowAssocJacobian d_res_d_pts = data_association_.computeJacobian(feature_W, targets_W);
                 Mat3 d_feature_d_rot = -ugpm::toSkewSymMat(feature_W_rot)*ugpm::jacobianRighthandSO3(-feature_rot);
-                std::vector<Mat3> d_target_d_rot(data_association_.target_ids.size());
-                for(size_t j = 0; j < data_association_.target_ids.size(); ++j)
+                std::array<Mat3, kMaxAssociationTargets> d_target_d_rot;
+                for(size_t j = 0; j < nb_targets; ++j)
                 {
                     Vec3& target_rot = poses[j+1].second;
                     d_target_d_rot[j] = -ugpm::toSkewSymMat(targets_W_rot[j])*ugpm::jacobianRighthandSO3(-target_rot);
@@ -222,7 +231,7 @@ class LidarNoCalCostFunction: public ceres::SizedCostFunction<1, 3,3,3,3>
                         {
                             j_s += d_res_d_pts.segment<3>(0) * d_feature_d_rot * pose_jacobians[0][j].second;
                         }
-                        for(size_t k = 0; k < data_association_.target_ids.size(); ++k)
+                        for(size_t k = 0; k < nb_targets; ++k)
                         {
                             j_s += d_res_d_pts.segment<3>(3*(k+1)) * pose_jacobians[k+1][j].first;
                             if(j==1)
