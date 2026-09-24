@@ -76,6 +76,11 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         GpMapNode()
             : Node("gp_map")
         {
+            // Eigen spawns its own OpenMP threads for large enough products, and the registration
+            // calls into it from inside OpenMP regions of its own. The matrices here are small
+            // enough that it should never trigger, but if it ever did the two levels would
+            // oversubscribe the machine rather than share it, so it is held to one thread.
+            Eigen::setNbThreads(1);
 
             // Read the parameters for options
             voxel_size_ = readRequiredFieldDouble(this, "voxel_size");
@@ -152,6 +157,18 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // blocks survive from one scan to the next as long as the map does not change, so this
             // is what trades the memory they take against the cost of rebuilding them.
             options.max_num_alpha_cells = readFieldInt(this, "max_num_alpha_cells", -1);
+
+            // Threads of the OpenMP regions of the registration. The default was a hardcoded 8,
+            // which oversubscribes a machine with fewer cores than that, so it is capped by what the
+            // host actually has. `hardware_concurrency` is allowed to return 0 when it cannot tell,
+            // in which case the old default stands.
+            const unsigned int hw_threads = std::thread::hardware_concurrency();
+            const int default_num_threads = (hw_threads > 0)
+                ? std::min<int>(8, static_cast<int>(hw_threads))
+                : 8;
+            options.num_threads = std::max(1, readFieldInt(this, "num_threads", default_num_threads));
+            RCLCPP_INFO(this->get_logger(), "Registration running on %d thread(s) (%u reported by the host)", options.num_threads, hw_threads);
+
             use_scale_optimization_ = options.use_scale_optimization;
             if(options.use_scale_optimization && !localization_)
             {

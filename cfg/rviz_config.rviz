@@ -8,6 +8,7 @@ Panels:
         - /Status1
         - /PointCloud21
         - /PointCloud22
+        - /Odometry1
         - /Odometry1/Shape1
         - /Path1
       Splitter Ratio: 0.5
@@ -62,7 +63,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 119; 118; 123
       Color Transformer: Intensity
-      Decay Time: 3
+      Decay Time: 1
       Enabled: true
       Invert Rainbow: false
       Max Color: 224; 27; 36
@@ -135,7 +136,7 @@ Visualization Manager:
           Value: true
         Value: true
       Enabled: true
-      Keep: 10000
+      Keep: 1000
       Name: Odometry
       Position Tolerance: 0.10000000149011612
       Shape:
@@ -254,7 +255,7 @@ Visualization Manager:
       Enabled: true
       Name: Assoc pairs (green planar, red edge)
       Namespaces:
-        associations: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -309,7 +310,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 34.85541534423828
+      Distance: 61.88569259643555
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -324,10 +325,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4797973930835724
+      Pitch: 1.1097967624664307
       Target Frame: lidar
       Value: Orbit (rviz)
-      Yaw: 2.0209219455718994
+      Yaw: 2.5959317684173584
     Saved: ~
 Window Geometry:
   Displays:

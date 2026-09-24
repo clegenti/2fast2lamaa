@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <omp.h>
 #include <eigen3/Eigen/Dense>
 
 
@@ -132,8 +133,10 @@ void Cell::computeAlpha(bool clean_behind)
     {
         alpha_block_ = new AlphaBlock();
         MatX pts = getNeighborPts(true);
-        MatX weights = getWeights(pts).asDiagonal();
-        MatX K = kernelRQ(pts.block(0,0,pts.rows(),3), pts.block(0,0,pts.rows(),3)) + weights;
+        // The noise term is diagonal, so it is added in place rather than through a dense matrix of
+        // zeros: `asDiagonal` used to be materialised into one and added to the whole kernel.
+        MatX K = kernelRQSelf(pts.block(0,0,pts.rows(),3));
+        K.diagonal() += getWeights(pts);
         VecX Y = VecX::Ones(pts.rows());
         alpha_block_->alpha = solveKinvY(K, Y);
         if(!clean_behind)
@@ -164,6 +167,26 @@ MatX Cell::getNeighborPts(bool with_count)
 }
 
 
+
+MatX Cell::kernelRQSelf(const MatX& X) const
+{
+    const GPCellHyperparameters& hp = map_->cell_hyperparameters;
+    const int n = X.rows();
+    MatX K(n, n);
+    for(int i = 0; i < n; i++)
+    {
+        // The diagonal is the kernel at zero distance, which the rational quadratic puts at 1
+        K(i, i) = 1.0;
+        for(int j = i + 1; j < n; j++)
+        {
+            double temp = 1.0 + ((X.row(i) - X.row(j)).squaredNorm()*hp.inv_2_beta_l_2);
+            const double k = 1.0/(temp*temp);
+            K(i, j) = k;
+            K(j, i) = k;
+        }
+    }
+    return K;
+}
 
 MatX Cell::kernelRQ(const MatX& X1, const MatX& X2) const
 {
@@ -456,6 +479,10 @@ MapDistField::MapDistField(const MapDistFieldOptions& options, GpMapPublisher* p
     {
         hash_map_edge_ = std::make_unique<ankerl::unordered_dense::set<CellPtr>>();
     }
+    // One staging list per thread of the OpenMP regions that build weight blocks, and a guaranteed
+    // slot 0 for the calls made outside any of them (the calibration below is one of those). Sized
+    // before it, since it builds a block.
+    staged_cells_.resize(std::max(1, num_threads_));
 
     calibrateUncertaintyProxy();
 }
@@ -488,6 +515,10 @@ void MapDistField::clear()
     prev_scan_.clear();
     prev_pose_ = Mat4::Identity();
     cells_to_clean_.clear();
+    for(auto& thread_cells : staged_cells_)
+    {
+        thread_cells.clear();
+    }
     travel_since_sweep_ = 0.0;
     has_sweep_position_ = false;
     last_sweep_position_ = Vec3::Zero();
@@ -760,14 +791,36 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
 
 void MapDistField::cellToClean(const GridIndex& index)
 {
-    clean_mutex_.lock();
-    cells_to_clean_.insert(index);
-    clean_mutex_.unlock();
+    // No lock: each thread of the surrounding OpenMP region appends to its own list, and
+    // `mergeStagedCells` folds them in once the region is over. A cell builds its block at most
+    // once per scan, so the lists cannot hold the same index twice.
+    const int thread_id = omp_get_thread_num();
+    if((thread_id < 0) || (thread_id >= (int)staged_cells_.size()))
+    {
+        // Outside any parallel region, or more threads than the map was sized for
+        staged_cells_[0].push_back(index);
+        return;
+    }
+    staged_cells_[thread_id].push_back(index);
+}
+
+void MapDistField::mergeStagedCells()
+{
+    for(auto& thread_cells : staged_cells_)
+    {
+        if(thread_cells.empty())
+        {
+            continue;
+        }
+        cells_to_clean_.insert(thread_cells.begin(), thread_cells.end());
+        thread_cells.clear();
+    }
 }
 
 void MapDistField::cleanCells()
 {
     clean_mutex_.lock();
+    mergeStagedCells();
     for(auto& index : cells_to_clean_)
     {
         auto it = hash_map_->find(index);
@@ -795,6 +848,7 @@ void MapDistField::evictFarAlphas(const Vec3& position)
     }
 
     clean_mutex_.lock();
+    mergeStagedCells();
 
     // The optional size cap is checked every scan, the range sweep only every
     // `kAlphaSweepTravelDistance`. They cover different cases: the range sweep bounds a trajectory
@@ -1312,11 +1366,24 @@ std::pair<std::vector<Pointd>, std::vector<Vec3> > MapDistField::getPtsAndNormal
 double MapDistField::queryDistField(const Vec3& pt, const bool field, const int type)
 {
     double dist = std::numeric_limits<double>::max();
-    thuni::Octree& octree = (opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0) ? ioctree_edge_ : ioctree_;
+    const bool use_edge = opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0;
+    thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
     if(octree.size() == 0)
     {
         return dist;
     }
+
+    // Same shortcut as in `queryDistFieldAndGrad`: one cell wanted, and the cell the query falls in
+    // is the nearest one whenever it is occupied.
+    if(num_neighbors_ == 1)
+    {
+        CellPtr cell = cellContaining(pt, use_edge);
+        if(cell != nullptr)
+        {
+            return field ? cell->getDist(pt) : (pt - cell->getPt()).norm();
+        }
+    }
+
     std::vector<double> neighbor_dists;
     std::vector<PointSimple> neighbors;
     octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
@@ -1394,6 +1461,22 @@ std::vector<double> MapDistField::queryDistField(const std::vector<Vec3>& pts, c
 
 
 
+CellPtr MapDistField::cellContaining(const Vec3& pt, const bool edge)
+{
+    auto it = hash_map_->find(getGridIndex(pt));
+    if(it == hash_map_->end())
+    {
+        return nullptr;
+    }
+    if(edge && (!hash_map_edge_ || (hash_map_edge_->count(it->second) == 0)))
+    {
+        // The edge octree only holds the edge cells, so the containing cell is only the answer to
+        // a search in it when it is one of them
+        return nullptr;
+    }
+    return it->second;
+}
+
 std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, const bool field, const int type)
 {
     double dist = std::numeric_limits<double>::max();
@@ -1401,13 +1484,30 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
     CellPtr best_cell = nullptr;
     std::vector<double> neighbor_dists;
     std::vector<PointSimple> neighbors;
-    thuni::Octree& octree = (opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0) ? ioctree_edge_ : ioctree_;
+    const bool use_edge = opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0;
+    thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
     if(octree.size() == 0)
     {
         return {dist, grad};
     }
-    octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
-    if(field && (neighbors.size() == 1))
+
+    // Only one cell is wanted, and the query usually falls inside an occupied one: that cell is
+    // then the nearest of the whole map (see `cellContaining`), so the tree descent can be skipped
+    // altogether. This is the case during the registration, which forces `num_neighbors_` to 1.
+    if(num_neighbors_ == 1)
+    {
+        best_cell = cellContaining(pt, use_edge);
+    }
+
+    if(best_cell == nullptr)
+    {
+        octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
+    }
+    if(best_cell != nullptr)
+    {
+        // Answered by the lookup above, nothing to select
+    }
+    else if(field && (neighbors.size() == 1))
     {
         // With a single candidate there is nothing to select: the getDist call below would only
         // serve to pick the cell that getDistAndGrad is called on anyway, and its result would be
@@ -1454,7 +1554,13 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
         }
         else
         {
-            grad = (pt - best_cell->getPt()).normalized();
+            // Set here rather than only in the selection loop: when `cellContaining` answered, that
+            // loop never ran and the distance would come back as the max() it was initialised to,
+            // which makes every coarse registration (`approximate`, so `field` is false) fail.
+            // For the loop's own answer this recomputes the value it already found.
+            const Vec3 diff = pt - best_cell->getPt();
+            dist = diff.norm();
+            grad = diff.normalized();
         }
     }
     else

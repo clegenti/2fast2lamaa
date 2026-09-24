@@ -81,6 +81,9 @@ class Cell {
 
 
         MatX kernelRQ(const MatX& X1, const MatX& X2) const;
+        // `kernelRQ(X, X)`, which is what fitting a cell needs. The matrix is symmetric, so only
+        // half of the pairs are evaluated and each result is written to both sides.
+        MatX kernelRQSelf(const MatX& X) const;
         std::tuple<MatX, MatX, MatX, MatX> kernelRQAndDiff(const MatX& X1, const MatX& X2);
 
         // Evaluate the GP occupancy (and its gradient) at a query point directly from the weights,
@@ -225,6 +228,11 @@ class MapDistField {
         const int num_threads_;
 
         std::mutex clean_mutex_;
+        // Cells that built a weight block during the current scan, one list per thread of the
+        // OpenMP regions that call `computeAlpha`. Staging them per thread rather than inserting
+        // straight into `cells_to_clean_` keeps a process-wide lock off a path that is taken once
+        // per cell built, from inside those regions. Folded in by `mergeStagedCells`.
+        std::vector<std::vector<GridIndex> > staged_cells_;
         // The cells currently holding an alpha block: what `cleanCells` releases when the map
         // changes, and what `evictFarAlphas` sweeps by range when it does not.
         ankerl::unordered_dense::set<GridIndex> cells_to_clean_;
@@ -265,6 +273,11 @@ class MapDistField {
         double scale_ = 1.0;
 
         void cleanCells();
+
+        // Move what `cellToClean` staged per thread into `cells_to_clean_`. Called by everything
+        // that reads that set, and only ever from outside a parallel region. Expects
+        // `clean_mutex_` to be held.
+        void mergeStagedCells();
 
 
         // Release the GP weight blocks of the cells further than `kMaxAlphaRange` from `position`,
@@ -329,8 +342,17 @@ class MapDistField {
 
         CellPtr getClosestCell(const Vec3& pt);
 
+        // The cell `pt` falls in, when it is occupied, and null otherwise. The cell centres form a
+        // cubic lattice, whose Voronoi region is the cell itself, so that cell's centre is the
+        // nearest centre of the whole map to `pt`: one lookup answers what a nearest neighbour
+        // search in the octree would, exactly, whenever it does not come back empty. `edge` also
+        // requires the cell to be one of the edge cells, which is what the edge octree holds.
+        CellPtr cellContaining(const Vec3& pt, const bool edge);
+
         std::vector<CellPtr> getNeighborCells(const Vec3& pt);
         
+        // Records that `index` now holds a weight block. Called from inside the OpenMP regions of
+        // the registration, so it takes no lock: it appends to this thread's staging list.
         void cellToClean(const GridIndex& index);
 
 
