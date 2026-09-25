@@ -242,11 +242,13 @@ class LidarOdometry
 
 
         // Helper function to project points using the continuous preintegrated state
+        // With only_chunk >= 0, only that point cloud is projected and the others are left empty
         std::vector<std::shared_ptr<std::vector<Pointd> > > projectPoints(
             const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts,
             const State& state,
             const std::vector<Vec3>& state_blocks,
-            const Vec7& state_calib) const;
+            const Vec7& state_calib,
+            const int only_chunk = -1) const;
 
 
         std::vector<DataAssociation> getDataAssociations(

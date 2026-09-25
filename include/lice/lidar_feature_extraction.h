@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -131,7 +132,15 @@ inline bool extractLidarFeatures(
     }
 
 
+    // Reserve for the worst case (every point kept): only the pages actually written get touched
     std::vector<Pointd> downsample;
+    size_t nb_channel_pts = 0;
+    for(const auto& channel : channels)
+    {
+        nb_channel_pts += channel.size();
+    }
+    downsample.reserve(nb_channel_pts);
+    std::uniform_real_distribution<double> uniform_01(0.0, 1.0);
     int64_t time_thr = (int64_t)(median_dt * kFeatureTimeThrFactor);
     int64_t time_thr_far = (int64_t)(median_dt * kFeatureTimeThrFarFactor);
     double min_range = kFeatureMinRangeFactor * params.min_range;
@@ -212,7 +221,7 @@ inline bool extractLidarFeatures(
                 (channels[i][j].x - last_point.x) * (channels[i][j].x - last_point.x) +
                 (channels[i][j].y - last_point.y) * (channels[i][j].y - last_point.y) +
                 (channels[i][j].z - last_point.z) * (channels[i][j].z - last_point.z));
-            double rand_val = ((double) rand() / (RAND_MAX));
+            double rand_val = uniform_01(pointSelectionRng());
             if(distance > params.feature_voxel_size*(0.5 + rand_val))
             {
                 if(params.intensity_threshold > 0.0 && channels[i][j].i < params.intensity_threshold)

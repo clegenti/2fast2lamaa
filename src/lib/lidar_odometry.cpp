@@ -442,17 +442,20 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
     options.function_tolerance = 1e-4;
 
 
-    // Project the features to the state times
+    // Project the features to the state times. Only the targets of the first point cloud and the
+    // sources of the last one are used, by the association and by publishAssociations alike
     std::vector<std::shared_ptr<std::vector<Pointd> > > projected_features = projectPoints(
         pts,
         state,
         state_blocks_,
-        state_calib_);
+        state_calib_,
+        0);
     std::vector<std::shared_ptr<std::vector<Pointd> > > projected_sparse_features = projectPoints(
         sparse_pts,
         state,
         state_blocks_,
-        state_calib_);
+        state_calib_,
+        (int)sparse_pts.size() - 1);
 
 
 
@@ -504,7 +507,8 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
         const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts,
         const State& state,
         const std::vector<Vec3>& state_blocks,
-        const Vec7& state_calib) const
+        const Vec7& state_calib,
+        const int only_chunk) const
 {
     // Prepare the output vector
     std::vector<std::shared_ptr<std::vector<Pointd> > > output(pts.size());
@@ -523,6 +527,10 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
     for(size_t i = 0; i < pts.size(); ++i)
     {
         output[i] = std::make_shared<std::vector<Pointd> >();
+        if((only_chunk >= 0) && ((int)i != only_chunk))
+        {
+            continue;
+        }
         output[i]->resize(pts[i]->size());
 
         // Collect the point times to perform a single query to the state
@@ -1106,10 +1114,22 @@ void LidarOdometry::correctAndPublishPc(
     }
     else
     {
-        // Sort the point cloud by time
-        std::sort(pc_corrected.begin(), pc_corrected.end(), [](const Pointd& a, const Pointd& b) {
-            return a.t < b.t;
-        });
+        // Sort the point cloud by time. Sorting (t, index) pairs then gathering once moves 16 bytes
+        // per swap instead of a whole 48 byte Pointd. Equal times keep their original order
+        std::vector<std::pair<int64_t, uint32_t> > order;
+        order.reserve(pc_corrected.size());
+        for(size_t j = 0; j < pc_corrected.size(); ++j)
+        {
+            order.emplace_back(pc_corrected[j].t, (uint32_t)j);
+        }
+        std::sort(order.begin(), order.end());
+        std::vector<Pointd> pc_sorted;
+        pc_sorted.reserve(order.size());
+        for(const auto& key : order)
+        {
+            pc_sorted.push_back(pc_corrected[key.second]);
+        }
+        pc_corrected.swap(pc_sorted);
         if(node_ != nullptr) node_->publishPc(pc_chunks_t.at(1), pc_corrected);
     }
 

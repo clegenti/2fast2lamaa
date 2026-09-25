@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <random>
 #include "happly/happly.h"
 #include "lice/utils.h"
 
@@ -276,37 +277,61 @@ inline std::vector<PointTemplated<T>> downsamplePointCloudPerType(
 
 
 
+// Random generator for the point selection, in place of rand(), which takes a global lock on
+// every call. One per thread; fixed seed, as rand() was never seeded, so runs stay repeatable.
+inline std::mt19937_64& pointSelectionRng()
+{
+    thread_local std::mt19937_64 rng(1);
+    return rng;
+}
+
+// Keeps one random point per occupied cell. Cells get a slot in order of first appearance, so each
+// point needs a single lookup and no per-cell point list is stored: the rank of the kept point in
+// its cell is drawn once the cell counts are known, and a second pass picks it.
 template<typename T>
 inline std::vector<PointTemplated<T> > downsamplePointCloudSubset(
     const std::vector<PointTemplated<T> >& input, T cell_size)
 {
-    std::vector<PointTemplated<T> > output;
-    std::unordered_map<GridIndex, std::vector<PointTemplated<T> >, ankerl::unordered_dense::hash<GridIndex>> grid_map;
-    for(const auto& pt : input)
+    ankerl::unordered_dense::map<GridIndex, uint32_t> slots;
+    slots.reserve(input.size());
+    std::vector<uint32_t> slot_of_point(input.size());
+    std::vector<uint32_t> count;
+    for(size_t i = 0; i < input.size(); ++i)
     {
-        GridIndex index = getGridIndex(pt, cell_size);
-        if(grid_map.find(index) == grid_map.end())
+        const auto [it, inserted] = slots.try_emplace(getGridIndex(input[i], cell_size), (uint32_t)count.size());
+        if(inserted)
         {
-            grid_map[index] = std::vector<PointTemplated<T> >(1, pt);
+            count.push_back(0);
         }
-        else
+        slot_of_point[i] = it->second;
+        count[it->second]++;
+    }
+
+    std::vector<uint32_t> rank(count.size(), 0);
+    for(size_t s = 0; s < count.size(); ++s)
+    {
+        if(count[s] > 1)
         {
-            grid_map[index].push_back(pt);
+            rank[s] = std::uniform_int_distribution<uint32_t>(0, count[s] - 1)(pointSelectionRng());
+        }
+        count[s] = 0;
+    }
+
+    std::vector<uint32_t> kept(rank.size());
+    for(size_t i = 0; i < input.size(); ++i)
+    {
+        const uint32_t s = slot_of_point[i];
+        if(count[s]++ == rank[s])
+        {
+            kept[s] = (uint32_t)i;
         }
     }
-    output.reserve(grid_map.size());
-    for(const auto& [index, pts] : grid_map)
+
+    std::vector<PointTemplated<T> > output;
+    output.reserve(kept.size());
+    for(const uint32_t i : kept)
     {
-        if(pts.size() > 1)
-        {
-            // Get a random point from the cluster
-            int random_index = rand() % pts.size();
-            output.push_back(pts[random_index]);
-        }
-        else
-        {
-            output.push_back(pts[0]);
-        }
+        output.push_back(input[i]);
     }
     return output;
 }
