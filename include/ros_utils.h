@@ -7,6 +7,9 @@
 #include "lice/types.h"
 #include <Eigen/Dense>
 #include <cmath>
+#include <cstring>
+#include <set>
+#include <type_traits>
 
 
 
@@ -453,6 +456,156 @@ inline std::pair<std::vector<Pointd>, bool> pointCloud2MsgToPtsVecInternal(const
     return {output, is_2d};
 }
 
+namespace detail
+{
+
+// Markers for the field types pointCloud2MsgToPtsVec dispatches on: a field the cloud does not
+// have (or a channel of a type it cannot read, which leaves the channel at 0), and a time field of
+// a type it cannot read
+struct NoField {};
+struct UnknownTimeField {};
+
+// What pointCloud2MsgToPtsVec reads from the message once, rather than once per point
+struct PointCloud2Layout
+{
+    const uint8_t* data = nullptr;
+    size_t point_step = 0;
+    size_t num_points = 0;
+    int off_x = 0;
+    int off_y = 0;
+    int off_z = 0;
+    int off_channel = -1;
+    int off_time = -1;
+    int off_intensity = -1;
+    int off_type = -1;
+    int off_rgb = -1;
+    int64_t time_ns = 0;            // header stamp
+    int64_t unknown_time_value = 0; // what a time field of unknown type gives: the stamp in seconds
+    double time_multiplier = 1.0;
+    bool absolute_time = false;
+};
+
+// Dead channel lookup: a table over the range of the dead channels, or the set itself when that
+// range is too large for one
+class DeadChannels
+{
+    public:
+        explicit DeadChannels(const std::set<int>& dead)
+            : dead_(dead)
+        {
+            if(!dead.empty() && (((int64_t)*dead.rbegin() - (int64_t)*dead.begin()) < kMaxTableSize))
+            {
+                min_ = *dead.begin();
+                table_.assign((size_t)(*dead.rbegin() - min_ + 1), 0);
+                for(const int channel : dead)
+                {
+                    table_[channel - min_] = 1;
+                }
+            }
+        }
+
+        bool contains(const int channel) const
+        {
+            if(!table_.empty())
+            {
+                const int64_t k = (int64_t)channel - min_;
+                return (k >= 0) && (k < (int64_t)table_.size()) && table_[k];
+            }
+            return dead_.find(channel) != dead_.end();
+        }
+
+    private:
+        static constexpr int64_t kMaxTableSize = 1 << 16;
+        const std::set<int>& dead_;
+        int min_ = 0;
+        std::vector<char> table_;
+};
+
+template<typename S>
+inline S readUnaligned(const uint8_t* p)
+{
+    S value;
+    memcpy(&value, p, sizeof(S));
+    return value;
+}
+
+// The per-point loop of pointCloud2MsgToPtsVec for one type of channel field and one type of time
+// field. Chosen once per message, so each field is read with a plain load instead of testing its
+// type for every point, and every offset is a local constant rather than a reload through the
+// message and the field table, which the writes to the output could otherwise alias.
+template<typename T, typename ChannelT, typename TimeT>
+inline void convertPointCloud2(const PointCloud2Layout layout, const DeadChannels* dead_channels,
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const std::vector<std::pair<int,int> >& fields,
+        std::vector<Mat3>* covariances, std::vector<PointTemplated<T> >& output, bool& is_2d, size_t& num_non_finite)
+{
+    for(size_t i = 0; i < layout.num_points; ++i)
+    {
+        const uint8_t* p = layout.data + layout.point_step*i;
+        int channel = 0;
+        if constexpr (!std::is_same_v<ChannelT, NoField>)
+        {
+            channel = (int)readUnaligned<ChannelT>(p + layout.off_channel);
+        }
+        if((dead_channels != nullptr) && dead_channels->contains(channel))
+        {
+            continue; // Skip points with dead channels
+        }
+
+        const float x = readUnaligned<float>(p + layout.off_x);
+        const float y = readUnaligned<float>(p + layout.off_y);
+        const float z = readUnaligned<float>(p + layout.off_z);
+        if(!isFinitePoint(x, y, z))
+        {
+            num_non_finite++;
+            continue;
+        }
+        if(z != 0.0f)
+        {
+            is_2d = false;
+        }
+
+        PointTemplated<T>& pt = output.emplace_back();
+        pt.x = (T)x;
+        pt.y = (T)y;
+        pt.z = (T)z;
+        pt.channel = channel;
+        if constexpr (std::is_same_v<TimeT, UnknownTimeField>)
+        {
+            pt.t = layout.unknown_time_value;
+        }
+        else if constexpr (!std::is_same_v<TimeT, NoField>)
+        {
+            const TimeT time = readUnaligned<TimeT>(p + layout.off_time);
+            pt.t = (int64_t)(time * layout.time_multiplier);
+            if(!layout.absolute_time)
+            {
+                pt.t += layout.time_ns;
+            }
+        }
+        if(layout.off_intensity >= 0)
+        {
+            pt.i = readUnaligned<float>(p + layout.off_intensity);
+        }
+        if(layout.off_type >= 0)
+        {
+            pt.type = readUnaligned<int>(p + layout.off_type);
+        }
+        if(layout.off_rgb >= 0)
+        {
+            pt.r = p[layout.off_rgb + 2];
+            pt.g = p[layout.off_rgb + 1];
+            pt.b = p[layout.off_rgb + 0];
+            pt.has_color = true;
+        }
+        if(covariances != nullptr)
+        {
+            covariances->push_back(readPointCovariance(msg, i, fields));
+        }
+    }
+}
+
+} // namespace detail
+
 // Function to read a PointCloud2 message and convert it to a vector of points.
 // `covariances`, when given, is filled with the per-point position covariance if the cloud carries
 // the 6 cov_* fields, and left empty otherwise. It is an out-parameter rather than part of the return
@@ -462,11 +615,6 @@ template <typename T>
 inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2MsgToPtsVec(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const double time_scale = 1e-9, bool need_time = true, const std::set<int>& dead_channels = std::set<int>(), bool absolute_time = false, std::vector<Mat3>* covariances = nullptr)
 {
     std::vector<PointTemplated<T>> output;
-    rclcpp::Time time = rclcpp::Time(msg->header.stamp);
-    int64_t time_ns = time.nanoseconds();
-    double time_multiplier = time_scale * 1e9;
-    size_t num_points = msg->width * msg->height;
-    output.reserve(num_points);
     std::vector<std::pair<int,int> > fields = getPointFields(msg->fields, need_time);
     bool has_intensity = (fields[PointFieldTypes::INTENSITY].first != -1);
     bool has_channel = (fields[PointFieldTypes::CHANNEL].first != -1);
@@ -474,13 +622,26 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
     bool has_time = (fields[PointFieldTypes::TIME].first != -1);
     bool has_color = (fields[PointFieldTypes::RGB].first != -1);
 
-    bool has_dead_channel = false;
-    bool is_2d = true;
-    size_t num_non_finite = 0;
-    if(has_channel && !dead_channels.empty())
-    {
-        has_dead_channel = true;
-    }
+    detail::PointCloud2Layout layout;
+    layout.data = msg->data.data();
+    layout.point_step = msg->point_step;
+    layout.num_points = msg->width * msg->height;
+    layout.off_x = fields[PointFieldTypes::X].first;
+    layout.off_y = fields[PointFieldTypes::Y].first;
+    layout.off_z = fields[PointFieldTypes::Z].first;
+    layout.off_channel = fields[PointFieldTypes::CHANNEL].first;
+    layout.off_time = fields[PointFieldTypes::TIME].first;
+    layout.off_intensity = has_intensity ? fields[PointFieldTypes::INTENSITY].first : -1;
+    layout.off_type = has_type ? fields[PointFieldTypes::TYPE].first : -1;
+    layout.off_rgb = has_color ? fields[PointFieldTypes::RGB].first : -1;
+    layout.time_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+    layout.unknown_time_value = (int64_t)rclcpp::Time(msg->header.stamp).seconds();
+    layout.time_multiplier = time_scale * 1e9;
+    layout.absolute_time = absolute_time;
+    output.reserve(layout.num_points);
+
+    const detail::DeadChannels dead(dead_channels);
+    const detail::DeadChannels* dead_ptr = (has_channel && !dead_channels.empty()) ? &dead : nullptr;
 
     bool fill_covariance = false;
     if(covariances != nullptr)
@@ -489,154 +650,55 @@ inline std::tuple<std::vector<PointTemplated<T> >, bool, bool, bool> pointCloud2
         fill_covariance = hasPointCovariance(fields);
         if(fill_covariance)
         {
-            covariances->reserve(num_points);
+            covariances->reserve(layout.num_points);
         }
     }
+    std::vector<Mat3>* covariances_out = fill_covariance ? covariances : nullptr;
 
-    for(size_t i = 0; i < num_points; ++i)
+    bool is_2d = true;
+    size_t num_non_finite = 0;
+    auto convert = [&](auto channel_tag, auto time_tag)
     {
-        PointTemplated<T> pt;
-        if(has_channel)
+        detail::convertPointCloud2<T, decltype(channel_tag), decltype(time_tag)>(
+                layout, dead_ptr, msg, fields, covariances_out, output, is_2d, num_non_finite);
+    };
+    auto dispatchTime = [&](auto channel_tag)
+    {
+        if(!has_time)
         {
-            if(fields[PointFieldTypes::CHANNEL].second == sensor_msgs::msg::PointField::UINT16)
-            {
-                uint16_t temp_channel;
-                memcpy(&(temp_channel),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::CHANNEL].first]), sizeof(uint16_t));
-                pt.channel = (int)temp_channel;
-            }
-            else if(fields[PointFieldTypes::CHANNEL].second == sensor_msgs::msg::PointField::INT32)
-            {
-                int32_t temp_channel;
-                memcpy(&(temp_channel),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::CHANNEL].first]), sizeof(int32_t));
-                pt.channel = (int)temp_channel;
-            }
-            else if(fields[PointFieldTypes::CHANNEL].second == sensor_msgs::msg::PointField::UINT32)
-            {
-                uint32_t temp_channel;
-                memcpy(&(temp_channel),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::CHANNEL].first]), sizeof(uint32_t));
-                pt.channel = (int)temp_channel;
-            }
-            else if(fields[PointFieldTypes::CHANNEL].second == sensor_msgs::msg::PointField::INT16)
-            {
-                int16_t temp_channel;
-                memcpy(&(temp_channel),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::CHANNEL].first]), sizeof(int16_t));
-                pt.channel = (int)temp_channel;
-            }
-            else if(fields[PointFieldTypes::CHANNEL].second == sensor_msgs::msg::PointField::INT8)
-            {
-                int8_t temp_channel;
-                memcpy(&(temp_channel),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::CHANNEL].first]), sizeof(int8_t));
-                pt.channel = (int)temp_channel;
-            }
-            else if(fields[PointFieldTypes::CHANNEL].second == sensor_msgs::msg::PointField::UINT8)
-            {
-                uint8_t temp_channel;
-                memcpy(&(temp_channel),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::CHANNEL].first]), sizeof(uint8_t));
-                pt.channel = (int)temp_channel;
-            }
-            else
-            {
-                std::cout << "The channel field is of unknown type" << std::endl;
-            }
+            convert(channel_tag, detail::NoField{});
+            return;
         }
-        // WARNING, CAN BE MAD FASTER BUY DOING A LOOKUP TABLE INSTEAD OF A SET
-        if(has_dead_channel && (dead_channels.find(pt.channel) != dead_channels.end()))
+        switch(fields[PointFieldTypes::TIME].second)
         {
-            continue; // Skip points with dead channels
-        }
-
-        float temp_x, temp_y, temp_z;
-        memcpy(&(temp_x), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::X].first]), sizeof(float));
-        memcpy(&(temp_y), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::Y].first]), sizeof(float));
-        memcpy(&(temp_z), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::Z].first]), sizeof(float));
-        if(!isFinitePoint(temp_x, temp_y, temp_z))
-        {
-            num_non_finite++;
-            continue;
-        }
-        pt.x = (T)temp_x;
-        pt.y = (T)temp_y;
-        pt.z = (T)temp_z;
-        if(temp_z != 0.0f)
-        {
-            is_2d = false;
-        }
-        if(has_time)
-        {
-            if(fields[PointFieldTypes::TIME].second == sensor_msgs::msg::PointField::FLOAT64)
-            {
-                double temp_t;
-                memcpy(&(temp_t), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::TIME].first]), sizeof(double));
-                if(absolute_time)
-                {
-                    pt.t = (int64_t)(temp_t * time_multiplier);
-                }
-                else
-                {
-                    pt.t = time_ns + (int64_t)(temp_t * time_multiplier);
-                }
-            }
-            else if(fields[PointFieldTypes::TIME].second == sensor_msgs::msg::PointField::FLOAT32)
-            {
-                float temp_t;
-                memcpy(&(temp_t), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::TIME].first]), sizeof(float));
-                if(absolute_time)
-                {
-                    pt.t = (int64_t)(temp_t * time_multiplier);
-                }
-                else
-                {
-                    pt.t = time_ns + (int64_t)(temp_t * time_multiplier);
-                }
-            }
-            else if(fields[PointFieldTypes::TIME].second == sensor_msgs::msg::PointField::UINT32)
-            {
-                uint32_t temp_t;
-                memcpy(&(temp_t), &(msg->data[(msg->point_step*i) + fields[PointFieldTypes::TIME].first]), sizeof(uint32_t));
-                if(absolute_time)
-                {
-                    pt.t = (int64_t)(temp_t * time_multiplier);
-                }
-                else
-                {
-                    if(time_multiplier == 1.0)
-                    {
-                        pt.t = time_ns + (int64_t)temp_t;
-                    }
-                    else
-                    {
-                        pt.t = time_ns + (int64_t)(temp_t * time_multiplier);
-                    }
-                }
-            }
-            else
-            {
+            case sensor_msgs::msg::PointField::FLOAT64: convert(channel_tag, double{}); break;
+            case sensor_msgs::msg::PointField::FLOAT32: convert(channel_tag, float{}); break;
+            case sensor_msgs::msg::PointField::UINT32: convert(channel_tag, uint32_t{}); break;
+            default:
                 std::cout << "The time field is not of type float32 or float64 or unit32" << std::endl;
-                pt.t = rclcpp::Time(msg->header.stamp).seconds();
-            }
+                convert(channel_tag, detail::UnknownTimeField{});
         }
-        if(has_intensity)
-        {
-            memcpy(&(pt.i),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::INTENSITY].first]), sizeof(float));
-        }
-        if(has_type)
-        {
-            memcpy(&(pt.type),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::TYPE].first]), sizeof(int));
-        }
-        if(has_color)
-        {
-            memcpy(&(pt.r),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::RGB].first + 2]), sizeof(uint8_t));
-            memcpy(&(pt.g),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::RGB].first + 1]), sizeof(uint8_t));
-            memcpy(&(pt.b),&(msg->data[(msg->point_step*i) + fields[PointFieldTypes::RGB].first + 0]), sizeof(uint8_t));
-            pt.has_color = true;
-        }
-        if(fill_covariance)
-        {
-            covariances->push_back(readPointCovariance(msg, i, fields));
-        }
-        output.push_back(pt);
+    };
+    if(!has_channel)
+    {
+        dispatchTime(detail::NoField{});
     }
-    reportNonFinitePoints(num_non_finite, num_points);
+    else
+    {
+        switch(fields[PointFieldTypes::CHANNEL].second)
+        {
+            case sensor_msgs::msg::PointField::UINT16: dispatchTime(uint16_t{}); break;
+            case sensor_msgs::msg::PointField::INT32: dispatchTime(int32_t{}); break;
+            case sensor_msgs::msg::PointField::UINT32: dispatchTime(uint32_t{}); break;
+            case sensor_msgs::msg::PointField::INT16: dispatchTime(int16_t{}); break;
+            case sensor_msgs::msg::PointField::INT8: dispatchTime(int8_t{}); break;
+            case sensor_msgs::msg::PointField::UINT8: dispatchTime(uint8_t{}); break;
+            default:
+                std::cout << "The channel field is of unknown type" << std::endl;
+                dispatchTime(detail::NoField{});
+        }
+    }
+    reportNonFinitePoints(num_non_finite, layout.num_points);
     return {output, has_intensity, has_channel, is_2d};
 }
 /////// End helper functions to subscribe and publish PointCloud2 messages

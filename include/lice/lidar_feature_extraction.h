@@ -132,7 +132,9 @@ inline bool extractLidarFeatures(
     }
 
 
-    // Reserve for the worst case (every point kept): only the pages actually written get touched
+    // Reserve for the worst case (every point kept): only the pages actually written get touched.
+    // A point is at most one of an edge or a downsampling candidate, so the edges plus the
+    // downsampled points appended at the end fit in features too
     std::vector<Pointd> downsample;
     size_t nb_channel_pts = 0;
     for(const auto& channel : channels)
@@ -140,6 +142,7 @@ inline bool extractLidarFeatures(
         nb_channel_pts += channel.size();
     }
     downsample.reserve(nb_channel_pts);
+    features.reserve(nb_channel_pts);
     std::uniform_real_distribution<double> uniform_01(0.0, 1.0);
     int64_t time_thr = (int64_t)(median_dt * kFeatureTimeThrFactor);
     int64_t time_thr_far = (int64_t)(median_dt * kFeatureTimeThrFarFactor);

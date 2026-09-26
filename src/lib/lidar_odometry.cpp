@@ -4,12 +4,11 @@
 #include <limits>
 #include <map>
 #include <random>
-#include "KDTree.h"
+#include <array>
+#include <memory>
+#include "nanoflann.hpp"
 #include "ankerl/unordered_dense.h"
 #include <ctime>
-
-typedef jk::tree::KDTree<std::pair<int,int>, 3, 16> KDTree3;
-typedef jk::tree::KDTree<int, 3, 16> KDTree3Simple;
 
 
 // ---- Conditioning of the target triplets/pairs a data association is built on -------------------
@@ -35,6 +34,36 @@ const double kMinPlanarSine = 0.2;
 // point are all its own ring.
 const int kPlanarCandidates = 16;
 const int kEdgeCandidates = 12;
+
+// Leaf size of the kd tree of the target features: 32 was the fastest to build and search against
+// 10 and 16, on target clouds of 2.6k to 118k points
+const size_t kFeatureTreeLeafSize = 32;
+
+namespace
+{
+
+// Target features of one type, contiguous as nanoflann reads them, with their indexes in the
+// feature cloud. The coordinates go through float, as the jk tree used before got them (vec3f), so
+// the neighbours found are the same
+struct FeatureCloud
+{
+    std::vector<std::array<double, 3> > pts;
+    std::vector<int> ids;
+    size_t kdtree_get_point_count() const { return pts.size(); }
+    double kdtree_get_pt(const size_t idx, const size_t dim) const { return pts[idx][dim]; }
+    template<class BBox> bool kdtree_get_bbox(BBox&) const { return false; }
+};
+
+typedef nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<double, FeatureCloud>, FeatureCloud, 3, uint32_t> FeatureIndex;
+
+// The index keeps a reference to its cloud, so the two live together (and must not move once built)
+struct FeatureTree
+{
+    FeatureCloud cloud;
+    std::unique_ptr<FeatureIndex> index;
+};
+
+} // namespace
 
 
 
@@ -130,6 +159,7 @@ void LidarOdometry::addAccSample(const Vec3& acc, const int64_t t)
     imu_mutex_.lock();
     imu_data_.acc.push_back(imu_sample);
     imu_mutex_.unlock();
+    notifyNewData(true);
 }
 
 void LidarOdometry::addGyroSample(const Vec3& gyro, const int64_t t)
@@ -151,7 +181,7 @@ void LidarOdometry::addGyroSample(const Vec3& gyro, const int64_t t)
     imu_mutex_.lock();
     imu_data_.gyr.push_back(imu_sample);
     imu_mutex_.unlock();
-
+    notifyNewData(true);
 }
 
 void LidarOdometry::stop()
@@ -159,6 +189,24 @@ void LidarOdometry::stop()
     mutex_.lock();
     running_ = false;
     mutex_.unlock();
+    notifyNewData(false);
+}
+
+void LidarOdometry::notifyNewData(const bool imu_sample)
+{
+    bool notify = true;
+    {
+        std::lock_guard<std::mutex> lock(data_cv_mutex_);
+        data_version_++;
+        if(imu_sample)
+        {
+            notify = wake_on_imu_;
+        }
+    }
+    if(notify)
+    {
+        data_cv_.notify_one();
+    }
 }
 
 std::shared_ptr<std::thread> LidarOdometry::runThread()
@@ -174,6 +222,14 @@ void LidarOdometry::run()
     running_ = true;
     while(running_)
     {
+        // Read before checking the data: whatever changes after this, even before the wait below,
+        // makes the wait return at once
+        uint64_t seen_version;
+        {
+            std::lock_guard<std::mutex> lock(data_cv_mutex_);
+            seen_version = data_version_;
+        }
+
         // Check if there is enough point clouds chunks and enough IMU data to run the optimisation
         mutex_.lock();
         int64_t last_time_t = imu_time_offset_;
@@ -204,6 +260,8 @@ void LidarOdometry::run()
         {
             has_data = (pc_chunk_features_.size() > id_to_run);
         }
+        // A chunk is there, only the IMU data to cover it is missing
+        const bool waiting_for_imu = !has_data && (pc_chunk_features_.size() > id_to_run);
         pc_mutex_.unlock();
         if(has_data)
         {
@@ -215,7 +273,10 @@ void LidarOdometry::run()
         }
         else
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(int(kPullPeriod*1000)));
+            std::unique_lock<std::mutex> lock(data_cv_mutex_);
+            wake_on_imu_ = waiting_for_imu;
+            data_cv_.wait(lock, [&]{ return data_version_ != seen_version; });
+            wake_on_imu_ = false;
         }
     }
     std::cout << "Stopping lidar odometry thread" << std::endl;
@@ -251,6 +312,7 @@ void LidarOdometry::splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd
     pc_chunks_.push_back(pc);
     pc_chunks_t_.push_back(t);
     pc_mutex_.unlock();
+    notifyNewData(false);
     return;
 }
 
@@ -523,6 +585,22 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
     ceres::QuaternionToRotation<double>(state_calib.data(), ceres::ColumnMajorAdapter3x3(R_calib.data()));
     Vec3 t_calib = state_calib.segment<3>(4);
 
+    // The points are only projected for the data association, so each one takes the pose of the
+    // state time closest to it rather than one interpolated at its own time: at most half a state
+    // period away (2.5 ms at 200 Hz), a few centimetres at range while rotating fast, against a
+    // neighbour search of max_feature_dist. That leaves one matrix product per point instead of
+    // an interpolation and an angle-axis rotation (a sincos). The residuals and the published
+    // clouds keep the interpolated poses. Each state pose is combined with the calibration once:
+    // p_W = R_k (R_calib p_L + t_calib) + p_k
+    const std::vector<std::pair<Vec3, Mat3> > state_poses = state.statePoses(state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3]);
+    std::vector<Mat3> R_W_L(state_poses.size());
+    std::vector<Vec3> t_W_L(state_poses.size());
+    for(size_t k = 0; k < state_poses.size(); ++k)
+    {
+        R_W_L[k] = state_poses[k].second * R_calib;
+        t_W_L[k] = state_poses[k].second * t_calib + state_poses[k].first;
+    }
+
     // Project each point cloud to the state times
     for(size_t i = 0; i < pts.size(); ++i)
     {
@@ -533,28 +611,12 @@ std::vector<std::shared_ptr<std::vector<Pointd> > > LidarOdometry::projectPoints
         }
         output[i]->resize(pts[i]->size());
 
-        // Collect the point times to perform a single query to the state
-        std::vector<double> temp_times;
-        temp_times.reserve(pts[i]->size());
         for(size_t j = 0; j < pts[i]->size(); ++j)
         {
-            temp_times.push_back(nanosToImuTime(pts[i]->at(j).t));
-        }
-        std::vector<std::pair<Vec3, Vec3>> poses = state.queryApprox(temp_times, state_blocks[0], state_blocks[1], state_blocks[2], state_blocks[3]);
-
-        // Apply the transformations to each point
-        for(size_t j = 0; j < pts[i]->size(); ++j)
-        {
-            Vec3& pos = poses[j].first;
-            Vec3& rot = poses[j].second;
-
-            Vec3 p_L = pts[i]->at(j).vec3();
-            Vec3 p_I = R_calib * p_L + t_calib;
-            Vec3 p_W;
-            ceres::AngleAxisRotatePoint<double>(rot.data(), p_I.data(), p_W.data());
-            p_W += pos;
-
-            output[i]->at(j) = Pointd(p_W, pts[i]->at(j).t, pts[i]->at(j).i, pts[i]->at(j).channel, pts[i]->at(j).type);
+            const Pointd& pt = pts[i]->at(j);
+            const int k = state.closestStateId(nanosToImuTime(pt.t));
+            const Vec3 p_W = R_W_L[k] * pt.vec3() + t_W_L[k];
+            output[i]->at(j) = Pointd(p_W, pt.t, pt.i, pt.channel, pt.type);
         }
     }
     return output;
@@ -579,29 +641,33 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
     // Precompute the maximum distance parameter
     double max_dist2 = params_.max_feature_dist*params_.max_feature_dist;
 
-    // Create the kd tree for each feature type
-    std::vector<std::shared_ptr<KDTree3Simple>> feature_kd_trees;
+    // Create the kd tree for each feature type. Sized once: a tree must not move after it is built
+    std::vector<FeatureTree> feature_trees(types.size());
     std::map<int, int> tree_types;
     int counter = 0;
     for(const auto type: types)
     {
         tree_types[type] = counter;
-        feature_kd_trees.push_back(std::make_shared<KDTree3Simple>());
         counter++;
     }
 
     // Do the kd tree creation in parallel threads
     std::vector<std::thread> threads;
     // Anonymous function to create a kd tree for a given type
-    auto createKdTree = [&](int type, std::shared_ptr<KDTree3Simple> tree, std::shared_ptr<std::vector<Pointd> > features)
+    auto createKdTree = [&](int type, FeatureTree& tree, std::shared_ptr<std::vector<Pointd> > features)
     {
         for(size_t j = 0; j < features->size(); ++j)
         {
             if(features->at(j).type == type)
             {
                 Vec3f p = features->at(j).vec3f();
-                tree->addPoint({p[0], p[1], p[2]}, j);
+                tree.cloud.pts.push_back({p[0], p[1], p[2]});
+                tree.cloud.ids.push_back((int)j);
             }
+        }
+        if(!tree.cloud.pts.empty())
+        {
+            tree.index = std::make_unique<FeatureIndex>(3, tree.cloud, nanoflann::KDTreeSingleIndexAdaptorParams(kFeatureTreeLeafSize));
         }
     };
     // Launch the threads
@@ -609,7 +675,7 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
     {
         if(type != 3)
         {
-            threads.push_back(std::thread(createKdTree, type, feature_kd_trees[tree_types[type]], target_features));
+            threads.push_back(std::thread(createKdTree, type, std::ref(feature_trees[tree_types[type]]), target_features));
         }
     }
     // Join the threads
@@ -637,19 +703,22 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
         temp_type_to_ids[source_features->at(i).type][quadrant].push_back(i);
     }
 
-    // Sort the by number of points in each quadrant
+    // Sort the quadrants by number of points, smallest first: each one is capped at its share of the
+    // remaining budget, so the small ones take all they have and leave the rest to the larger ones.
+    // Largest first capped every quadrant at about an eighth of the budget before the small ones
+    // turned out not to use theirs, and that budget was lost
     for(auto& [type, ids]: temp_type_to_ids)
     {
-        std::sort(ids.begin(), ids.end(), [](const std::vector<int>& a, const std::vector<int>& b) { return a.size() > b.size(); });
+        std::sort(ids.begin(), ids.end(), [](const std::vector<int>& a, const std::vector<int>& b) { return a.size() < b.size(); });
     }
 
 
-    // For each type, cap the number of associations to 2*params_.max_associations_per_type
+    // For each type, cap the number of candidate sources to 2*params_.max_associations_per_type
     for(const auto& [type, quadrants]: temp_type_to_ids)
     {
         for(size_t i = 0; i < quadrants.size(); i++)
         {
-            int cap = std::ceil(2*params_.max_associations_per_type - source_downsampled_ids[type].size()) / (quadrants.size() - i);
+            int cap = (int)((2*params_.max_associations_per_type - source_downsampled_ids[type].size()) / (quadrants.size() - i));
             if(cap <= 0)
                 break;
             if(quadrants[i].size() > (size_t)(cap))
@@ -664,8 +733,13 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                 source_downsampled_ids[type].insert(source_downsampled_ids[type].end(), quadrants[i].begin(), quadrants[i].end());
             }
         }
+        // The search below stops at max_associations_per_type successes: in a random order, the
+        // first ones found are a uniform random subset of all the successes, as the shuffle and cap
+        // of the associations used to give, without searching for the candidates dropped after.
+        // Without the shuffle, the candidates are grouped by quadrant and the first ones would win
+        std::shuffle(source_downsampled_ids[type].begin(), source_downsampled_ids[type].end(), std::mt19937{std::random_device{}()});
     }
-    
+
 
     
     // Create a hashmap to store the previous associations
@@ -675,21 +749,40 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
         associations_per_type[type] = std::vector<DataAssociation>();
     }
     // Anonymous function to find the associations for a given type
-    auto findAssociations = [&](int type, const std::vector<int>& ids, int pc_id, int target_id, std::vector<DataAssociation>& associations, KDTree3Simple& tree, std::shared_ptr<std::vector<Pointd> > source, std::shared_ptr<std::vector<Pointd> > target)
+    auto findAssociations = [&](int type, const std::vector<int>& ids, int pc_id, int target_id, std::vector<DataAssociation>& associations, const FeatureTree& tree, std::shared_ptr<std::vector<Pointd> > source, std::shared_ptr<std::vector<Pointd> > target)
     {
+        // The k closest targets within max_feature_dist, closest first, as indexes in the target
+        // features. Buffers reused for every search: nn is only valid until the next one
+        std::array<uint32_t, std::max(kPlanarCandidates, kEdgeCandidates)> nn_idx;
+        std::array<double, std::max(kPlanarCandidates, kEdgeCandidates)> nn_dist2;
+        std::vector<int> nn;
+        nn.reserve(nn_idx.size());
+        auto search = [&](const Vec3& p, const size_t k)
+        {
+            const size_t nb_found = tree.index->rknnSearch(p.data(), k, nn_idx.data(), nn_dist2.data(), max_dist2);
+            nn.clear();
+            for(size_t m = 0; m < nb_found; ++m)
+            {
+                nn.push_back(tree.cloud.ids[nn_idx[m]]);
+            }
+        };
         for(size_t i = 0; i < ids.size(); ++i)
         {
+            if(associations.size() >= params_.max_associations_per_type)
+            {
+                break;
+            }
             Vec3 temp_feature = source->at(ids[i]).vec3();
 
             if(type == 1)
             {
-                auto nn = tree.searchCapacityLimitedBall({temp_feature(0), temp_feature(1), temp_feature(2)}, max_dist2, kPlanarCandidates);
+                search(temp_feature, kPlanarCandidates);
 
                 if(nn.size() < 3)
                     continue;
 
 
-                int target_feature_id = nn[0].payload;
+                int target_feature_id = nn[0];
 
                 const Pointd& point_1 = target->at(target_feature_id);
                 Vec3 candidate_1 = point_1.vec3();
@@ -697,7 +790,7 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                 // Get the second candidate at a distance greater than params_.min_feature_dist from
                 // the first
                 while(((size_t)(candidate_2_id) < nn.size())&&
-                    ((candidate_1 - target->at(nn[candidate_2_id].payload).vec3()).norm() < params_.min_feature_dist))
+                    ((candidate_1 - target->at(nn[candidate_2_id]).vec3()).norm() < params_.min_feature_dist))
                 {
                     candidate_2_id++;
                 }
@@ -705,7 +798,7 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                 if((size_t)(candidate_2_id) >= nn.size())
                     continue;
 
-                const Pointd& point_2 = target->at(nn[candidate_2_id].payload);
+                const Pointd& point_2 = target->at(nn[candidate_2_id]);
                 Vec3 candidate_2 = point_2.vec3();
 
                 // Get the third candidate: far enough from BOTH of the first two, spanning a second
@@ -716,7 +809,7 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                 int candidate_3_id = candidate_2_id + 1;
                 while((size_t)(candidate_3_id) < nn.size())
                 {
-                    const Pointd& point_3 = target->at(nn[candidate_3_id].payload);
+                    const Pointd& point_3 = target->at(nn[candidate_3_id]);
                     const Vec3 candidate_3 = point_3.vec3();
                     const bool far_enough = ((candidate_1 - candidate_3).norm() >= params_.min_feature_dist)
                             && ((candidate_2 - candidate_3).norm() >= params_.min_feature_dist);
@@ -738,9 +831,9 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                     data_association.pc_id = pc_id;
                     data_association.feature_id = ids[i];
                     data_association.type = type;
-                    data_association.target_ids.push_back(std::make_pair(target_id, nn[0].payload));
-                    data_association.target_ids.push_back(std::make_pair(target_id, nn[candidate_2_id].payload));
-                    data_association.target_ids.push_back(std::make_pair(target_id, nn[candidate_3_id].payload));
+                    data_association.target_ids.push_back(std::make_pair(target_id, nn[0]));
+                    data_association.target_ids.push_back(std::make_pair(target_id, nn[candidate_2_id]));
+                    data_association.target_ids.push_back(std::make_pair(target_id, nn[candidate_3_id]));
 
                     associations.push_back(data_association);
                 }
@@ -748,13 +841,13 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
             }
             else if((type == 2))
             {
-                auto nn = tree.searchCapacityLimitedBall({temp_feature(0), temp_feature(1), temp_feature(2)}, max_dist2, kEdgeCandidates);
+                search(temp_feature, kEdgeCandidates);
 
                 if(nn.size() < 2)
                     continue;
 
 
-                int target_feature_id = nn[0].payload;
+                int target_feature_id = nn[0];
 
                 const Pointd& point_1 = target->at(target_feature_id);
                 Vec3 candidate_1 = point_1.vec3();
@@ -764,8 +857,8 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                 // the point-to-line residual measures nothing.
                 int candidate_2_id = 1;
                 while(((size_t)(candidate_2_id) < nn.size())&&
-                    (((candidate_1 - target->at(nn[candidate_2_id].payload).vec3()).norm() < params_.min_feature_dist)
-                     || !differentScanlines(point_1, target->at(nn[candidate_2_id].payload))))
+                    (((candidate_1 - target->at(nn[candidate_2_id]).vec3()).norm() < params_.min_feature_dist)
+                     || !differentScanlines(point_1, target->at(nn[candidate_2_id]))))
                 {
                     candidate_2_id++;
                 }
@@ -776,8 +869,8 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
                     data_association.pc_id = pc_id;
                     data_association.feature_id = ids[i];
                     data_association.type = type;
-                    data_association.target_ids.push_back(std::make_pair(target_id, nn[0].payload));
-                    data_association.target_ids.push_back(std::make_pair(target_id, nn[candidate_2_id].payload));
+                    data_association.target_ids.push_back(std::make_pair(target_id, nn[0]));
+                    data_association.target_ids.push_back(std::make_pair(target_id, nn[candidate_2_id]));
                     associations.push_back(data_association);
                 }
             }
@@ -788,9 +881,9 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
     std::vector<std::thread> assoc_threads;
     for(const auto& [type, ids]: source_downsampled_ids)
     {
-        if(feature_kd_trees[tree_types[type]]->size() == 0)
+        if(!feature_trees[tree_types[type]].index)
             continue;
-        assoc_threads.push_back(std::thread(findAssociations, type, ids, pc_id, target_id, std::ref(associations_per_type[type]), std::ref(*(feature_kd_trees[tree_types[type]])), source_features, target_features));
+        assoc_threads.push_back(std::thread(findAssociations, type, ids, pc_id, target_id, std::ref(associations_per_type[type]), std::cref(feature_trees[tree_types[type]]), source_features, target_features));
     }
     // Join the threads
     for(auto& thread: assoc_threads)
@@ -799,24 +892,11 @@ std::vector<DataAssociation> LidarOdometry::getDataAssociations(
     }
 
 
+    // Already capped at max_associations_per_type per type by the search
     for(const auto& pair: associations_per_type)
     {
         const auto& assocs = pair.second;
-
-        if(assocs.size() > params_.max_associations_per_type)
-        {
-            std::vector<size_t> indices(assocs.size());
-            std::iota(indices.begin(), indices.end(), 0);
-            std::shuffle(indices.begin(), indices.end(), std::mt19937{std::random_device{}()});
-            for(size_t i = 0; i < params_.max_associations_per_type; ++i)
-            {
-                data_associations.push_back(assocs[indices[i]]);
-            }
-        }
-        else
-        {
-            data_associations.insert(data_associations.end(), assocs.begin(), assocs.end());
-        }
+        data_associations.insert(data_associations.end(), assocs.begin(), assocs.end());
     }
 
     return data_associations;
@@ -1114,22 +1194,10 @@ void LidarOdometry::correctAndPublishPc(
     }
     else
     {
-        // Sort the point cloud by time. Sorting (t, index) pairs then gathering once moves 16 bytes
-        // per swap instead of a whole 48 byte Pointd. Equal times keep their original order
-        std::vector<std::pair<int64_t, uint32_t> > order;
-        order.reserve(pc_corrected.size());
-        for(size_t j = 0; j < pc_corrected.size(); ++j)
-        {
-            order.emplace_back(pc_corrected[j].t, (uint32_t)j);
-        }
-        std::sort(order.begin(), order.end());
-        std::vector<Pointd> pc_sorted;
-        pc_sorted.reserve(order.size());
-        for(const auto& key : order)
-        {
-            pc_sorted.push_back(pc_corrected[key.second]);
-        }
-        pc_corrected.swap(pc_sorted);
+        // Sort the point cloud by time
+        std::sort(pc_corrected.begin(), pc_corrected.end(), [](const Pointd& a, const Pointd& b) {
+            return a.t < b.t;
+        });
         if(node_ != nullptr) node_->publishPc(pc_chunks_t.at(1), pc_corrected);
     }
 

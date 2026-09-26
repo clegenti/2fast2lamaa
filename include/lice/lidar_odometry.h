@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include "preint/preint.h"
@@ -16,7 +17,6 @@
 #include <ceres/rotation.h>
 
 
-const double kPullPeriod = 0.001;
 const double kAssociationFilterAngQuantum = 1.0;
 //const double kAssociationFilterLinQuantum = 0.75;
 
@@ -157,6 +157,16 @@ class LidarOdometry
         std::mutex imu_mutex_;
         std::mutex pc_mutex_;
 
+        // Wakes run() when new data may let it optimise, instead of it polling every millisecond
+        // (about a thousand wake-ups a second while idle). data_version_ counts the changes, so one
+        // made between run() checking for data and it going to sleep is not missed. An IMU sample
+        // only wakes run() when a point cloud chunk waits for IMU data (wake_on_imu_), otherwise
+        // it would wake at the IMU rate. All three are guarded by data_cv_mutex_.
+        std::mutex data_cv_mutex_;
+        std::condition_variable data_cv_;
+        uint64_t data_version_ = 0;
+        bool wake_on_imu_ = false;
+
         // Estimate the average scan time
         int64_t last_pc_time_ = -1;
         int64_t scan_time_sum_ = 0;
@@ -218,6 +228,9 @@ class LidarOdometry
 
         // Split the point cloud into chunks and downsample to get the features
         void splitAndFeatureExtraction(std::shared_ptr<std::vector<Pointd> > pc, const int64_t t);
+
+        // Signal run() that the incoming data changed (see data_cv_)
+        void notifyNewData(const bool imu_sample);
 
 
         // Get the data for optimisation: features and IMU data

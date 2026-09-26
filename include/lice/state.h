@@ -25,6 +25,15 @@ class State
 
         double eps_ = 1e-6;
 
+        // Position and rotation at state time i
+        std::pair<Vec3, Mat3> statePose(
+                const int i
+                , const Vec3& acc_bias
+                , const Vec3& gyr_bias
+                , const Vec3& gravity
+                , const Vec3& vel
+                ) const;
+
     public:
 
         State(const ugpm::ImuData& imu_data, const double first_t, const double state_freq, const LidarOdometryMode mode);
@@ -38,6 +47,17 @@ class State
                 , const Vec3& gravity
                 , const Vec3& vel
                 ) const;
+
+        // Poses (position, rotation) at all the state times, and the index of the state time closest
+        // to a query time: the pose without interpolation, for when a few milliseconds do not
+        // matter (the data association, see LidarOdometry::projectPoints)
+        std::vector<std::pair<Vec3, Mat3> > statePoses(
+                const Vec3& acc_bias
+                , const Vec3& gyr_bias
+                , const Vec3& gravity
+                , const Vec3& vel
+                ) const;
+        int closestStateId(const double query_time) const;
 
 
         // Overload to query a single time

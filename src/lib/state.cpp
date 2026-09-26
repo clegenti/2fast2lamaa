@@ -3,6 +3,7 @@
 #include "lice/utils.h"
 #include "lice/math_utils.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -63,28 +64,7 @@ std::vector<std::pair<Vec3, Vec3> > State::queryApprox(
     std::vector<std::pair<Vec3, Vec3> > state_pose(nb_state_);
     for(int i = 0; i < nb_state_; ++i)
     {
-        Mat3 R;
-        Vec3 p;
-        if(mode_ == LidarOdometryMode::NO_IMU)
-        {
-            double dt = state_time_.at(i) - start_t_;
-            R = expMap(gyr_bias * dt);
-            p = vel * dt;
-        }
-        else
-        {
-            const ugpm::PreintMeas& preint = preint_meas_.at(i);
-
-            R = preint.delta_R * ugpm::expMap(preint.d_delta_R_d_bw * gyr_bias);
-            if(mode_ == LidarOdometryMode::GYR)
-            {
-                p = vel * (state_time_.at(i) - start_t_);
-            }
-            else
-            {
-                p = preint.delta_p + preint.d_delta_p_d_bf * acc_bias + preint.d_delta_p_d_bw * gyr_bias + vel*preint.dt + gravity*preint.dt_sq_half;
-            }
-        }
+        const auto [p, R] = statePose(i, acc_bias, gyr_bias, gravity, vel);
         state_pose.at(i) = {p, ugpm::logMap(R)};
     }
 
@@ -115,6 +95,60 @@ std::vector<std::pair<Vec3, Vec3> > State::queryApprox(
     }
     return query_pose;
 
+}
+
+std::pair<Vec3, Mat3> State::statePose(
+        const int i
+        , const Vec3& acc_bias
+        , const Vec3& gyr_bias
+        , const Vec3& gravity
+        , const Vec3& vel
+        ) const
+{
+    Mat3 R;
+    Vec3 p;
+    if(mode_ == LidarOdometryMode::NO_IMU)
+    {
+        double dt = state_time_.at(i) - start_t_;
+        R = expMap(gyr_bias * dt);
+        p = vel * dt;
+    }
+    else
+    {
+        const ugpm::PreintMeas& preint = preint_meas_.at(i);
+
+        R = preint.delta_R * ugpm::expMap(preint.d_delta_R_d_bw * gyr_bias);
+        if(mode_ == LidarOdometryMode::GYR)
+        {
+            p = vel * (state_time_.at(i) - start_t_);
+        }
+        else
+        {
+            p = preint.delta_p + preint.d_delta_p_d_bf * acc_bias + preint.d_delta_p_d_bw * gyr_bias + vel*preint.dt + gravity*preint.dt_sq_half;
+        }
+    }
+    return {p, R};
+}
+
+std::vector<std::pair<Vec3, Mat3> > State::statePoses(
+        const Vec3& acc_bias
+        , const Vec3& gyr_bias
+        , const Vec3& gravity
+        , const Vec3& vel
+        ) const
+{
+    std::vector<std::pair<Vec3, Mat3> > poses(nb_state_);
+    for(int i = 0; i < nb_state_; ++i)
+    {
+        poses[i] = statePose(i, acc_bias, gyr_bias, gravity, vel);
+    }
+    return poses;
+}
+
+int State::closestStateId(const double query_time) const
+{
+    const int id = (int)std::lround((query_time - state_time_.at(0)) / state_period_);
+    return std::clamp(id, 0, nb_state_ - 1);
 }
 
 
