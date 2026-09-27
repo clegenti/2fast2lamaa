@@ -4,7 +4,9 @@
 #include "lice/types.h"
 #include "lice/math_utils.h"
 #include "lice/lidar_odometry.h"
+#include <algorithm>
 #include <memory>
+#include <thread>
 
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -63,7 +65,15 @@ class LidarOdometryNode : public rclcpp::Node, public LidarOdometryPublisher
             params.lidar_std = readFieldDouble(this, "lidar_std", 0.02);
             params.g = readFieldDouble(this, "g", 9.80);
             params.intensity_threshold = readFieldDouble(this, "minimum_intensity", -1.0);
-            params.num_threads = readFieldInt(this, "num_threads", 4);
+            // Threads of the ceres solver. The default of 4 is capped by what the host has, as in
+            // gp_map. `hardware_concurrency` is allowed to return 0 when it cannot tell, in which
+            // case the default stands. Fewer threads cost less CPU for a longer optimisation.
+            const unsigned int hw_threads = std::thread::hardware_concurrency();
+            const int default_num_threads = (hw_threads > 0)
+                ? std::min<int>(4, static_cast<int>(hw_threads))
+                : 4;
+            params.num_threads = std::max(1, readFieldInt(this, "num_threads", default_num_threads));
+            RCLCPP_INFO(this->get_logger(), "Optimisation running on %d thread(s) (%u reported by the host)", params.num_threads, hw_threads);
             std::string mode = readFieldString(this, "mode", "imu");
             if(kLidarOdometryModeMap.find(mode) != kLidarOdometryModeMap.end())
             {

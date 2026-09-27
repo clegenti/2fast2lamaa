@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 #include <omp.h>
 #include <eigen3/Eigen/Dense>
 
@@ -17,6 +18,28 @@ constexpr size_t kMaxPointsPerLoadChunk = 10000000;
 
 
 // Function to solve the linear system with Eigen's cholesky decomposition
+namespace
+{
+// Each point of the (main) octree carries in its fourth slot the cell it stands for (see addPts): the
+// pointer's bits copied into the double, and copied back out here, so that a search result gives
+// its cell directly instead of through a hash map lookup. The octree only ever copies that slot,
+// which copies its bits, and never computes with it (it held the point's insertion index, which the
+// map does not use).
+static_assert(sizeof(CellPtr) == sizeof(double), "a cell pointer is stored in a double of the octree");
+inline double cellToOctreeSlot(const CellPtr cell)
+{
+    double slot;
+    std::memcpy(&slot, &cell, sizeof(slot));
+    return slot;
+}
+inline CellPtr octreeSlotToCell(const double* octree_pt)
+{
+    CellPtr cell;
+    std::memcpy(&cell, octree_pt + 3, sizeof(cell));
+    return cell;
+}
+} // namespace
+
 inline VecX solveKinvY(const MatX& K, const VecX& Y)
 {
     Eigen::LLT<Eigen::MatrixXd> lltOfA(K);
@@ -131,19 +154,55 @@ void Cell::computeAlpha(bool clean_behind)
     lockCell();
     if(alpha_block_ == nullptr)
     {
+        // Rebuilt for every cell the registration touches after the map changed, so the working
+        // buffers are the thread's own and kept across fits: a fit only allocates what it stores
+        // (the block, its weights and the neighbour points). The neighbour points are written
+        // straight into the block, row-major, which is also what the kernel reads fastest.
+        thread_local NeighborScratch scratch;
+        // The cells are distinct, as the set this used to go through made them: the octree holds the
+        // centre of each occupied cell once (addPts inserts it when it creates the cell, carving
+        // removes it with the cell). They come in the octree's order, which depends on the map alone,
+        // where the set's depended on the cells' addresses.
+        map_->getNeighborCells(getPt(), scratch);
+        const int n = (int)scratch.cells.size();
+
         alpha_block_ = new AlphaBlock();
-        MatX pts = getNeighborPts(true);
-        // The noise term is diagonal, so it is added in place rather than through a dense matrix of
-        // zeros: `asDiagonal` used to be materialised into one and added to the whole kernel.
-        MatX K = kernelRQSelf(pts.block(0,0,pts.rows(),3));
-        K.diagonal() += getWeights(pts);
-        VecX Y = VecX::Ones(pts.rows());
-        alpha_block_->alpha = solveKinvY(K, Y);
+        alpha_block_->neighbor_pts.resize(n, 3);
+        scratch.counts.resize(n);
+        for(int i = 0; i < n; ++i)
+        {
+            alpha_block_->neighbor_pts.row(i) = scratch.cells[i]->getPt().transpose();
+            scratch.counts[i] = scratch.cells[i]->getCount();
+        }
+
+        scratch.kernel.resize((size_t)n*n);
+        Eigen::Map<MatX> K(scratch.kernel.data(), n, n);
+        kernelRQSelf(alpha_block_->neighbor_pts, K);
+        // The noise term, as getWeights gives it, added to the diagonal in place
+        const GPCellHyperparameters& hp = map_->cell_hyperparameters;
+        const Eigen::Map<const VecX> counts(scratch.counts.data(), n);
+        if(!hp.use_weights)
+        {
+            K.diagonal() += VecX::Ones(n) * hp.sz2;
+        }
+        else
+        {
+            const double max_count = counts.maxCoeff();
+            K.diagonal() += (((1.0 + hp.sz2) * (1.0+((12.0*(counts/max_count)).array()-6.0).exp()).inverse().matrix()).array() + hp.sz2).matrix();
+        }
+        // Factorised where it is, with Eigen's unblocked Cholesky. The LLT class switches to its
+        // blocked one from 32 x 32 up, which works through blocks of 8 with Eigen's matrix product
+        // and triangular solve kernels, and costs 1.2 to 1.5 times more at the sizes of a
+        // neighbourhood (16 to 96 cells). The solves are the two LLT::solveInPlace performs. As
+        // before, a failed factorisation (a non-positive pivot) is not checked.
+        Eigen::internal::llt_inplace<double, Eigen::Lower>::unblocked(K);
+        alpha_block_->alpha = VecX::Ones(n);
+        K.triangularView<Eigen::Lower>().solveInPlace(alpha_block_->alpha);
+        K.triangularView<Eigen::Lower>().transpose().solveInPlace(alpha_block_->alpha);
         if(!clean_behind)
         {
             map_->cellToClean(getIndex());
         }
-        alpha_block_->neighbor_pts = pts.block(0, 0, pts.rows(), 3);
     }
     unlockCell();
 }
@@ -186,6 +245,34 @@ MatX Cell::kernelRQSelf(const MatX& X) const
         }
     }
     return K;
+}
+
+void Cell::kernelRQSelf(const Eigen::Matrix<double, Eigen::Dynamic, 3>& X, Eigen::Ref<MatX> K) const
+{
+    // Lower triangle only, a column at a time: the column of K and the coordinates of the other
+    // points are then contiguous, and the inner loop (no reduction) runs on vector instructions
+    const double c = map_->cell_hyperparameters.inv_2_beta_l_2;
+    const int n = X.rows();
+    const double* x = X.col(0).data();
+    const double* y = X.col(1).data();
+    const double* z = X.col(2).data();
+    for(int i = 0; i < n; i++)
+    {
+        double* k = K.col(i).data();
+        // The diagonal is the kernel at zero distance, which the rational quadratic puts at 1
+        k[i] = 1.0;
+        const double xi = x[i];
+        const double yi = y[i];
+        const double zi = z[i];
+        for(int j = i + 1; j < n; j++)
+        {
+            const double dx = xi - x[j];
+            const double dy = yi - y[j];
+            const double dz = zi - z[j];
+            const double temp = 1.0 + (dx*dx + dy*dy + dz*dz)*c;
+            k[j] = 1.0/(temp*temp);
+        }
+    }
 }
 
 MatX Cell::kernelRQ(const MatX& X1, const MatX& X2) const
@@ -346,49 +433,41 @@ void Cell::testKernelAndRevert()
 
 // Evaluate the GP occupancy at `pt` directly from the weights. Going through kernelRQ would build
 // a 1xN kernel matrix and multiply it by alpha, allocating a temporary per intermediate result.
+// Written on whole columns of the neighbour points, so that Eigen evaluates it a few neighbours at
+// a time with vector instructions, its sum included (a loop sums one term after the other: the
+// compiler may not reorder it into vector lanes without -ffast-math).
 double Cell::occupancy(const Vec3& pt) const
 {
     const GPCellHyperparameters& hp = map_->cell_hyperparameters;
     const auto& nb = alpha_block_->neighbor_pts;
     const VecX& alpha = alpha_block_->alpha;
-
-    double occ = 0.0;
-    for(int j = 0; j < nb.rows(); ++j)
-    {
-        const double dx = nb(j,0) - pt[0];
-        const double dy = nb(j,1) - pt[1];
-        const double dz = nb(j,2) - pt[2];
-        const double temp = 1.0 + (dx*dx + dy*dy + dz*dz)*hp.inv_2_beta_l_2;
-        occ += alpha[j]/(temp*temp);
-    }
-    return occ;
+    const auto temp = 1.0 + ((nb.col(0).array() - pt[0]).square() + (nb.col(1).array() - pt[1]).square()
+            + (nb.col(2).array() - pt[2]).square())*hp.inv_2_beta_l_2;
+    return (alpha.array() / temp.square()).sum();
 }
 
 // Same as above, also accumulating the gradient of the occupancy. The kernel value and its three
-// derivatives share the squared distance, so they only cost one extra division per neighbor.
+// derivatives share the squared distance and a single division per neighbour, whose result is kept
+// in a buffer of the thread's (the gradient takes three more sums over it).
 std::pair<double, Vec3> Cell::occupancyAndGrad(const Vec3& pt) const
 {
     const GPCellHyperparameters& hp = map_->cell_hyperparameters;
     const auto& nb = alpha_block_->neighbor_pts;
     const VecX& alpha = alpha_block_->alpha;
+    const Eigen::Index n = nb.rows();
+    thread_local std::vector<double> buffer;
+    buffer.resize(n);
+    Eigen::Map<Eigen::ArrayXd> inv_temp(buffer.data(), n);
+    const auto dx = nb.col(0).array() - pt[0];
+    const auto dy = nb.col(1).array() - pt[1];
+    const auto dz = nb.col(2).array() - pt[2];
+    inv_temp = 1.0/(1.0 + (dx.square() + dy.square() + dz.square())*hp.inv_2_beta_l_2);
 
-    double occ = 0.0;
-    Vec3 occ_grad = Vec3::Zero();
-    for(int j = 0; j < nb.rows(); ++j)
-    {
-        const double dx = nb(j,0) - pt[0];
-        const double dy = nb(j,1) - pt[1];
-        const double dz = nb(j,2) - pt[2];
-        const double temp = 1.0 + (dx*dx + dy*dy + dz*dz)*hp.inv_2_beta_l_2;
-        const double k = 1.0/(temp*temp);
-        const double a = alpha[j];
-        occ += k*a;
-        // d/dpt of the rational quadratic kernel, the sign follows (neighbor - query)
-        const double g = a*(k/temp)*hp.inv_lengthscale2;
-        occ_grad[0] += dx*g;
-        occ_grad[1] += dy*g;
-        occ_grad[2] += dz*g;
-    }
+    // k = 1/temp^2, and d/dpt of the rational quadratic kernel is a*(k/temp)*inv_lengthscale2 times
+    // (neighbor - query)
+    const double occ = (alpha.array()*inv_temp.square()).sum();
+    const auto g = alpha.array()*inv_temp.cube()*hp.inv_lengthscale2;
+    const Vec3 occ_grad((dx*g).sum(), (dy*g).sum(), (dz*g).sum());
     return {occ, occ_grad};
 }
 
@@ -712,10 +791,17 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     std::vector<double> weights(pts.size(), 1.0);
     if(opt_.use_temporal_weights)
     {
+        // The map is looked up where each point is in the map frame at the prior pose, as the cost
+        // function places it before any correction: p_world = R_prior*(s*p) + t_prior. The points
+        // are given in the scan frame, and used to be looked up there, which only coincides with
+        // the map frame around the starting pose.
+        const Mat3 R_prior = pose.block<3,3>(0,0);
+        const Vec3 t_prior = pose.block<3,1>(0,3);
+        const double prior_scale = use_scale ? scale_state : 1.0;
         #pragma omp parallel for num_threads(num_threads_)
         for(size_t i = 0; i < pts.size(); i++)
         {
-            weights[i] = getMinTime(pts[i].vec3());
+            weights[i] = getMinTime(R_prior*(prior_scale*pts[i].vec3()) + t_prior);
         }
         double min_time = std::numeric_limits<double>::max();
         for(size_t i = 0; i < pts.size(); i++)
@@ -1035,19 +1121,18 @@ std::pair<ankerl::unordered_dense::set<GridIndex>, std::vector<bool> > MapDistFi
 
 std::vector<Vec3> MapDistField::getNeighborPoints(const Vec3& pt, const double radius)
 {
+    // The free space carving collects every cell within its radius (tens of thousands of them at
+    // 50 m) at every scan: the search writes into buffers kept across the calls rather than growing
+    // new ones, the output is sized once, and each cell comes from its octree point rather than a
+    // hash map lookup. Same cells, in the same order.
+    thread_local std::vector<double*> octree_pts;
+    thread_local std::vector<double> octree_dists;
+    ioctree_.radiusNeighborsPtr(PointSimple{pt[0], pt[1], pt[2]}, radius, octree_pts, octree_dists);
     std::vector<Vec3> neighbors;
-    std::vector<PointSimple> neighbors_octree_;
-    std::vector<double> neighbor_dists;
-    ioctree_.radiusNeighbors(PointSimple{pt[0], pt[1], pt[2]}, radius, neighbors_octree_, neighbor_dists);
-    for(auto& neighbor : neighbors_octree_)
+    neighbors.reserve(octree_pts.size());
+    for(const double* p : octree_pts)
     {
-        GridIndex index = getGridIndex(neighbor);
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
-        {
-            continue;
-        }
-        neighbors.push_back(it->second->getPt());
+        neighbors.push_back(octreeSlotToCell(p)->getPt());
     }
 
     return neighbors;
@@ -1106,6 +1191,12 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     pts_to_add_octree.reserve(pts_to_add.size()/8);
     std::vector<PointSimple> pts_to_add_octree_edge;
     pts_to_add_octree_edge.reserve(pts_to_add.size()/16);
+    // The cell of each point of the (main) octree, for its fourth slot (see cellToOctreeSlot). The
+    // edge octree is left out: it holds raw point positions for the cells that were not new, which
+    // can lie within rounding of their cell's box, where the carving's box deletion may miss them,
+    // so its searches keep checking their result in the hash map
+    std::vector<double> octree_cells;
+    octree_cells.reserve(pts_to_add.size()/8);
     for (size_t i = 0; i < pts_to_add.size(); i++)
     {
         if(pts_to_add[i].type == kSkyPoint) continue;
@@ -1147,6 +1238,7 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
             temp_pt = getCenterPt(index);
             //phtree_.emplace({temp_pt[0], temp_pt[1], temp_pt[2]}, cell_ptr);
             pts_to_add_octree.push_back(PointSimple{temp_pt[0], temp_pt[1], temp_pt[2]});
+            octree_cells.push_back(cellToOctreeSlot(cell_ptr));
 
         }
         else
@@ -1156,7 +1248,10 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
             {
                 continue;
             }
-            it->second->addPt(temp_pt, pts_to_add[i].i);
+            // Also what the edge block below registers: it was left unset here, so an edge point
+            // falling in an existing cell put an indeterminate pointer in the edge set
+            cell_ptr = it->second;
+            cell_ptr->addPt(temp_pt, pts_to_add[i].i);
         }
 
         if(opt_.edge_field && (pts_to_add[i].type == 2))
@@ -1176,11 +1271,11 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
     {
         if(ioctree_.size() == 0)
         {
-            ioctree_.initialize(pts_to_add_octree);
+            ioctree_.initialize(pts_to_add_octree, &octree_cells);
         }
         else
         {
-            ioctree_.update(pts_to_add_octree);
+            ioctree_.update(pts_to_add_octree, false, &octree_cells);
         }
     }
     // Insert the new edge points in the octree
@@ -1291,6 +1386,15 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
     
 double MapDistField::getMinTime(const Vec3& pt)
 {
+    // The cell the point falls in, when occupied, is the one whose centre the nearest neighbour
+    // search below would find (see cellContaining): the search, run for every point of every
+    // registration when the temporal weights are on, is only needed when that cell is empty
+    const CellPtr cell = cellContaining(pt, false);
+    if(cell != nullptr)
+    {
+        return cell->getFirstTime();
+    }
+
     PointSimple query_point = {pt[0], pt[1], pt[2]};
     std::vector<double> neighbor_dists;
     std::vector<PointSimple> neighbors;
@@ -1384,19 +1488,10 @@ double MapDistField::queryDistField(const Vec3& pt, const bool field, const int 
         }
     }
 
-    std::vector<double> neighbor_dists;
-    std::vector<PointSimple> neighbors;
-    octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
-    for(size_t i = 0; i < neighbors.size(); i++)
+    thread_local std::vector<CellPtr> cells;
+    nearestCells(pt, use_edge, cells);
+    for(const CellPtr cell : cells)
     {
-        GridIndex index = getGridIndex(neighbors[i]);
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
-        {
-            continue;
-        }
-        CellPtr cell = it->second;
-        
         if(field)
         {
             double temp_dist = cell->getDist(pt);
@@ -1482,8 +1577,6 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
     double dist = std::numeric_limits<double>::max();
     Vec3 grad = Vec3::Zero();
     CellPtr best_cell = nullptr;
-    std::vector<double> neighbor_dists;
-    std::vector<PointSimple> neighbors;
     const bool use_edge = opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0;
     thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
     if(octree.size() == 0)
@@ -1499,37 +1592,28 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
         best_cell = cellContaining(pt, use_edge);
     }
 
+    thread_local std::vector<CellPtr> cells;
+    cells.clear();
     if(best_cell == nullptr)
     {
-        octree.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
+        nearestCells(pt, use_edge, cells);
     }
     if(best_cell != nullptr)
     {
         // Answered by the lookup above, nothing to select
     }
-    else if(field && (neighbors.size() == 1))
+    else if(field && (cells.size() == 1))
     {
         // With a single candidate there is nothing to select: the getDist call below would only
         // serve to pick the cell that getDistAndGrad is called on anyway, and its result would be
         // overwritten. This is the case during the registration (registerPts sets num_neighbors_
         // to 1), where it saves one kernel evaluation per point per solver iteration.
-        auto it = hash_map_->find(getGridIndex(neighbors[0]));
-        if(it != hash_map_->end())
-        {
-            best_cell = it->second;
-        }
+        best_cell = cells[0];
     }
     else
     {
-        for(size_t i = 0; i < neighbors.size(); i++)
+        for(const CellPtr cell : cells)
         {
-            GridIndex index = getGridIndex(neighbors[i]);
-            auto it = hash_map_->find(index);
-            if(it == hash_map_->end())
-            {
-                continue;
-            }
-            CellPtr cell = it->second;
             double temp_dist;
             if(field)
             {
@@ -1637,6 +1721,40 @@ thuni::BoxDeleteType MapDistField::getCellBox(const GridIndex& index)
     return box;
 }
 
+
+void MapDistField::nearestCells(const Vec3& pt, const bool use_edge, std::vector<CellPtr>& cells)
+{
+    thread_local std::vector<double*> octree_pts;
+    thread_local std::vector<double> octree_dists;
+    thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
+    octree.knnNeighborsPtr(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, octree_pts, octree_dists);
+    cells.clear();
+    for(const double* p : octree_pts)
+    {
+        if(!use_edge)
+        {
+            cells.push_back(octreeSlotToCell(p));
+            continue;
+        }
+        // The edge octree does not carry its cells (see addPts)
+        auto it = hash_map_->find(getGridIndex(PointSimple{p[0], p[1], p[2]}));
+        if(it != hash_map_->end())
+        {
+            cells.push_back(it->second);
+        }
+    }
+}
+
+void MapDistField::getNeighborCells(const Vec3& pt, NeighborScratch& scratch)
+{
+    const double radius = (opt_.neighborhood_size+0.5)*cell_size_;
+    ioctree_.radiusNeighborsPtr(PointSimple{pt[0], pt[1], pt[2]}, radius, scratch.octree_pts, scratch.octree_dists);
+    scratch.cells.clear();
+    for(const double* p : scratch.octree_pts)
+    {
+        scratch.cells.push_back(octreeSlotToCell(p));
+    }
+}
 
 std::vector<CellPtr> MapDistField::getNeighborCells(const Vec3& pt)
 {

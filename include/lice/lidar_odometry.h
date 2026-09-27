@@ -280,6 +280,9 @@ class LidarOdometry
                 , const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts
                 , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_pts
                 , const State& state
+                // When given, the residuals are evaluated from its state data (LidarResidualCostFunction),
+                // otherwise each queries the state itself (LidarNoCalCostFunction, without the state cache)
+                , LidarResiduals* lidar_residuals
                 );
         
 

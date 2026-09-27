@@ -535,10 +535,15 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
 
     ceres::Problem::Options pb_options;
     pb_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+    // With the state cache, the lidar residuals are evaluated from the state data the callback
+    // gathers once per evaluation (see LidarResiduals). Declared before the problem, whose cost
+    // functions refer to it, so that it outlives them.
+    std::unique_ptr<LidarResiduals> lidar_residuals;
     std::unique_ptr<StateCacheCallback> state_cache_callback;
     if(params_.mode != LidarOdometryMode::NO_IMU)
     {
-        state_cache_callback = std::make_unique<StateCacheCallback>(state, state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3]);
+        lidar_residuals = std::make_unique<LidarResiduals>(state);
+        state_cache_callback = std::make_unique<StateCacheCallback>(state, state_blocks_[0], state_blocks_[1], state_blocks_[2], state_blocks_[3], lidar_residuals.get());
         state_cache_callback->PrepareForEvaluation(true, true);
         pb_options.evaluation_callback = state_cache_callback.get();
     }
@@ -547,7 +552,7 @@ std::vector<DataAssociation> LidarOdometry::createProblemAssociateAndOptimise(
 
     ceres::Problem problem(pb_options);
     addBlocks(problem, vel_only);
-    addLidarResiduals(problem, data_associations, pts, sparse_pts, state);
+    addLidarResiduals(problem, data_associations, pts, sparse_pts, state, lidar_residuals.get());
 
     if(params_.mode == LidarOdometryMode::IMU)
     {
@@ -951,12 +956,22 @@ void LidarOdometry::addLidarResiduals(ceres::Problem& problem
         , const std::vector<std::shared_ptr<std::vector<Pointd> > >& pts
         , const std::vector<std::shared_ptr<std::vector<Pointd> > >& sparse_pts
         , const State& state
+        , LidarResiduals* lidar_residuals
         )
 {
     // Add the residuals
     for(size_t i = 0; i < data_associations.size(); ++i)
     {
-        LidarNoCalCostFunction* cost_function = new LidarNoCalCostFunction(state, data_associations[i], pts, sparse_pts, lidar_weight_, imu_time_offset_, state_calib_);
+        ceres::CostFunction* cost_function;
+        if(lidar_residuals != nullptr)
+        {
+            const size_t id = lidar_residuals->addResidual(data_associations[i], pts, sparse_pts, lidar_weight_, imu_time_offset_, state_calib_);
+            cost_function = new LidarResidualCostFunction(*lidar_residuals, id);
+        }
+        else
+        {
+            cost_function = new LidarNoCalCostFunction(state, data_associations[i], pts, sparse_pts, lidar_weight_, imu_time_offset_, state_calib_);
+        }
 
         problem.AddResidualBlock(cost_function, loss_function_, state_blocks_[0].data(), state_blocks_[1].data(), state_blocks_[2].data(), state_blocks_[3].data());
     }

@@ -22,34 +22,52 @@ inline GridIndex getGridIndex(const PointTemplated<T>& pt, T cell_size)
 // Indexes of the points kept by the density filter. Split out of filterPointsDensity so that a
 // parallel per-point array (the covariances) can be permuted exactly like the points: the filter both
 // drops points and reorders them.
+//
+// The cells are numbered in the order of their first point, one lookup per point and no list of
+// points per cell (which cost one allocation per occupied cell): the kept points are then placed
+// cell after cell, in that order and in input order within a cell, which is the order the per-cell
+// lists gave.
 template<typename T>
 inline std::vector<size_t> filterPointsDensityIndexes(const std::vector<PointTemplated<T> >& input, T cell_size)
 {
-    ankerl::unordered_dense::map<GridIndex, std::vector<size_t> > occupied_cells;
-    occupied_cells.reserve(input.size());
+    ankerl::unordered_dense::map<GridIndex, uint32_t> slots;
+    slots.reserve(input.size());
+    std::vector<uint32_t> slot_of_point(input.size());
+    std::vector<GridIndex> slot_index;
+    std::vector<size_t> slot_offset;   // points per cell, then where the cell starts in the output
     for(size_t i = 0; i < input.size(); ++i)
     {
-        occupied_cells[getGridIndex(input[i], cell_size)].push_back(i);
-    }
-    std::vector<size_t> output;
-    output.reserve(input.size());
-
-    // If the 8 neighboring cells are all occupied, ignore the point in the cell
-    for(const auto& [index, indexes] : occupied_cells)
-    {
-        int num_neighbors = 0;
-        for(int dx = -1; dx <= 1; ++dx)
+        const GridIndex index = getGridIndex(input[i], cell_size);
+        const auto [it, inserted] = slots.try_emplace(index, (uint32_t)slot_index.size());
+        if(inserted)
         {
-            for(int dy = -1; dy <= 1; ++dy)
+            slot_index.push_back(index);
+            slot_offset.push_back(0);
+        }
+        slot_of_point[i] = it->second;
+        slot_offset[it->second]++;
+    }
+
+    // If more than 12 of the 26 neighbouring cells are occupied, ignore the points of the cell. The
+    // count stops as soon as it gets there: the decision is the same.
+    std::vector<char> keep(slot_index.size(), 0);
+    size_t nb_kept = 0;
+    for(size_t s = 0; s < slot_index.size(); ++s)
+    {
+        const GridIndex& index = slot_index[s];
+        int num_neighbors = 0;
+        for(int dx = -1; dx <= 1 && num_neighbors <= 12; ++dx)
+        {
+            for(int dy = -1; dy <= 1 && num_neighbors <= 12; ++dy)
             {
-                for(int dz = -1; dz <= 1; ++dz)
+                for(int dz = -1; dz <= 1 && num_neighbors <= 12; ++dz)
                 {
                     if(dx == 0 && dy == 0 && dz == 0)
                     {
                         continue;
                     }
                     GridIndex neighbor_index(std::get<0>(index) + dx, std::get<1>(index) + dy, std::get<2>(index) + dz);
-                    if(occupied_cells.find(neighbor_index) != occupied_cells.end())
+                    if(slots.find(neighbor_index) != slots.end())
                     {
                         num_neighbors++;
                     }
@@ -58,7 +76,20 @@ inline std::vector<size_t> filterPointsDensityIndexes(const std::vector<PointTem
         }
         if(num_neighbors <= 12)
         {
-            output.insert(output.end(), indexes.begin(), indexes.end());
+            keep[s] = 1;
+            const size_t nb_in_cell = slot_offset[s];
+            slot_offset[s] = nb_kept;
+            nb_kept += nb_in_cell;
+        }
+    }
+
+    std::vector<size_t> output(nb_kept);
+    for(size_t i = 0; i < input.size(); ++i)
+    {
+        const uint32_t s = slot_of_point[i];
+        if(keep[s])
+        {
+            output[slot_offset[s]++] = i;
         }
     }
     return output;

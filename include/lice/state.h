@@ -59,6 +59,26 @@ class State
                 ) const;
         int closestStateId(const double query_time) const;
 
+        // What queryWthJacobian(..., use_cache = true) interpolates, at state time k: the position
+        // and its jacobians w.r.t. the 4 state blocks, the rotation vector and its jacobian w.r.t.
+        // the gyroscope bias. Needs the cache (computeCache); `vel` is only read in GYR mode, where
+        // the position is the constant velocity one rather than the cached preintegrated one.
+        // The position jacobians w.r.t. gravity and velocity are a scalar times the identity in both
+        // modes (dt^2/2 and dt, or 0 and dt): only the scalar is kept.
+        struct CachedStateKnot
+        {
+            Vec3 pos;
+            Mat3 pos_jac_acc_bias;
+            Mat3 pos_jac_gyr_bias;
+            double pos_jac_gravity;
+            double pos_jac_vel;
+            Vec3 rot;
+            Mat3 rot_jac_gyr_bias;
+        };
+        void cachedStateKnots(const Vec3& vel, std::vector<CachedStateKnot>& knots) const;
+        // The interval [state_id, state_id + 1] and the weight queryWthJacobian interpolates at t with
+        void interpolationInterval(const double t, int& state_id, double& alpha) const;
+
 
         // Overload to query a single time
         std::pair<Vec3, Vec3> query(

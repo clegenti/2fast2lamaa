@@ -531,8 +531,11 @@ namespace thuni
 			m_downSize = down_size;
 		}
 
+		// `payloads`, when given (one per point of pts_), is stored in each point's fourth slot instead
+		// of its index: a value of the caller's that the pointer-returning searches then hand back with
+		// the point (added for 2fast2lamaa; the index-returning searches then return it instead)
 		template <typename ContainerT>
-		void initialize(ContainerT &pts_)
+		void initialize(ContainerT &pts_, const std::vector<double>* payloads = nullptr)
 		{
 			clear();
 			const size_t pts_num = pts_.size();
@@ -552,7 +555,7 @@ namespace thuni
 				cloud_ptr[0] = x;
 				cloud_ptr[1] = y;
 				cloud_ptr[2] = z;
-				cloud_ptr[3] = double(cloud_index); // 保存在**原始**数据中的索引
+				cloud_ptr[3] = payloads ? (*payloads)[i] : double(cloud_index); // 保存在**原始**数据中的索引
 				points[cloud_index] = cloud_ptr;
 				if(cloud_index==0)
 				{
@@ -597,12 +600,13 @@ namespace thuni
 			}
 		}
 
+		// `payloads`: as in initialize
 		template <typename ContainerT>
-		void update(ContainerT &pts_, bool down_size = false)
+		void update(ContainerT &pts_, bool down_size = false, const std::vector<double>* payloads = nullptr)
 		{
 			if (m_root_ == 0)
 			{
-				initialize(pts_);
+				initialize(pts_, payloads);
 				return;
 			}
 			// std::cout<<"update start\n";
@@ -626,7 +630,7 @@ namespace thuni
 				cloud_ptr[0] = x;
 				cloud_ptr[1] = y;
 				cloud_ptr[2] = z;
-				cloud_ptr[3] = N_old + cloud_index;
+				cloud_ptr[3] = payloads ? (*payloads)[i] : N_old + cloud_index;
 				points_tmp[cloud_index] = cloud_ptr;
 				if(cloud_index==0)
 				{
@@ -773,6 +777,22 @@ namespace thuni
 			}
 		}
 
+		// As radiusNeighbors, returning the pointers to the stored points ([x, y, z, index]) rather than
+		// copies, into vectors the caller keeps: a caller running many searches then reuses their
+		// storage instead of each search allocating (and growing) its own. The pointers are valid
+		// until the tree changes. (Added for 2fast2lamaa.)
+		template <typename PointT>
+		void radiusNeighborsPtr(const PointT &  query, double radius, std::vector<double*> &points_ptr, std::vector<double> &distances)
+		{
+			points_ptr.clear();
+			distances.clear();
+			if (m_root_ == 0)
+				return;
+			double sqrRadius = radius*radius; // "squared" radius
+			double query_[3] = {query.x, query.y, query.z};
+			radiusNeighbors(m_root_, query_, radius, sqrRadius, points_ptr, distances);
+		}
+
 		template <typename PointT>
 		int32_t knnNeighbors(const PointT &  query, int k, std::vector<PointT> &resultIndices, std::vector<double> &distances)
 		{
@@ -802,6 +822,29 @@ namespace thuni
 			}
 			// run_details.end();
 			// run_details.show();
+			return data.size();
+		}
+
+		// As knnNeighbors, returning the pointers to the stored points ([x, y, z, fourth slot]), valid
+		// until the tree changes. (Added for 2fast2lamaa.)
+		template <typename PointT>
+		int32_t knnNeighborsPtr(const PointT &  query, int k, std::vector<double*> &points, std::vector<double> &distances)
+		{
+			points.clear();
+			distances.clear();
+			if (m_root_ == 0)
+				return 0;
+			double query_[3] = {query.x, query.y, query.z};
+			KNNSimpleResultSet heap(k);
+			knnNeighbors(m_root_, query_, heap);
+			std::vector<DistanceIndex>  data = heap.get_data();
+			points.resize(heap.size());
+			distances.resize(heap.size());
+			for (int i=0;i<heap.size();i++)
+			{
+				points[i] = data[i].index_;
+				distances[i] = data[i].dist_;
+			}
 			return data.size();
 		}
 

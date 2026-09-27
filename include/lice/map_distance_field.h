@@ -54,12 +54,24 @@ class MapDistField;
 class Cell;
 typedef Cell* CellPtr;
 
+// Buffers of one thread's cell fits (Cell::computeAlpha), kept from one fit to the next so that a
+// fit only allocates what it stores: the octree search results, the neighbour cells, their counts
+// and the kernel matrix
+struct NeighborScratch
+{
+    std::vector<double*> octree_pts;
+    std::vector<double> octree_dists;
+    std::vector<CellPtr> cells;
+    std::vector<double> counts;
+    std::vector<double> kernel;
+};
+
 struct AlphaBlock
 {
     VecX alpha;
-    // Row-major so that the 3 coordinates of a neighbor are contiguous: they are always read one
-    // neighbor at a time when querying the field
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> neighbor_pts;
+    // Column-major: each coordinate of all the neighbours contiguous, so that the kernel over the
+    // neighbours (fit and field queries) is computed a few neighbours at a time with vector instructions
+    Eigen::Matrix<double, Eigen::Dynamic, 3> neighbor_pts;
 };
 
 class Cell {
@@ -84,6 +96,9 @@ class Cell {
         // `kernelRQ(X, X)`, which is what fitting a cell needs. The matrix is symmetric, so only
         // half of the pairs are evaluated and each result is written to both sides.
         MatX kernelRQSelf(const MatX& X) const;
+        // The same into K (n x n), its lower triangle only (all the fit's Cholesky reads), a column
+        // at a time from the columns of X (each coordinate contiguous)
+        void kernelRQSelf(const Eigen::Matrix<double, Eigen::Dynamic, 3>& X, Eigen::Ref<MatX> K) const;
         std::tuple<MatX, MatX, MatX, MatX> kernelRQAndDiff(const MatX& X1, const MatX& X2);
 
         // Evaluate the GP occupancy (and its gradient) at a query point directly from the weights,
@@ -242,8 +257,13 @@ class MapDistField {
         bool has_sweep_position_ = false;
         Vec3 last_sweep_position_ = Vec3::Zero();
 
-        thuni::Octree ioctree_;
-        thuni::Octree ioctree_edge_;
+        // Points a leaf holds before it splits. The default of 32 left the neighbourhood searches of
+        // the cell fits 9 to 22% slower than 128, with a larger tree; 256 slows the nearest neighbour
+        // searches down (oct_bench, on Boreas and Newer College maps with gp_map's workload). The
+        // minimum extent, 0.01 m as by default, never binds: the points are cell centres.
+        static constexpr size_t kOctreeBucketSize = 128;
+        thuni::Octree ioctree_{kOctreeBucketSize, false, 0.01};
+        thuni::Octree ioctree_edge_{kOctreeBucketSize, false, 0.01};
 
         std::vector<Pointd> prev_scan_;
         Mat4 prev_pose_;
@@ -350,6 +370,11 @@ class MapDistField {
         CellPtr cellContaining(const Vec3& pt, const bool edge);
 
         std::vector<CellPtr> getNeighborCells(const Vec3& pt);
+        // The same into scratch.cells, with the scratch buffers reused for the search
+        void getNeighborCells(const Vec3& pt, NeighborScratch& scratch);
+        // The num_neighbors_ cells nearest to pt, from the edge octree if use_edge (thread-local
+        // buffers for the search)
+        void nearestCells(const Vec3& pt, const bool use_edge, std::vector<CellPtr>& cells);
         
         // Records that `index` now holds a weight block. Called from inside the OpenMP regions of
         // the registration, so it takes no lock: it appends to this thread's staging list.

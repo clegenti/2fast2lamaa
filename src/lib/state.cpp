@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -149,6 +150,56 @@ int State::closestStateId(const double query_time) const
 {
     const int id = (int)std::lround((query_time - state_time_.at(0)) / state_period_);
     return std::clamp(id, 0, nb_state_ - 1);
+}
+
+void State::cachedStateKnots(const Vec3& vel, std::vector<CachedStateKnot>& knots) const
+{
+    if((int)cached_state_poses_.size() != nb_state_)
+    {
+        throw std::logic_error("State::cachedStateKnots: the cache is not computed");
+    }
+    knots.resize(nb_state_);
+    for(int k = 0; k < nb_state_; ++k)
+    {
+        CachedStateKnot& knot = knots[k];
+        // As the two branches of queryWthJacobian (and computeCache for the IMU one)
+        if(mode_ == LidarOdometryMode::GYR)
+        {
+            const double dt = state_time_[k] - start_t_;
+            knot.pos = vel * dt;
+            knot.pos_jac_acc_bias = Mat3::Zero();
+            knot.pos_jac_gyr_bias = Mat3::Zero();
+            knot.pos_jac_gravity = 0.0;
+            knot.pos_jac_vel = dt;
+        }
+        else
+        {
+            knot.pos = cached_state_poses_[k].first;
+            knot.pos_jac_acc_bias = cached_state_jacobians_[k][0];
+            knot.pos_jac_gyr_bias = cached_state_jacobians_[k][1];
+            knot.pos_jac_gravity = preint_meas_[k].dt_sq_half;
+            knot.pos_jac_vel = preint_meas_[k].dt;
+        }
+        knot.rot = cached_state_poses_[k].second;
+        knot.rot_jac_gyr_bias = cached_state_dr_dw_[k];
+    }
+}
+
+void State::interpolationInterval(const double t, int& state_id, double& alpha) const
+{
+    // As queryWthJacobian
+    state_id = std::floor((t - state_time_[0]) / state_period_);
+    if(state_id < 0)
+    {
+        state_id = 0;
+    }
+    else if(state_id >= nb_state_-1)
+    {
+        state_id = nb_state_-2;
+    }
+    const double t0 = state_time_[state_id];
+    const double t1 = state_time_[state_id+1];
+    alpha = (t - t0) / (t1 - t0);
 }
 
 
