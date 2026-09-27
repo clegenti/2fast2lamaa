@@ -9,7 +9,7 @@
 #include <mutex>
 #include "ankerl/unordered_dense.h"
 
-#include "ioctree/octree2/Octree.h"
+#include "lice/voxel_index.h"
 
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
@@ -55,12 +55,11 @@ class Cell;
 typedef Cell* CellPtr;
 
 // Buffers of one thread's cell fits (Cell::computeAlpha), kept from one fit to the next so that a
-// fit only allocates what it stores: the octree search results, the neighbour cells, their counts
-// and the kernel matrix
+// fit only allocates what it stores: the neighbour cells and their squared distances (the search
+// results), their counts and the kernel matrix
 struct NeighborScratch
 {
-    std::vector<double*> octree_pts;
-    std::vector<double> octree_dists;
+    std::vector<double> dists;
     std::vector<CellPtr> cells;
     std::vector<double> counts;
     std::vector<double> kernel;
@@ -232,9 +231,7 @@ class MapDistField {
 
         ankerl::unordered_dense::set<GridIndex> free_space_cells_;
 
-        std::unique_ptr<HashMap<CellPtr> > hash_map_;
         GpMapPublisher* publisher_;
-        std::unique_ptr<ankerl::unordered_dense::set<CellPtr> > hash_map_edge_;
         const double cell_size_;
         const double inv_cell_size_;
         const float cell_size_f_;
@@ -257,18 +254,13 @@ class MapDistField {
         bool has_sweep_position_ = false;
         Vec3 last_sweep_position_ = Vec3::Zero();
 
-        // Points a leaf holds before it splits. The default of 32 left the neighbourhood searches of
-        // the cell fits 9 to 22% slower than 128, with a larger tree; 256 slows the nearest neighbour
-        // searches down (oct_bench, on Boreas and Newer College maps with gp_map's workload). The
-        // minimum extent, 0.01 m as by default, never binds: the points are cell centres.
-        static constexpr size_t kOctreeBucketSize = 128;
-        thuni::Octree ioctree_{kOctreeBucketSize, false, 0.01};
-        thuni::Octree ioctree_edge_{kOctreeBucketSize, false, 0.01};
+        // The cells, by grid index, and which of them are edge cells: what the lookups and every
+        // search (neighbourhoods, nearest cells, all or edge only) go through. Positions are implied
+        // by the grid, the searches work on the cell centres (getCenterPt)
+        vdb::VoxelIndex<Cell> cells_;
 
         std::vector<Pointd> prev_scan_;
         Mat4 prev_pose_;
-
-        size_t num_cells_ = 0;
 
         double path_length_ = 0.0;
 
@@ -351,29 +343,28 @@ class MapDistField {
         GridIndex getGridIndex(const Vec2& pt);
         GridIndex getGridIndex(const PointSimple& pt);
         Vec3 getCenterPt(const GridIndex& index);
-        thuni::BoxDeleteType getCellBox(const GridIndex& index);
 
 
         void writeMap(const std::string& filename);
 
         void loadMap(const std::string& filename);
 
-        bool isInHash(const GridIndex& index) const{ return hash_map_->find(index) != hash_map_->end(); }
+        bool isInHash(const GridIndex& index) const{ return cells_.find(std::get<0>(index), std::get<1>(index), std::get<2>(index)) != nullptr; }
 
         CellPtr getClosestCell(const Vec3& pt);
 
         // The cell `pt` falls in, when it is occupied, and null otherwise. The cell centres form a
         // cubic lattice, whose Voronoi region is the cell itself, so that cell's centre is the
         // nearest centre of the whole map to `pt`: one lookup answers what a nearest neighbour
-        // search in the octree would, exactly, whenever it does not come back empty. `edge` also
-        // requires the cell to be one of the edge cells, which is what the edge octree holds.
+        // search would, exactly, whenever it does not come back empty. `edge` also requires the
+        // cell to be one of the edge cells, which is what the edge searches consider.
         CellPtr cellContaining(const Vec3& pt, const bool edge);
 
         std::vector<CellPtr> getNeighborCells(const Vec3& pt);
         // The same into scratch.cells, with the scratch buffers reused for the search
         void getNeighborCells(const Vec3& pt, NeighborScratch& scratch);
-        // The num_neighbors_ cells nearest to pt, from the edge octree if use_edge (thread-local
-        // buffers for the search)
+        // The num_neighbors_ cells nearest to pt, among the edge cells only if use_edge
+        // (thread-local buffers for the search)
         void nearestCells(const Vec3& pt, const bool use_edge, std::vector<CellPtr>& cells);
         
         // Records that `index` now holds a weight block. Called from inside the OpenMP regions of

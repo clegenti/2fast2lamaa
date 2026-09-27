@@ -18,28 +18,6 @@ constexpr size_t kMaxPointsPerLoadChunk = 10000000;
 
 
 // Function to solve the linear system with Eigen's cholesky decomposition
-namespace
-{
-// Each point of the (main) octree carries in its fourth slot the cell it stands for (see addPts): the
-// pointer's bits copied into the double, and copied back out here, so that a search result gives
-// its cell directly instead of through a hash map lookup. The octree only ever copies that slot,
-// which copies its bits, and never computes with it (it held the point's insertion index, which the
-// map does not use).
-static_assert(sizeof(CellPtr) == sizeof(double), "a cell pointer is stored in a double of the octree");
-inline double cellToOctreeSlot(const CellPtr cell)
-{
-    double slot;
-    std::memcpy(&slot, &cell, sizeof(slot));
-    return slot;
-}
-inline CellPtr octreeSlotToCell(const double* octree_pt)
-{
-    CellPtr cell;
-    std::memcpy(&cell, octree_pt + 3, sizeof(cell));
-    return cell;
-}
-} // namespace
-
 inline VecX solveKinvY(const MatX& K, const VecX& Y)
 {
     Eigen::LLT<Eigen::MatrixXd> lltOfA(K);
@@ -159,10 +137,9 @@ void Cell::computeAlpha(bool clean_behind)
         // (the block, its weights and the neighbour points). The neighbour points are written
         // straight into the block, row-major, which is also what the kernel reads fastest.
         thread_local NeighborScratch scratch;
-        // The cells are distinct, as the set this used to go through made them: the octree holds the
-        // centre of each occupied cell once (addPts inserts it when it creates the cell, carving
-        // removes it with the cell). They come in the octree's order, which depends on the map alone,
-        // where the set's depended on the cells' addresses.
+        // The cells are distinct, as the set this used to go through made them: the index holds each
+        // occupied cell once. They come in the index's order, which depends on the map alone, where
+        // the set's depended on the cells' addresses.
         map_->getNeighborCells(getPt(), scratch);
         const int n = (int)scratch.cells.size();
 
@@ -552,12 +529,8 @@ MapDistField::MapDistField(const MapDistFieldOptions& options, GpMapPublisher* p
     , publisher_(publisher)
     , cell_hyperparameters(options.gp_lengthscale < 0 ? 2.0*options.cell_size : options.gp_lengthscale, options.gp_sigma_z, options.use_voxel_weights)
     , num_threads_(options.num_threads)
+    , cells_(options.cell_size)
 {
-    hash_map_ = std::make_unique<HashMap<CellPtr> >();
-    if(opt_.edge_field)
-    {
-        hash_map_edge_ = std::make_unique<ankerl::unordered_dense::set<CellPtr>>();
-    }
     // One staging list per thread of the OpenMP regions that build weight blocks, and a guaranteed
     // slot 0 for the calls made outside any of them (the calibration below is one of those). Sized
     // before it, since it builds a block.
@@ -568,27 +541,14 @@ MapDistField::MapDistField(const MapDistFieldOptions& options, GpMapPublisher* p
 
 MapDistField::~MapDistField()
 {
-    for(auto& pair : *hash_map_)
-    {
-        delete pair.second;
-    }
+    cells_.forEach([](const vdb::VoxelCoord&, CellPtr cell, bool) { delete cell; });
 }
 
 void MapDistField::clear()
 {
-    for(auto& pair : *hash_map_)
-    {
-        delete pair.second;
-    }
-    hash_map_->clear();
-    if(hash_map_edge_)
-    {
-        hash_map_edge_->clear();
-    }
+    cells_.forEach([](const vdb::VoxelCoord&, CellPtr cell, bool) { delete cell; });
+    cells_.clear();
     free_space_cells_.clear();
-    ioctree_.clear();
-    ioctree_edge_.clear();
-    num_cells_ = 0;
     path_length_ = 0.0;
     scan_counter_ = -1;
     prev_scan_.clear();
@@ -909,12 +869,12 @@ void MapDistField::cleanCells()
     mergeStagedCells();
     for(auto& index : cells_to_clean_)
     {
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
+        CellPtr cell = cells_.find(std::get<0>(index), std::get<1>(index), std::get<2>(index));
+        if(cell == nullptr)
         {
             continue;
         }
-        it->second->resetAlpha();
+        cell->resetAlpha();
     }
     cells_to_clean_.clear();
     clean_mutex_.unlock();
@@ -984,10 +944,10 @@ void MapDistField::evictFarAlphas(const Vec3& position)
     }
     for(const auto& index : to_evict)
     {
-        auto it = hash_map_->find(index);
-        if(it != hash_map_->end())
+        CellPtr cell = cells_.find(std::get<0>(index), std::get<1>(index), std::get<2>(index));
+        if(cell != nullptr)
         {
-            it->second->resetAlpha();
+            cell->resetAlpha();
         }
         cells_to_clean_.erase(index);
     }
@@ -1123,16 +1083,15 @@ std::vector<Vec3> MapDistField::getNeighborPoints(const Vec3& pt, const double r
 {
     // The free space carving collects every cell within its radius (tens of thousands of them at
     // 50 m) at every scan: the search writes into buffers kept across the calls rather than growing
-    // new ones, the output is sized once, and each cell comes from its octree point rather than a
-    // hash map lookup. Same cells, in the same order.
-    thread_local std::vector<double*> octree_pts;
-    thread_local std::vector<double> octree_dists;
-    ioctree_.radiusNeighborsPtr(PointSimple{pt[0], pt[1], pt[2]}, radius, octree_pts, octree_dists);
+    // new ones, and the output is sized once
+    thread_local std::vector<CellPtr> cells;
+    thread_local std::vector<double> dists;
+    cells_.radius(pt.data(), radius, false, cells, dists);
     std::vector<Vec3> neighbors;
-    neighbors.reserve(octree_pts.size());
-    for(const double* p : octree_pts)
+    neighbors.reserve(cells.size());
+    for(const CellPtr cell : cells)
     {
-        neighbors.push_back(octreeSlotToCell(p)->getPt());
+        neighbors.push_back(cell->getPt());
     }
 
     return neighbors;
@@ -1187,16 +1146,6 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
 
     // Project the points to the map frame
     double min_point_time = std::numeric_limits<double>::max();
-    std::vector<PointSimple> pts_to_add_octree;
-    pts_to_add_octree.reserve(pts_to_add.size()/8);
-    std::vector<PointSimple> pts_to_add_octree_edge;
-    pts_to_add_octree_edge.reserve(pts_to_add.size()/16);
-    // The cell of each point of the (main) octree, for its fourth slot (see cellToOctreeSlot). The
-    // edge octree is left out: it holds raw point positions for the cells that were not new, which
-    // can lie within rounding of their cell's box, where the carving's box deletion may miss them,
-    // so its searches keep checking their result in the hash map
-    std::vector<double> octree_cells;
-    octree_cells.reserve(pts_to_add.size()/8);
     for (size_t i = 0; i < pts_to_add.size(); i++)
     {
         if(pts_to_add[i].type == kSkyPoint) continue;
@@ -1225,69 +1174,27 @@ void MapDistField::addPts(const std::vector<Pointd>& pts, const Mat4& pose, cons
             continue;
         }
 
-        CellPtr cell_ptr;
-        if (hash_map_->count(index) == 0)
+        const int x = std::get<0>(index), y = std::get<1>(index), z = std::get<2>(index);
+        CellPtr cell_ptr = cells_.find(x, y, z);
+        if(cell_ptr == nullptr)
         {
             cell_ptr = new Cell(temp_pt, ((pts_to_add[i].t)-time_offset_)*1e-9, this, pts_to_add[i].i);
             if(count.size() > 0)
             {
                 cell_ptr->setCount(count[i]);
             }
-            hash_map_->insert({index, cell_ptr});
-            num_cells_++;
-            temp_pt = getCenterPt(index);
-            //phtree_.emplace({temp_pt[0], temp_pt[1], temp_pt[2]}, cell_ptr);
-            pts_to_add_octree.push_back(PointSimple{temp_pt[0], temp_pt[1], temp_pt[2]});
-            octree_cells.push_back(cellToOctreeSlot(cell_ptr));
-
+            cells_.insert(x, y, z, cell_ptr);
         }
         else
         {
-            auto it = hash_map_->find(index);
-            if(it == hash_map_->end())
-            {
-                continue;
-            }
-            // Also what the edge block below registers: it was left unset here, so an edge point
-            // falling in an existing cell put an indeterminate pointer in the edge set
-            cell_ptr = it->second;
             cell_ptr->addPt(temp_pt, pts_to_add[i].i);
         }
 
+        // An edge cell is searched by its centre, like every cell (the edge octree this replaces held
+        // the raw position of the edge point for the cells that already existed)
         if(opt_.edge_field && (pts_to_add[i].type == 2))
         {
-            if (hash_map_edge_->count(cell_ptr) == 0)
-            {
-                hash_map_edge_->insert(cell_ptr);
-
-                PointSimple edge_octree_point = {temp_pt[0], temp_pt[1], temp_pt[2]};
-                pts_to_add_octree_edge.push_back(edge_octree_point);
-            }
-        }
-    }
-
-    // Insert the new points in the octree
-    if(pts_to_add_octree.size() > 0)
-    {
-        if(ioctree_.size() == 0)
-        {
-            ioctree_.initialize(pts_to_add_octree, &octree_cells);
-        }
-        else
-        {
-            ioctree_.update(pts_to_add_octree, false, &octree_cells);
-        }
-    }
-    // Insert the new edge points in the octree
-    if(opt_.edge_field && pts_to_add_octree_edge.size() > 0)
-    {
-        if(ioctree_edge_.size() == 0)
-        {
-            ioctree_edge_.initialize(pts_to_add_octree_edge);
-        }
-        else
-        {
-            ioctree_edge_.update(pts_to_add_octree_edge);
+            cells_.setEdge(x, y, z);
         }
     }
 }
@@ -1348,35 +1255,27 @@ std::vector<Pointd> MapDistField::freeSpaceCarving(const std::vector<Pointd>& pt
 
 
     // Remove the points from the map
+    std::vector<CellPtr> nearest;
+    std::vector<double> nearest_dists;
+    std::vector<vdb::VoxelCoord> nearest_voxels;
     for(auto& map_index : map_pts_to_remove)
     {
-        // For each cell to remove, also remove the cell from the neighbors
-        Vec3 map_pt = getCenterPt(map_index);
-        std::vector<PointSimple> neighbors_octree;
-        std::vector<double> neighbor_dists;
-
-        // Get the closest neighbor
-        ioctree_.knnNeighbors(PointSimple{map_pt[0], map_pt[1], map_pt[2]}, 1, neighbors_octree, neighbor_dists);
-
-
-        bool one = false;
-        GridIndex grid_index = getGridIndex(neighbors_octree[0]);
-        auto it = hash_map_->find(grid_index);
-        if(it != hash_map_->end())
+        // The cell to remove is the one nearest to the centre of the voxel to free: that voxel's own
+        // cell when it has one, the nearest other cell otherwise
+        vdb::VoxelCoord victim{std::get<0>(map_index), std::get<1>(map_index), std::get<2>(map_index)};
+        if(cells_.find(victim.x, victim.y, victim.z) == nullptr)
         {
-            CellPtr neighbor_cell = it->second;
-            if(opt_.edge_field && hash_map_edge_->count(neighbor_cell) > 0)
+            const Vec3 map_pt = getCenterPt(map_index);
+            cells_.knn(map_pt.data(), 1, false, nearest, nearest_dists, &nearest_voxels);
+            if(nearest_voxels.empty())
             {
-                ioctree_edge_.boxWiseDelete(getCellBox(grid_index), true);
-                hash_map_edge_->erase(neighbor_cell);
+                break;
             }
-            ioctree_.boxWiseDelete(getCellBox(grid_index), true);
-            GridIndex neighbor_index = getGridIndex(neighbors_octree[0]);
-            free_space_cells_.insert(neighbor_index);
-            hash_map_->erase(neighbor_index);
-            num_cells_--;
-            delete neighbor_cell;
+            victim = nearest_voxels[0];
         }
+        CellPtr neighbor_cell = cells_.erase(victim.x, victim.y, victim.z);
+        free_space_cells_.insert(GridIndex(victim.x, victim.y, victim.z));
+        delete neighbor_cell;
     }
     return pts_to_add;
 }
@@ -1395,21 +1294,14 @@ double MapDistField::getMinTime(const Vec3& pt)
         return cell->getFirstTime();
     }
 
-    PointSimple query_point = {pt[0], pt[1], pt[2]};
-    std::vector<double> neighbor_dists;
-    std::vector<PointSimple> neighbors;
-    ioctree_.knnNeighbors(query_point, 1, neighbors, neighbor_dists);
-    if(neighbors.size() == 0)
+    thread_local std::vector<CellPtr> cells;
+    thread_local std::vector<double> dists;
+    cells_.knn(pt.data(), 1, false, cells, dists);
+    if(cells.empty())
     {
         return std::numeric_limits<double>::max();
     }
-    GridIndex index = getGridIndex(neighbors[0]);
-    auto it = hash_map_->find(index);
-    if(it == hash_map_->end())
-    {
-        return std::numeric_limits<double>::max();
-    }
-    return it->second->getFirstTime();
+    return cells[0]->getFirstTime();
 }
 
 
@@ -1417,19 +1309,14 @@ double MapDistField::getMinTime(const Vec3& pt)
 std::vector<Pointd> MapDistField::getPts()
 {
     std::vector<Pointd> pts;
-    if(!hash_map_)
-    {
-        return pts;
-    }
-    pts.reserve(num_cells_);
-    for (auto& pair : *hash_map_)
-    {
-        Vec3 pt = pair.second->getPt();
-        int count = pair.second->getCount();
-        float intensity = pair.second->getIntensity();
+    pts.reserve(cells_.size());
+    cells_.forEach([&](const vdb::VoxelCoord&, CellPtr cell, bool is_edge) {
+        Vec3 pt = cell->getPt();
+        int count = cell->getCount();
+        float intensity = cell->getIntensity();
         pts.push_back(Pointd(pt[0], pt[1], pt[2], count, intensity));
-        pts.back().type = (hash_map_edge_ && (hash_map_edge_->count(pair.second) > 0)) ? 2 : 1;
-    }
+        pts.back().type = is_edge ? 2 : 1;
+    });
     return pts;
 }
 
@@ -1437,22 +1324,15 @@ std::pair<std::vector<Pointd>, std::vector<Vec3> > MapDistField::getPtsAndNormal
 {
     std::vector<Pointd> pts;
     std::vector<Vec3> normals;
-    if(!hash_map_)
-    {
-        return {pts, normals};
-    }
 
     // Get cell in vector form for parallel processing
     std::vector<CellPtr> cells;
-    cells.reserve(num_cells_);
-    for(auto& pair : *hash_map_)
-    {
-        cells.push_back(pair.second);
-    }
+    cells.reserve(cells_.size());
+    cells_.forEach([&](const vdb::VoxelCoord&, CellPtr cell, bool) { cells.push_back(cell); });
 
 
-    pts.resize(num_cells_);
-    normals.resize(num_cells_);
+    pts.resize(cells.size());
+    normals.resize(cells.size());
     #pragma omp parallel for num_threads(num_threads_)
     for(size_t i = 0; i < cells.size(); i++)
     {
@@ -1470,9 +1350,8 @@ std::pair<std::vector<Pointd>, std::vector<Vec3> > MapDistField::getPtsAndNormal
 double MapDistField::queryDistField(const Vec3& pt, const bool field, const int type)
 {
     double dist = std::numeric_limits<double>::max();
-    const bool use_edge = opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0;
-    thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
-    if(octree.size() == 0)
+    const bool use_edge = opt_.edge_field && (type == 2) && cells_.numEdges() > 0;
+    if(cells_.size() == 0)
     {
         return dist;
     }
@@ -1516,18 +1395,11 @@ std::pair<double, double> MapDistField::queryDistFieldAndUncertaintyProxy(const 
     double dist = std::numeric_limits<double>::max();
     double uncertainty_proxy = std::numeric_limits<double>::max();
     CellPtr best_cell = nullptr;
-    std::vector<double> neighbor_dists;
-    std::vector<PointSimple> neighbors;
-    ioctree_.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
-    for(size_t i = 0; i < neighbors.size(); i++)
+    std::vector<CellPtr> cells;
+    std::vector<double> dists;
+    cells_.knn(pt.data(), num_neighbors_, false, cells, dists);
+    for(const CellPtr cell : cells)
     {
-        GridIndex index = getGridIndex(neighbors[i]);
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
-        {
-            continue;
-        }
-        CellPtr cell = it->second;
         double temp_dist = cell->getDist(pt);
         if(temp_dist < dist)
         {
@@ -1558,18 +1430,16 @@ std::vector<double> MapDistField::queryDistField(const std::vector<Vec3>& pts, c
 
 CellPtr MapDistField::cellContaining(const Vec3& pt, const bool edge)
 {
-    auto it = hash_map_->find(getGridIndex(pt));
-    if(it == hash_map_->end())
+    const GridIndex index = getGridIndex(pt);
+    bool is_edge = false;
+    CellPtr cell = cells_.findWithEdge(std::get<0>(index), std::get<1>(index), std::get<2>(index), is_edge);
+    if(edge && !is_edge)
     {
+        // The edge searches only consider the edge cells, so the containing cell is only their
+        // answer when it is one of them
         return nullptr;
     }
-    if(edge && (!hash_map_edge_ || (hash_map_edge_->count(it->second) == 0)))
-    {
-        // The edge octree only holds the edge cells, so the containing cell is only the answer to
-        // a search in it when it is one of them
-        return nullptr;
-    }
-    return it->second;
+    return cell;
 }
 
 std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, const bool field, const int type)
@@ -1577,15 +1447,14 @@ std::pair<double, Vec3> MapDistField::queryDistFieldAndGrad(const Vec3& pt, cons
     double dist = std::numeric_limits<double>::max();
     Vec3 grad = Vec3::Zero();
     CellPtr best_cell = nullptr;
-    const bool use_edge = opt_.edge_field && (type == 2) && hash_map_edge_ && hash_map_edge_->size() > 0;
-    thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
-    if(octree.size() == 0)
+    const bool use_edge = opt_.edge_field && (type == 2) && cells_.numEdges() > 0;
+    if(cells_.size() == 0)
     {
         return {dist, grad};
     }
 
     // Only one cell is wanted, and the query usually falls inside an occupied one: that cell is
-    // then the nearest of the whole map (see `cellContaining`), so the tree descent can be skipped
+    // then the nearest of the whole map (see `cellContaining`), so the search can be skipped
     // altogether. This is the case during the registration, which forces `num_neighbors_` to 1.
     if(num_neighbors_ == 1)
     {
@@ -1662,18 +1531,11 @@ CellPtr MapDistField::getClosestCell(const Vec3& pt)
 {
     CellPtr closest_cell = nullptr;
     double dist = std::numeric_limits<double>::max();
-    std::vector<double> neighbor_dists;
-    std::vector<PointSimple> neighbors;
-    ioctree_.knnNeighbors(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, neighbors, neighbor_dists);
-    for(auto& neighbor : neighbors)
+    std::vector<CellPtr> cells;
+    std::vector<double> dists;
+    cells_.knn(pt.data(), num_neighbors_, false, cells, dists);
+    for(const CellPtr cell : cells)
     {
-        GridIndex index = getGridIndex(neighbor);
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
-        {
-            continue;
-        }
-        CellPtr cell = it->second;
         double temp_dist = (pt - cell->getPt()).norm();
         if(temp_dist < dist)
         {
@@ -1704,75 +1566,31 @@ GridIndex MapDistField::getGridIndex(const PointSimple& pos)
     return std::make_tuple(std::floor(pos.x*inv_cell_size_), std::floor(pos.y*inv_cell_size_), std::floor(pos.z*inv_cell_size_));
 }
 
+// The centre the searches of the cell index use (same formula, same bits)
 Vec3 MapDistField::getCenterPt(const GridIndex& index)
 {
-    return Vec3(std::get<0>(index)*cell_size_f_ + half_cell_size_f_, std::get<1>(index)*cell_size_f_ + half_cell_size_f_, std::get<2>(index)*cell_size_f_ + half_cell_size_f_);
-}
-
-thuni::BoxDeleteType MapDistField::getCellBox(const GridIndex& index)
-{
-    thuni::BoxDeleteType box;
-    box.min[0] = std::get<0>(index)*cell_size_f_;
-    box.min[1] = std::get<1>(index)*cell_size_f_;
-    box.min[2] = std::get<2>(index)*cell_size_f_;
-    box.max[0] = box.min[0] + cell_size_f_;
-    box.max[1] = box.min[1] + cell_size_f_;
-    box.max[2] = box.min[2] + cell_size_f_;
-    return box;
+    return Vec3(vdb::cellCentre(std::get<0>(index), cell_size_f_, half_cell_size_f_), vdb::cellCentre(std::get<1>(index), cell_size_f_, half_cell_size_f_), vdb::cellCentre(std::get<2>(index), cell_size_f_, half_cell_size_f_));
 }
 
 
 void MapDistField::nearestCells(const Vec3& pt, const bool use_edge, std::vector<CellPtr>& cells)
 {
-    thread_local std::vector<double*> octree_pts;
-    thread_local std::vector<double> octree_dists;
-    thuni::Octree& octree = use_edge ? ioctree_edge_ : ioctree_;
-    octree.knnNeighborsPtr(PointSimple{pt[0], pt[1], pt[2]}, num_neighbors_, octree_pts, octree_dists);
-    cells.clear();
-    for(const double* p : octree_pts)
-    {
-        if(!use_edge)
-        {
-            cells.push_back(octreeSlotToCell(p));
-            continue;
-        }
-        // The edge octree does not carry its cells (see addPts)
-        auto it = hash_map_->find(getGridIndex(PointSimple{p[0], p[1], p[2]}));
-        if(it != hash_map_->end())
-        {
-            cells.push_back(it->second);
-        }
-    }
+    thread_local std::vector<double> dists;
+    cells_.knn(pt.data(), num_neighbors_, use_edge, cells, dists);
 }
 
 void MapDistField::getNeighborCells(const Vec3& pt, NeighborScratch& scratch)
 {
     const double radius = (opt_.neighborhood_size+0.5)*cell_size_;
-    ioctree_.radiusNeighborsPtr(PointSimple{pt[0], pt[1], pt[2]}, radius, scratch.octree_pts, scratch.octree_dists);
-    scratch.cells.clear();
-    for(const double* p : scratch.octree_pts)
-    {
-        scratch.cells.push_back(octreeSlotToCell(p));
-    }
+    cells_.radius(pt.data(), radius, false, scratch.cells, scratch.dists);
 }
 
 std::vector<CellPtr> MapDistField::getNeighborCells(const Vec3& pt)
 {
     std::vector<CellPtr> neighbors;
-    double radius = (opt_.neighborhood_size+0.5)*cell_size_;
-    std::vector<PointSimple> neighbors_octree_;
-    std::vector<double> neighbor_dists;
-    ioctree_.radiusNeighbors(PointSimple{pt[0], pt[1], pt[2]}, radius, neighbors_octree_, neighbor_dists);
-    for(auto& neighbor : neighbors_octree_)
-    {
-        GridIndex index = getGridIndex(neighbor);
-        auto it = hash_map_->find(index);
-        if(it == hash_map_->end())
-        {
-            continue;
-        }
-        neighbors.push_back(it->second);
-    }
+    std::vector<double> dists;
+    const double radius = (opt_.neighborhood_size+0.5)*cell_size_;
+    cells_.radius(pt.data(), radius, false, neighbors, dists);
     return neighbors;
 }
 
