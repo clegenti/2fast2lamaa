@@ -436,6 +436,14 @@ void SubmapManager::addEstimatorPose(const Mat4& pose, const int64_t time_ns)
     }
 }
 
+void SubmapManager::addEstimatorTrajectoryTime(const int64_t time_ns)
+{
+    if(imu_estimator_)
+    {
+        imu_estimator_->addTrajectoryTime(time_ns);
+    }
+}
+
 void SubmapManager::addGyrMeasurement(const Vec3& gyr, const int64_t time_ns)
 {
     if(imu_estimator_)

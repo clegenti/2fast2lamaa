@@ -403,7 +403,10 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                 eo.pose_loss_scale = readFieldDouble(this, "imu_estimator_pose_loss_scale", eo.pose_loss_scale);
                 eo.max_iterations = readFieldInt(this, "imu_estimator_max_iterations", eo.max_iterations);
                 eo.use_registration_covariance = readFieldBool(this, "imu_estimator_use_registration_covariance", true);
+                eo.output_smoothing = readFieldDouble(this, "imu_estimator_output_smoothing", eo.output_smoothing);
                 eo.log_path = readFieldString(this, "imu_estimator_log", "");
+                // Next to trajectory.csv, in the same format, for the evaluation scripts
+                eo.trajectory_path = map_path + "/trajectory_imu_estimator.csv";
                 map_->enableImuEstimator(eo);
 
                 // Its state at the IMU rate: /imu_rate_odom and the map -> imu_rate transform
@@ -889,8 +892,9 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
 
 
-            // Log the pose to the trajectory file
+            // Log the pose to the trajectory file (and the IMU estimator's, when it runs)
             logPoseToFile(traj_path_, init_guess_, time);
+            map_->addEstimatorTrajectoryTime(getTimeNs(time));
 
 
             double time_ms = sw.stop();

@@ -91,6 +91,8 @@ class SubmapManager
         void enableImuEstimator(const ImuWindowEstimatorOptions& options);
         // The final pose of a scan (after all its registrations), for the IMU estimator
         void addEstimatorPose(const Mat4& pose, const int64_t time_ns);
+        // The time of every scan, for the IMU estimator's trajectory file
+        void addEstimatorTrajectoryTime(const int64_t time_ns);
         // Null when not enabled
         const ImuWindowEstimator* imuEstimator() const { return imu_estimator_.get(); }
 
