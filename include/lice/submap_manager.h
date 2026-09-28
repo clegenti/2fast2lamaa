@@ -3,13 +3,16 @@
 #include "types.h"
 #include "math_utils.h"
 #include "map_distance_field.h"
+#include <atomic>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 #include <fstream>
 #include "utils.h"
 
 
 #include "preint/preint.h"
+#include "lice/imu_window_estimator.h"
 
 
 const double kMinNodeDist = 1.0;
@@ -17,6 +20,10 @@ const double kMinNodeDist = 1.0;
 // Default number of solver iterations of a registration, named so that a caller that only wants to
 // pass the arguments after it does not have to repeat the value
 const int kDefaultRegistrationIterations = 12;
+
+// IMU noise standard deviations until setImuNoise is called (the odometry's defaults)
+const double kDefaultImuAccStd = 0.02;     // m/s^2
+const double kDefaultImuGyrStd = 0.005;    // rad/s
 
 
 class SubmapManager
@@ -53,9 +60,15 @@ class SubmapManager
         }
 
 
+        // The IMU samples, which may be given from another thread than the rest of the calls (they
+        // only take the IMU buffer's own lock). A sample not newer than the last one of its stream
+        // is dropped.
         void addGyrMeasurement(const Vec3& gyr, const int64_t time_ns);
 
         void addAccMeasurement(const Vec3& acc, const int64_t time_ns);
+
+        // Noise standard deviations of the IMU samples, for the covariances of their preintegration
+        void setImuNoise(const double acc_std, const double gyr_std);
 
         void addVelocity(const Vec3& vel, const int64_t time_ns);
 
@@ -72,6 +85,14 @@ class SubmapManager
 
 
         void set2D(const bool is_2d);
+
+        // Sliding-window IMU estimator fed with the IMU samples and the registered poses (off until
+        // enabled; call before the IMU samples start coming)
+        void enableImuEstimator(const ImuWindowEstimatorOptions& options);
+        // The final pose of a scan (after all its registrations), for the IMU estimator
+        void addEstimatorPose(const Mat4& pose, const int64_t time_ns);
+        // Null when not enabled
+        const ImuWindowEstimator* imuEstimator() const { return imu_estimator_.get(); }
 
     private:
         GpMapPublisher* publisher_ = nullptr;
@@ -107,11 +128,20 @@ class SubmapManager
         double path_length_ = -1.0;
         double path_angle_change_ = 0.0;
 
+        std::unique_ptr<ImuWindowEstimator> imu_estimator_;
+        // The covariance of the last registration, for the IMU estimator (when it uses them)
+        bool registration_cov_ = false;
+        int64_t last_cov_time_ = -1;
+        Mat6 last_cov_ = Mat6::Zero();
+
+        // Guards `imu_data_`: the IMU samples are added from their own thread
+        std::mutex imu_mutex_;
         ugpm::ImuData imu_data_;
         Vec3 gravity_ = Vec3::Zero();
         Vec3 bias_acc_ = Vec3::Zero();
         Vec3 bias_gyr_ = Vec3::Zero();
-        uint64_t first_imu_time_ns_ = -1;
+        // Time of the first sample of the stream received second, -1 until both have one
+        std::atomic<int64_t> first_imu_time_ns_{-1};
 
         std::map<int64_t, Vec3> body_velocities_;
         std::vector<Mat4> imu_poses_;

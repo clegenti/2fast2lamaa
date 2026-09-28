@@ -79,6 +79,7 @@ SubmapManager::SubmapManager(GpMapPublisher* publisher, const MapDistFieldOption
     , reverse_path_(reverse_path)
     , node_search_dist_(node_search_dist)
 {
+    setImuNoise(kDefaultImuAccStd, kDefaultImuGyrStd);
     if(submap_length_ > 0.0 && submap_overlap_ >= 1.0)
     {
         throw std::runtime_error("Submap overlap must be less than 1.0");
@@ -254,7 +255,14 @@ Mat4 SubmapManager::registerPts(const std::vector<Pointd>& pts, const Mat4& prio
         throw std::runtime_error("No current map available for registration");
     }
 
-    Mat4 updated_pose = current_map_->registerPts(pts, prior, current_time, approximate, loss_scale, max_iterations, gravity_factor, pts_cov, disable_odom_prior);
+    Mat6 cov;
+    Mat4 updated_pose = current_map_->registerPts(pts, prior, current_time, approximate, loss_scale, max_iterations, gravity_factor, pts_cov, disable_odom_prior, registration_cov_ ? &cov : nullptr);
+    if(registration_cov_)
+    {
+        // A scan registered several times keeps the covariance of its last registration
+        last_cov_time_ = current_time;
+        last_cov_ = cov;
+    }
     last_registered_time_ = current_time;
     if(localization_ && using_submaps_ && graph_nodes_.size() > 0)
     {
@@ -407,14 +415,44 @@ void SubmapManager::addPts(const std::vector<Pointd>& pts, const Mat4& pose, con
 }
 
 
+void SubmapManager::setImuNoise(const double acc_std, const double gyr_std)
+{
+    std::lock_guard<std::mutex> lock(imu_mutex_);
+    imu_data_.acc_var = acc_std*acc_std;
+    imu_data_.gyr_var = gyr_std*gyr_std;
+}
+
+void SubmapManager::enableImuEstimator(const ImuWindowEstimatorOptions& options)
+{
+    imu_estimator_ = std::make_unique<ImuWindowEstimator>(options);
+    registration_cov_ = options.use_registration_covariance;
+}
+
+void SubmapManager::addEstimatorPose(const Mat4& pose, const int64_t time_ns)
+{
+    if(imu_estimator_)
+    {
+        imu_estimator_->addPose(pose, time_ns, (registration_cov_ && last_cov_time_ == time_ns) ? &last_cov_ : nullptr);
+    }
+}
+
 void SubmapManager::addGyrMeasurement(const Vec3& gyr, const int64_t time_ns)
 {
+    if(imu_estimator_)
+    {
+        imu_estimator_->addGyr(gyr, time_ns);
+    }
     ugpm::ImuSample imu_sample;
     imu_sample.data[0] = gyr[0];
     imu_sample.data[1] = gyr[1];
     imu_sample.data[2] = gyr[2];
     imu_sample.t = time_ns * 1e-9;
 
+    std::lock_guard<std::mutex> lock(imu_mutex_);
+    if(!imu_data_.gyr.empty() && (imu_sample.t <= imu_data_.gyr.back().t))
+    {
+        return;
+    }
     imu_data_.gyr.push_back(imu_sample);
 
     if((imu_data_.acc.size() > 0) && (imu_data_.gyr.size() == 1))
@@ -425,12 +463,21 @@ void SubmapManager::addGyrMeasurement(const Vec3& gyr, const int64_t time_ns)
 
 void SubmapManager::addAccMeasurement(const Vec3& acc, const int64_t time_ns)
 {
+    if(imu_estimator_)
+    {
+        imu_estimator_->addAcc(acc, time_ns);
+    }
     ugpm::ImuSample imu_sample;
     imu_sample.data[0] = acc[0];
     imu_sample.data[1] = acc[1];
     imu_sample.data[2] = acc[2];
     imu_sample.t = time_ns * 1e-9;
 
+    std::lock_guard<std::mutex> lock(imu_mutex_);
+    if(!imu_data_.acc.empty() && (imu_sample.t <= imu_data_.acc.back().t))
+    {
+        return;
+    }
     imu_data_.acc.push_back(imu_sample);
     if((imu_data_.acc.size() == 1) && (imu_data_.gyr.size() > 0))
     {
@@ -445,6 +492,7 @@ void SubmapManager::addVelocity(const Vec3& vel, const int64_t time_ns)
 
 void SubmapManager::attemptGravityBiasInit()
 {
+    std::unique_lock<std::mutex> imu_lock(imu_mutex_);
     if((imu_data_.acc.size() > 2)
         && (imu_data_.gyr.size() > 2)
         && (imu_times_.size() >= 2)
@@ -465,6 +513,7 @@ void SubmapManager::attemptGravityBiasInit()
             imu_data_ = imu_data_.get((time_A * 1e-9) - 0.1, std::numeric_limits<double>::max());
         }
     }
+    imu_lock.unlock();
 
 
     if(path_length_ > 5.0 && path_angle_change_ > 120.0*M_PI/180.0 && (imu_poses_.size() >= 30))
@@ -695,8 +744,13 @@ void SubmapManager::writeCurrentSubmap()
 
 GravityFactorFunctor* SubmapManager::computeGravityFactor(const int64_t current_time)
 {
+    std::lock_guard<std::mutex> imu_lock(imu_mutex_);
+    if(imu_data_.acc.size() < 2 || imu_data_.gyr.size() < 2)
+    {
+        return nullptr;
+    }
     int64_t last_imu_time_ns = std::min(imu_data_.acc.back().t, imu_data_.gyr.back().t) * 1e9;
-    if(imu_data_.acc.size() < 2 || imu_data_.gyr.size() < 2 || current_time > last_imu_time_ns)
+    if(current_time > last_imu_time_ns)
     {
         return nullptr;
     }

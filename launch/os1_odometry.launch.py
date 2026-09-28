@@ -81,6 +81,7 @@ def generate_launch_description():
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
                 {"submap_length": -200.0},
+                {"use_imu_estimator": True}
 
             ],
             output='screen',

@@ -664,7 +664,7 @@ void PointCovarianceCallback::PrepareForEvaluation(bool evaluate_jacobians, bool
     map_->computePointInvStd(pts_, pts_cov_, prior_*correction, use_field_, inv_std_, scan_scale);
 }
 
-Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov, const bool disable_odom_prior)
+Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose, const int64_t current_time, const bool approximate, const double loss_scale, const int max_iterations, GravityFactorFunctor* gravity_factor, const std::vector<Mat3>& pts_cov, const bool disable_odom_prior, Mat6* correction_cov)
 {
     if(current_time != last_time_register_)
     {
@@ -812,6 +812,25 @@ Mat4 MapDistField::registerPts(const std::vector<Pointd>& pts, const Mat4& pose,
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     //std::cout << summary.BriefReport() << std::endl;
+
+    if(correction_cov)
+    {
+        // Six parameters: the dense SVD of the Jacobian is cheap next to the one evaluation of the
+        // residuals it needs, and gives a pseudo-inverse when a direction is not constrained
+        ceres::Covariance::Options cov_options;
+        cov_options.algorithm_type = ceres::DENSE_SVD;
+        cov_options.null_space_rank = -1;
+        cov_options.num_threads = num_threads_;
+        ceres::Covariance covariance(cov_options);
+        const std::vector<std::pair<const double*, const double*>> blocks = {{pose_correction_state.data(), pose_correction_state.data()}};
+        correction_cov->setConstant(std::numeric_limits<double>::quiet_NaN());
+        if(covariance.Compute(blocks, &problem))
+        {
+            Eigen::Matrix<double, 6, 6, Eigen::RowMajor> cov_rm;
+            covariance.GetCovarianceBlock(pose_correction_state.data(), pose_correction_state.data(), cov_rm.data());
+            *correction_cov = cov_rm;
+        }
+    }
 
 
     Mat3 R = expMap(pose_correction_state.segment<3>(3));

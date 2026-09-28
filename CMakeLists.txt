@@ -53,6 +53,7 @@ add_library(lice STATIC
   src/lib/state.cpp
   src/lib/map_distance_field.cpp
   src/lib/submap_manager.cpp
+  src/lib/imu_window_estimator.cpp
 )
 
 target_link_libraries(lice
@@ -100,6 +101,7 @@ target_link_libraries(gp_map
   rclcpp::rclcpp
   ${sensor_msgs_TARGETS}
   ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
   ${std_msgs_TARGETS}
   message_filters::message_filters
   tf2::tf2

@@ -324,7 +324,10 @@ class MapDistField {
         // `disable_odom_prior` overrides the `use_odom_prior` option for this one call. It is meant for
         // a registration that is recovering from a bad prior pose, where anchoring the solution to that
         // pose is exactly the wrong thing to do.
-        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr, const std::vector<Mat3>& pts_cov = std::vector<Mat3>(), const bool disable_odom_prior = false);
+        // `correction_cov`, when given: the covariance of the solution's correction [translation,
+        // rotation] (applied on the right of the prior), from the problem's Jacobian at the solution;
+        // not finite when it cannot be computed
+        Mat4 registerPts(const std::vector<Pointd>& pts, const Mat4& prior, const int64_t current_time, const bool approximate=false, const double loss_scale=0.5, const int max_iterations=12, GravityFactorFunctor* gravity_factor = nullptr, const std::vector<Mat3>& pts_cov = std::vector<Mat3>(), const bool disable_odom_prior = false, Mat6* correction_cov = nullptr);
 
         void addPts(const std::vector<Pointd>& pts, const Mat4& pose, const std::vector<double>& count=std::vector<double>());
         std::vector<Pointd> getPts();

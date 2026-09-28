@@ -15,6 +15,7 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "tf2_ros/transform_broadcaster.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/version.h"
 #include <message_filters/subscriber.hpp>
 #include <message_filters/synchronizer.hpp>
@@ -344,8 +345,17 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             query_dist_field_srv_ = this->create_service<ffastllamaa::srv::QueryDistField>("/query_dist_field", std::bind(&GpMapNode::queryDistFieldCallback, this, std::placeholders::_1, std::placeholders::_2));
 
 
-            gyr_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/gyr", 10, std::bind(&GpMapNode::gyrCallback, this, std::placeholders::_1));
-            acc_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/acc", 10, std::bind(&GpMapNode::accCallback, this, std::placeholders::_1));
+            // The IMU callbacks run in their own group, spun by their own executor in its own thread,
+            // so that they are not held back while a scan is registered, which would drop samples once
+            // the registration outlasts the queue. They do not take map_mutex_: the IMU buffer has its
+            // own. (A second single-threaded executor rather than a multi-threaded one for the whole
+            // node: the latter cost gp_map about 10% more CPU on Newer College and Boreas.)
+            imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+            rclcpp::SubscriptionOptions imu_sub_options;
+            imu_sub_options.callback_group = imu_callback_group_;
+            gyr_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/gyr", kImuQueueSize, std::bind(&GpMapNode::gyrCallback, this, std::placeholders::_1), imu_sub_options);
+            acc_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("/gp_map/acc", kImuQueueSize, std::bind(&GpMapNode::accCallback, this, std::placeholders::_1), imu_sub_options);
+            imu_executor_.add_callback_group(imu_callback_group_, this->get_node_base_interface());
             twist_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>("/twist", 10, std::bind(&GpMapNode::twistCallback, this, std::placeholders::_1));
 
             submap_info_pub_ = this->create_publisher<ffastllamaa::msg::SubmapInfo>("/submap_info", 10);
@@ -366,6 +376,47 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
 
             options.use_temporal_weights = submap_length <= 0.0; // If not using submaps, use temporal weights by default
             map_ = std::make_shared<SubmapManager>(this, options, localization_, using_submaps, submap_length, submap_overlap, map_path, reverse_path, submap_node_search_dist);
+
+            // IMU input: the same conversions and noise as the odometry's (same parameter names). The
+            // defaults leave the data as it arrives, which is what this node always did
+            invert_imu_ = readFieldBool(this, "invert_imu", false);
+            acc_in_m_s2_ = readFieldBool(this, "acc_in_m_per_s2", true);
+            const double acc_std = readFieldDouble(this, "acc_std", kDefaultImuAccStd);
+            const double gyr_std = readFieldDouble(this, "gyr_std", kDefaultImuGyrStd);
+            map_->setImuNoise(acc_std, gyr_std);
+
+            // Sliding-window IMU estimator on the registered poses (see ImuWindowEstimator)
+            if(readFieldBool(this, "use_imu_estimator", false))
+            {
+                ImuWindowEstimatorOptions eo;
+                eo.acc_std = acc_std;
+                eo.gyr_std = gyr_std;
+                eo.window_duration = readFieldDouble(this, "imu_estimator_window", eo.window_duration);
+                eo.min_nodes = readFieldInt(this, "imu_estimator_min_nodes", eo.min_nodes);
+                eo.acc_bias_walk_std = readFieldDouble(this, "imu_estimator_acc_bias_walk_std", eo.acc_bias_walk_std);
+                eo.gyr_bias_walk_std = readFieldDouble(this, "imu_estimator_gyr_bias_walk_std", eo.gyr_bias_walk_std);
+                eo.acc_bias_prior_std = readFieldDouble(this, "imu_estimator_acc_bias_prior_std", eo.acc_bias_prior_std);
+                eo.gravity_norm = readFieldDouble(this, "imu_estimator_gravity_norm", eo.gravity_norm);
+                eo.gravity_walk_std = readFieldDouble(this, "imu_estimator_gravity_walk_std", eo.gravity_walk_std);
+                eo.pose_pos_std = readFieldDouble(this, "imu_estimator_pose_pos_std", eo.pose_pos_std);
+                eo.pose_rot_std = readFieldDouble(this, "imu_estimator_pose_rot_std", eo.pose_rot_std);
+                eo.pose_loss_scale = readFieldDouble(this, "imu_estimator_pose_loss_scale", eo.pose_loss_scale);
+                eo.max_iterations = readFieldInt(this, "imu_estimator_max_iterations", eo.max_iterations);
+                eo.use_registration_covariance = readFieldBool(this, "imu_estimator_use_registration_covariance", true);
+                eo.log_path = readFieldString(this, "imu_estimator_log", "");
+                map_->enableImuEstimator(eo);
+
+                // Its state at the IMU rate: /imu_rate_odom and the map -> imu_rate transform
+                imu_rate_frame_ = readFieldString(this, "imu_estimator_frame", "imu_rate");
+                imu_rate_tf_ = readFieldBool(this, "imu_estimator_publish_tf", true);
+                imu_rate_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/imu_rate_odom", 100);
+                if(imu_rate_tf_)
+                {
+                    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+                }
+            }
+            // Only now that the map exists, which the IMU callbacks use
+            imu_thread_ = std::thread([this]() { imu_executor_.spin(); });
 
         }
 
@@ -403,6 +454,11 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         {
             running_ = false;
             map_publish_thread_->join();
+            imu_executor_.cancel();
+            if(imu_thread_.joinable())
+            {
+                imu_thread_.join();
+            }
         }
 
     private:
@@ -428,6 +484,21 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         bool can_trust_init_ = false;
 
         std::mutex map_mutex_;
+
+        // IMU input (see the constructor)
+        static constexpr size_t kImuQueueSize = 1000;
+        rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
+        rclcpp::executors::SingleThreadedExecutor imu_executor_;
+        std::thread imu_thread_;
+        bool invert_imu_ = false;
+        bool acc_in_m_s2_ = true;
+
+        // IMU-rate output of the IMU estimator (IMU callback thread only)
+        rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_rate_pub_;
+        std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+        std::string imu_rate_frame_ = "imu_rate";
+        bool imu_rate_tf_ = true;
+        int64_t last_imu_rate_ns_ = -1;
 
 
         // Sub for time synchronised init_guess
@@ -789,6 +860,7 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
                     current_pose_ = localization_ ? init_guess_ : trans;
                 }
                 publishPose(time, current_pose_);
+                map_->addEstimatorPose(current_pose_, getTimeNs(time));
                 // Published whatever produced `current_pose_`, so that the map to odom transform is
                 // available to the rest of the system even when the registration is disabled
                 publishOdomMapCorrection(time, trans);
@@ -1174,17 +1246,77 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         void gyrCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
         {
             Vec3 gyr(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
-            map_mutex_.lock();
+            if(invert_imu_)
+            {
+                gyr *= -1;
+            }
             map_->addGyrMeasurement(gyr, getTimeNs(rclcpp::Time(msg->header.stamp)));
-            map_mutex_.unlock();
+            publishImuRate();
         }
         void accCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
         {
             Vec3 acc(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
-            map_mutex_.lock();
+            if(!acc_in_m_s2_)
+            {
+                acc *= 9.81;
+            }
+            if(invert_imu_)
+            {
+                acc *= -1;
+            }
             map_->addAccMeasurement(acc, getTimeNs(rclcpp::Time(msg->header.stamp)));
-            map_mutex_.unlock();
+            publishImuRate();
         }
+        // The IMU estimator's state at the newest time both IMU streams cover, once per such time
+        void publishImuRate()
+        {
+            if(!imu_rate_pub_)
+            {
+                return;
+            }
+            const ImuWindowEstimator* estimator = map_->imuEstimator();
+            ImuWindowEstimator::Prediction p;
+            if(!estimator || !estimator->predictLatest(p) || p.t_ns <= last_imu_rate_ns_)
+            {
+                return;
+            }
+            last_imu_rate_ns_ = p.t_ns;
+            const rclcpp::Time stamp(p.t_ns, RCL_ROS_TIME);
+            const Mat3 R = p.pose.block<3,3>(0,0);
+            const Eigen::Quaterniond q(R);
+            nav_msgs::msg::Odometry odom;
+            odom.header.stamp = stamp;
+            odom.header.frame_id = "map";
+            odom.child_frame_id = imu_rate_frame_;
+            odom.pose.pose.position.x = p.pose(0,3);
+            odom.pose.pose.position.y = p.pose(1,3);
+            odom.pose.pose.position.z = p.pose(2,3);
+            odom.pose.pose.orientation.x = q.x();
+            odom.pose.pose.orientation.y = q.y();
+            odom.pose.pose.orientation.z = q.z();
+            odom.pose.pose.orientation.w = q.w();
+            // The twist is expressed in the child frame
+            const Vec3 v_body = R.transpose()*p.vel;
+            odom.twist.twist.linear.x = v_body(0);
+            odom.twist.twist.linear.y = v_body(1);
+            odom.twist.twist.linear.z = v_body(2);
+            odom.twist.twist.angular.x = p.ang_vel(0);
+            odom.twist.twist.angular.y = p.ang_vel(1);
+            odom.twist.twist.angular.z = p.ang_vel(2);
+            imu_rate_pub_->publish(odom);
+            if(tf_broadcaster_)
+            {
+                geometry_msgs::msg::TransformStamped tf;
+                tf.header = odom.header;
+                tf.child_frame_id = imu_rate_frame_;
+                tf.transform.translation.x = p.pose(0,3);
+                tf.transform.translation.y = p.pose(1,3);
+                tf.transform.translation.z = p.pose(2,3);
+                tf.transform.rotation = odom.pose.pose.orientation;
+                tf_broadcaster_->sendTransform(tf);
+            }
+        }
+
         void twistCallback(const geometry_msgs::msg::TwistStamped::ConstSharedPtr msg)
         {
             // Only accept the twist expressed in the IMU/body frame
@@ -1207,6 +1339,7 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<GpMapNode>();
+    // The IMU callbacks have their own executor and thread (see the constructor)
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
