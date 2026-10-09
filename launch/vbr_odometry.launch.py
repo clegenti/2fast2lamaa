@@ -1,6 +1,6 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.events import Shutdown
+from launch.actions import Shutdown
 from launch_ros.substitutions import FindPackageShare
 from launch.substitutions import PathJoinSubstitution
 from ament_index_python.packages import get_package_prefix
@@ -98,7 +98,7 @@ def generate_launch_description():
 
         Node(package = "tf2_ros", 
                        executable = "static_transform_publisher",
-                       arguments = ["0", "0", "0", "0", "0", "0",  "map", "map_viz"]),
+                       arguments = ["--x", "0", "--y", "0", "--z", "0", "--yaw", "0", "--pitch", "0", "--roll", "0", "--frame-id", "map", "--child-frame-id", "map_viz"]),
         Node(
             package='rviz2', 
             executable='rviz2', 

@@ -86,7 +86,7 @@ def generate_launch_description():
 
         Node(package = "tf2_ros", 
                        executable = "static_transform_publisher",
-                       arguments = ["0", "0", "0", "0", "0", "3.14",  "map", "map_viz"]),
+                       arguments = ["--x", "0", "--y", "0", "--z", "0", "--yaw", "0", "--pitch", "0", "--roll", "3.14", "--frame-id", "map", "--child-frame-id", "map_viz"]),
         Node(
             package='rviz2', 
             executable='rviz2', 

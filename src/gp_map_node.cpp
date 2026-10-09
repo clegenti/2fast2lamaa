@@ -13,10 +13,12 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
-#include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/transform_broadcaster.hpp"
 #include "sensor_msgs/msg/imu.hpp"
-#include <message_filters/subscriber.h>
-#include <message_filters/time_synchronizer.h>
+#include "rclcpp/version.h"
+#include <message_filters/subscriber.hpp>
+#include <message_filters/synchronizer.hpp>
+#include <message_filters/sync_policies/exact_time.hpp>
 
 #include "ankerl/unordered_dense.h"
 
@@ -319,10 +321,16 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
             // Create the ROS related objects
             if(with_init_guess)
             {
+                // message_filters takes rmw_qos_profile_t up to Jazzy and rclcpp::QoS from Kilted on
+#if RCLCPP_VERSION_GTE(29, 0, 0)
+                pc_sub_.subscribe(this, "/points_input", rclcpp::QoS(10));
+                pose_sub_.subscribe(this, "/pose_input", rclcpp::QoS(10));
+#else
                 pc_sub_.subscribe(this, "/points_input");
                 pose_sub_.subscribe(this, "/pose_input");
+#endif
                 int queue_size = 20;
-                sync_ = std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::PointCloud2, geometry_msgs::msg::TransformStamped>>(pc_sub_, pose_sub_, queue_size);
+                sync_ = std::make_shared<SyncType>(SyncPolicy(queue_size), pc_sub_, pose_sub_);
                 sync_->registerCallback(std::bind(&GpMapNode::pcPriorCallback, this, std::placeholders::_1, std::placeholders::_2));
             }
             else
@@ -425,7 +433,9 @@ class GpMapNode: public rclcpp::Node, public GpMapPublisher
         // Sub for time synchronised init_guess
         message_filters::Subscriber<sensor_msgs::msg::PointCloud2> pc_sub_;
         message_filters::Subscriber<geometry_msgs::msg::TransformStamped> pose_sub_;
-        std::shared_ptr<message_filters::TimeSynchronizer<sensor_msgs::msg::PointCloud2, geometry_msgs::msg::TransformStamped>> sync_;
+        using SyncPolicy = message_filters::sync_policies::ExactTime<sensor_msgs::msg::PointCloud2, geometry_msgs::msg::TransformStamped>;
+        using SyncType = message_filters::Synchronizer<SyncPolicy>;
+        std::shared_ptr<SyncType> sync_;
         // Sub for no init_guess
         rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
         // Global map publisher

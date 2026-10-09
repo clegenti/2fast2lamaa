@@ -83,15 +83,40 @@ rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typ
 
 target_link_libraries(lidar_scan_odometry
   lice
+  rclcpp::rclcpp
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${visualization_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  message_filters::message_filters
+  tf2::tf2
+  tf2_ros::tf2_ros
 )
+
 target_link_libraries(gp_map
   "${cpp_typesupport_target}"
   lice
+  rclcpp::rclcpp
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  message_filters::message_filters
+  tf2::tf2
+  tf2_ros::tf2_ros
 )
 
 target_link_libraries(pose_graph
   "${cpp_typesupport_target}"
   lice
+  rclcpp::rclcpp
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  message_filters::message_filters
+  tf2::tf2
+  tf2_ros::tf2_ros
   ${OpenCV_LIBS}
 )
 
@@ -100,73 +125,25 @@ target_link_libraries(map_cleaner
   Ceres::ceres
   lice
 )
+
 target_link_libraries(lidar_2d_conversion
   Eigen3::Eigen
+  rclcpp::rclcpp
+  ${sensor_msgs_TARGETS}
 )
 
 target_link_libraries(wheel_gyro_odometry
   lice
+  rclcpp::rclcpp
+  ${sensor_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  tf2::tf2
+  tf2_ros::tf2_ros
 )
 
 
 ament_export_dependencies(rosidl_default_runtime)
-
-
-ament_target_dependencies(lidar_scan_odometry
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  nav_msgs
-  visualization_msgs
-  message_filters
-  std_msgs
-  tf2
-  tf2_ros
-  )
-  
-ament_target_dependencies(gp_map
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  message_filters
-  std_msgs
-  tf2
-  tf2_ros
-  )
-
-ament_target_dependencies(pose_graph
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  nav_msgs
-  message_filters
-  std_msgs
-  tf2
-  tf2_ros
-  OpenCV
-  )
-
-
-ament_target_dependencies(map_cleaner
-  Eigen3
-  Ceres)
-
-
-ament_target_dependencies(lidar_2d_conversion
-  rclcpp
-  sensor_msgs
-  Eigen3
-) 
-
-ament_target_dependencies(wheel_gyro_odometry
-  rclcpp
-  sensor_msgs
-  nav_msgs
-  geometry_msgs
-  tf2
-  tf2_ros
-  Eigen3
-)
 
 include_directories(
   include
