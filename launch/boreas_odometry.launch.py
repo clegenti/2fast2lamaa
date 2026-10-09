@@ -15,6 +15,15 @@ key_frame_dist_thr = float(10.0)
 key_frame_rot_thr = float(15.0 * 3.14 / 180.0)
 key_frame_time_thr = float(0.5)
 
+# IMU, shared by lidar_scan_odometry and gp_map (gravity factor and IMU-rate estimator)
+imu_topic = '/imu/data'
+acc_in_m_per_s2 = True      # False if the accelerometer measures in g
+invert_imu = False          # Flip the sign of the measurements (for some weird IMUs)
+gravity = 9.80              # m/s^2
+acc_std = 0.02              # m/s^2
+gyr_std = 0.005             # rad/s
+use_imu_estimator = True    # Pose at the IMU rate on /imu_rate_odom (see the README)
+
 
 def generate_launch_description():
     rviz_file = PathJoinSubstitution(
@@ -25,8 +34,8 @@ def generate_launch_description():
             executable='lidar_scan_odometry', 
             name='lidar_scan_odometry',
             remappings=[
-                ('/imu/acc', '/imu/data'),
-                ('/imu/gyr', '/imu/data'),
+                ('/imu/acc', imu_topic),
+                ('/imu/gyr', imu_topic),
                 ('/lidar_raw_points', '/velodyne_points')
             ],
             parameters=[
@@ -40,9 +49,12 @@ def generate_launch_description():
                 {"minimum_intensity": 2.0},
                 {"mode": "imu"},  # State representation mode: imu (acc and gyr preint), gyr (gyr preint and const vel), no_imu (const linear and angular vel)
 
-                # Adapting IMU measurements for some weird IMUs
-                {"acc_in_m_per_s2": True},
-                {"invert_imu": False},
+                # IMU (shared with gp_map, see the top of the file)
+                {"acc_in_m_per_s2": acc_in_m_per_s2},
+                {"invert_imu": invert_imu},
+                {"g": gravity},
+                {"acc_std": acc_std},
+                {"gyr_std": gyr_std},
 
                 # Calibration
                 {"calib_px": 0.},
@@ -65,8 +77,8 @@ def generate_launch_description():
             remappings=[
                 ('/points_input', '/lidar_scan_undistorted'),
                 ('/pose_input', '/undistortion_pose'),
-                ('/gp_map/acc', '/imu/data'),
-                ('/gp_map/gyr', '/imu/data'),
+                ('/gp_map/acc', imu_topic),
+                ('/gp_map/gyr', imu_topic),
                 ('/twist', '/start_of_scan_twist')
                 ],
             parameters=[
@@ -87,7 +99,14 @@ def generate_launch_description():
 
                 {"submap_length": 300.0},
 
-                {"write_scans": True}
+                {"write_scans": True},
+                # IMU (shared with lidar_scan_odometry, see the top of the file)
+                {"acc_in_m_per_s2": acc_in_m_per_s2},
+                {"invert_imu": invert_imu},
+                {"acc_std": acc_std},
+                {"gyr_std": gyr_std},
+                {"use_imu_estimator": use_imu_estimator},
+                {"imu_estimator_gravity_norm": gravity}
             ],
             output='screen',
             on_exit=Shutdown()

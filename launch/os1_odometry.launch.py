@@ -13,6 +13,15 @@ voxel_size = float(0.15)
 
 key_framing = False
 
+# IMU, shared by lidar_scan_odometry and gp_map (gravity factor and IMU-rate estimator)
+imu_topic = '/os1_cloud_node/imu'
+acc_in_m_per_s2 = True      # False if the accelerometer measures in g
+invert_imu = False          # Flip the sign of the measurements (for some weird IMUs)
+gravity = 9.81              # m/s^2
+acc_std = 0.02              # m/s^2
+gyr_std = 0.005             # rad/s
+use_imu_estimator = True    # Pose at the IMU rate on /imu_rate_odom (see the README)
+
 
 def generate_launch_description():
     rviz_file = PathJoinSubstitution(
@@ -23,8 +32,8 @@ def generate_launch_description():
             executable='lidar_scan_odometry', 
             name='lidar_scan_odometry',
             remappings=[
-                ('/imu/acc', '/os1_cloud_node/imu'),
-                ('/imu/gyr', '/os1_cloud_node/imu'),
+                ('/imu/acc', imu_topic),
+                ('/imu/gyr', imu_topic),
                 ('/lidar_raw_points', '/os1_cloud_node/points')
             ],
             parameters=[
@@ -34,12 +43,14 @@ def generate_launch_description():
                 {'feature_voxel_size': float(voxel_size)},
                 {"max_associations_per_type": 1000},
                 {"planar_only": True},
-                {"g": 9.81},
                 {"mode": "imu"},  # State representation mode: imu (acc and gyr preint), gyr (gyr preint and const vel), no_imu (const linear and angular vel)
 
-                # Adapting IMU measurements for some weird IMUs
-                {"acc_in_m_per_s2": True},
-                {"invert_imu": False},
+                # IMU (shared with gp_map, see the top of the file)
+                {"acc_in_m_per_s2": acc_in_m_per_s2},
+                {"invert_imu": invert_imu},
+                {"g": gravity},
+                {"acc_std": acc_std},
+                {"gyr_std": gyr_std},
 
                 # Calibration
                 {"calib_px": -0.006253},
@@ -63,8 +74,8 @@ def generate_launch_description():
             remappings=[
                 ('/points_input', '/lidar_scan_undistorted'),
                 ('/pose_input', '/undistortion_pose'),
-                ('/gp_map/acc', '/os1_cloud_node/imu'),
-                ('/gp_map/gyr', '/os1_cloud_node/imu'),
+                ('/gp_map/acc', imu_topic),
+                ('/gp_map/gyr', imu_topic),
                 ('/twist', '/start_of_scan_twist')
                 ],
             parameters=[
@@ -81,7 +92,13 @@ def generate_launch_description():
                 {"map_path": get_package_prefix('ffastllamaa') + "/share/ffastllamaa/maps/"},
 
                 {"submap_length": -200.0},
-                {"use_imu_estimator": True}
+                # IMU (shared with lidar_scan_odometry, see the top of the file)
+                {"acc_in_m_per_s2": acc_in_m_per_s2},
+                {"invert_imu": invert_imu},
+                {"acc_std": acc_std},
+                {"gyr_std": gyr_std},
+                {"use_imu_estimator": use_imu_estimator},
+                {"imu_estimator_gravity_norm": gravity}
 
             ],
             output='screen',
